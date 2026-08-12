@@ -1,0 +1,23 @@
+{
+  "actionId": "hello.action",
+  "version": "v1",
+  "definitionDigest": "sha256:50914b3d86d82a9313ae090f230c3d09d4345b3a6821a35e2e947c3d6b5dd9c1",
+  "entrypoint": "main",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "additionalProperties": false }
+    },
+    "required": ["name"],
+    "additionalProperties": false
+  },
+  "resultSchema": {
+    "type": "object",
+    "properties": {
+      "text": { "type": "string", "additionalProperties": false }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "acceptedTriggerKinds": ["trigger.manual/v1"]
+}

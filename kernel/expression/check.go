@@ -64,9 +64,6 @@ func CheckAssignable(expr contracts.ValueExpr, environment Environment, target c
 	if source.Format == contracts.FormatSecretHandle {
 		return errors.New("secret handle cannot flow into a public value slot")
 	}
-	if err := assignable(source, target, "$target"); err != nil {
-		return err
-	}
 	if expr.Literal != nil {
 		value, err := canonicaljson.Decode(*expr.Literal, canonicaljson.DefaultLimits())
 		if err != nil {
@@ -75,6 +72,10 @@ func CheckAssignable(expr contracts.ValueExpr, environment Environment, target c
 		if err := target.ValidateValue(value); err != nil {
 			return fmt.Errorf("literal is not assignable: %w", err)
 		}
+		return nil
+	}
+	if err := assignable(source, target, "$target"); err != nil {
+		return err
 	}
 	return nil
 }
@@ -368,6 +369,9 @@ func validPathSegment(segment string) bool {
 	if segment == "" {
 		return false
 	}
+	if len(segment) > 1 && segment[0] == '0' {
+		return false
+	}
 	_, err := strconv.ParseUint(segment, 10, 31)
 	return err == nil
 }
@@ -436,6 +440,35 @@ func sameType(left, right contracts.Schema) error {
 	if left.Type != right.Type || left.Format != right.Format {
 		return fmt.Errorf("types %s and %s are incompatible", left.Type, right.Type)
 	}
+	if left.Type == contracts.TypeArray {
+		if left.Items == nil || right.Items == nil {
+			return errors.New("array types require item schemas")
+		}
+		return sameType(*left.Items, *right.Items)
+	}
+	if left.Type == contracts.TypeObject {
+		if len(left.Properties) != len(right.Properties) || len(left.Required) != len(right.Required) {
+			return errors.New("object shapes are incompatible")
+		}
+		required := make(map[string]bool, len(left.Required))
+		for _, name := range left.Required {
+			required[name] = true
+		}
+		for _, name := range right.Required {
+			if !required[name] {
+				return errors.New("object required fields are incompatible")
+			}
+		}
+		for name, leftProperty := range left.Properties {
+			rightProperty, exists := right.Properties[name]
+			if !exists {
+				return errors.New("object shapes are incompatible")
+			}
+			if err := sameType(leftProperty, rightProperty); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -445,6 +478,25 @@ func assignable(source, target contracts.Schema, path string) error {
 	}
 	if source.Type != target.Type && !(source.Type == contracts.TypeInteger && target.Type == contracts.TypeNumber) {
 		return fmt.Errorf("%s: type %s is not assignable to %s", path, source.Type, target.Type)
+	}
+	if len(target.Enum) != 0 {
+		if len(source.Enum) == 0 {
+			return fmt.Errorf("%s: source does not prove target enum membership", path)
+		}
+		for _, sourceValue := range source.Enum {
+			matched := false
+			for _, targetValue := range target.Enum {
+				left, leftErr := canonicaljson.Canonicalize(sourceValue)
+				right, rightErr := canonicaljson.Canonicalize(targetValue)
+				if leftErr == nil && rightErr == nil && string(left) == string(right) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return fmt.Errorf("%s: source enum is not a subset of target enum", path)
+			}
+		}
 	}
 	switch target.Type {
 	case contracts.TypeObject:
@@ -457,15 +509,19 @@ func assignable(source, target contracts.Schema, path string) error {
 				return err
 			}
 		}
-		if !target.AdditionalProperties {
-			for name := range source.Properties {
-				targetProperty, exists := target.Properties[name]
-				if !exists {
-					return fmt.Errorf("%s: property %q is not accepted", path, name)
+		if source.AdditionalProperties && !target.AdditionalProperties {
+			return fmt.Errorf("%s: open source object is not assignable to closed target object", path)
+		}
+		for name, sourceProperty := range source.Properties {
+			targetProperty, exists := target.Properties[name]
+			if !exists {
+				if target.AdditionalProperties {
+					continue
 				}
-				if err := assignable(source.Properties[name], targetProperty, path+"."+name); err != nil {
-					return err
-				}
+				return fmt.Errorf("%s: property %q is not accepted", path, name)
+			}
+			if err := assignable(sourceProperty, targetProperty, path+"."+name); err != nil {
+				return err
 			}
 		}
 	case contracts.TypeArray:

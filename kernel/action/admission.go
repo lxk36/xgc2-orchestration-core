@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/lxk36/xgc2-execution-platform/kernel/canonicaljson"
@@ -55,6 +54,22 @@ func Admit(request Request) (Admission, error) {
 	if request.Trigger.Kind == contracts.TriggerPanel && request.Preset == nil {
 		return Admission{}, errors.New("panel trigger requires an exact preset")
 	}
+	if request.MappingDigest != "" && !contracts.ValidDigest(request.MappingDigest) {
+		return Admission{}, errors.New("candidate mapping digest is invalid")
+	}
+	candidate, err := contracts.CloneObject(request.Candidate)
+	if err != nil {
+		return Admission{}, fmt.Errorf("clone candidate inputs: %w", err)
+	}
+	candidateDigest, err := canonicaljson.DigestValue(candidate)
+	if err != nil {
+		return Admission{}, fmt.Errorf("candidate digest: %w", err)
+	}
+	trigger := request.Trigger
+	trigger.Payload, err = contracts.CloneObject(request.Trigger.Payload)
+	if err != nil {
+		return Admission{}, fmt.Errorf("clone trigger payload: %w", err)
+	}
 
 	inputs, defaultPaths, err := request.Action.InputSchema.ApplyDefaults(map[string]any{})
 	if err != nil {
@@ -75,10 +90,14 @@ func Admit(request Request) (Admission, error) {
 		if err := validatePreset(*request.Preset, request.Action.Ref()); err != nil {
 			return Admission{}, err
 		}
-		mergeObject(inputs, request.Preset.Values)
+		presetValues, cloneErr := contracts.CloneObject(request.Preset.Values)
+		if cloneErr != nil {
+			return Admission{}, fmt.Errorf("clone preset values: %w", cloneErr)
+		}
+		mergeObject(inputs, presetValues)
 		presetRef = request.Preset.PresetID + "@" + request.Preset.Version
 		presetDigest = request.Preset.Digest
-		for pointer := range leafPointers(request.Preset.Values) {
+		for pointer := range leafPointers(presetValues) {
 			provenance[pointer] = contracts.InputFieldProvenance{
 				TargetPointer: pointer,
 				OriginKind:    contracts.OriginPreset,
@@ -87,18 +106,19 @@ func Admit(request Request) (Admission, error) {
 				SourceDigest:  request.Preset.Digest,
 			}
 		}
-		if err := validateOverrides(request.Candidate, request.Preset.OverridablePaths); err != nil {
+		if err := validateOverrides(candidate, request.Preset.OverridablePaths); err != nil {
 			return Admission{}, err
 		}
 	}
 
-	mergeObject(inputs, request.Candidate)
-	for pointer := range leafPointers(request.Candidate) {
+	mergeObject(inputs, candidate)
+	for pointer := range leafPointers(candidate) {
 		provenance[pointer] = contracts.InputFieldProvenance{
 			TargetPointer: pointer,
 			OriginKind:    request.CandidateOrigin,
 			SourceRef:     request.CandidateRef,
 			SourcePointer: pointer,
+			SourceDigest:  candidateDigest,
 			MappingDigest: request.MappingDigest,
 		}
 	}
@@ -120,7 +140,7 @@ func Admit(request Request) (Admission, error) {
 	if err != nil {
 		return Admission{}, err
 	}
-	triggerDigest, err := canonicaljson.DigestValue(request.Trigger)
+	triggerDigest, err := canonicaljson.DigestValue(trigger)
 	if err != nil {
 		return Admission{}, fmt.Errorf("canonicalize trigger: %w", err)
 	}
@@ -133,7 +153,7 @@ func Admit(request Request) (Admission, error) {
 	})
 	return Admission{
 		ActionRef:       request.Action.Ref(),
-		Trigger:         request.Trigger,
+		Trigger:         trigger,
 		TriggerDigest:   triggerDigest,
 		Inputs:          inputs,
 		CanonicalInputs: canonicalInputs,
@@ -158,8 +178,14 @@ func validateAction(action contracts.ActionVersion) error {
 	if err := action.InputSchema.ValidateDefinition(); err != nil {
 		return fmt.Errorf("action input schema: %w", err)
 	}
+	if action.InputSchema.ContainsFormat(contracts.FormatSecretHandle) {
+		return errors.New("action inputs cannot contain resolved secret handle slots")
+	}
 	if err := action.ResultSchema.ValidateDefinition(); err != nil {
 		return fmt.Errorf("action result schema: %w", err)
+	}
+	if action.ResultSchema.ContainsFormat(contracts.FormatSecretHandle) {
+		return errors.New("action results cannot contain secret handles")
 	}
 	if len(action.AcceptedTriggerKinds) == 0 {
 		return errors.New("action must accept at least one trigger kind")
@@ -192,14 +218,17 @@ func validateTrigger(trigger contracts.TriggerEvent) error {
 	if trigger.OccurredAt.IsZero() || trigger.ReceivedAt.IsZero() {
 		return errors.New("trigger timestamps are required")
 	}
-	if trigger.ReceivedAt.Before(trigger.OccurredAt) {
-		return errors.New("trigger receivedAt precedes occurredAt")
-	}
 	if !contracts.ValidIdentifier(trigger.SourceRef) || !contracts.ValidIdentifier(trigger.ActorRef) {
 		return errors.New("trigger sourceRef and actorRef are required portable identifiers")
 	}
 	if trigger.SubjectRef != "" && !contracts.ValidIdentifier(trigger.SubjectRef) {
 		return errors.New("trigger subjectRef is invalid")
+	}
+	if trigger.RawArtifactRef != "" && !contracts.ValidIdentifier(trigger.RawArtifactRef) {
+		return errors.New("trigger rawArtifactRef is invalid")
+	}
+	if trigger.VerificationReceiptRef != "" && !contracts.ValidIdentifier(trigger.VerificationReceiptRef) {
+		return errors.New("trigger verificationReceiptRef is invalid")
 	}
 	if !contracts.ValidDigest(trigger.PayloadSchemaDigest) {
 		return errors.New("trigger payload schema digest is invalid")
@@ -333,8 +362,4 @@ func validatePointer(pointer string) error {
 
 func escapePointer(value string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(value, "~", "~0"), "/", "~1")
-}
-
-func pointerForIndex(base string, index int) string {
-	return base + "/" + strconv.Itoa(index)
 }

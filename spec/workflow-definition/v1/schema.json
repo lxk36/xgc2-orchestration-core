@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/workflow-definition/v1/schema.json",
+  "title": "XGC WorkflowDefinition v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "version",
+    "inputSchema",
+    "resultSchema",
+    "triggerSchema",
+    "scopeSchema",
+    "entrypoints",
+    "nodes",
+    "edges"
+  ],
+  "properties": {
+    "schemaVersion": { "const": "xgc.workflow/v1" },
+    "workflowId": { "$ref": "#/$defs/identifier" },
+    "version": { "$ref": "#/$defs/identifier" },
+    "inputSchema": { "$ref": "#/$defs/objectSchema" },
+    "resultSchema": { "$ref": "#/$defs/objectSchema" },
+    "triggerSchema": { "$ref": "#/$defs/objectSchema" },
+    "scopeSchema": { "$ref": "#/$defs/objectSchema" },
+    "secrets": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "entrypoints": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/identifier" },
+      "additionalProperties": { "$ref": "#/$defs/identifier" }
+    },
+    "nodes": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/node" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "typeRef": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*/v[1-9][0-9]*$" },
+    "schemaProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "additionalProperties"],
+      "properties": {
+        "type": { "enum": ["object", "array", "string", "number", "integer", "boolean", "null"] },
+        "properties": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/schemaProfile" }
+        },
+        "required": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "additionalProperties": { "type": "boolean" },
+        "items": { "$ref": "#/$defs/schemaProfile" },
+        "default": true,
+        "enum": { "type": "array" },
+        "format": { "enum": ["xgc-secret-handle"] }
+      }
+    },
+    "objectSchema": {
+      "allOf": [
+        { "$ref": "#/$defs/schemaProfile" },
+        { "properties": { "type": { "const": "object" } } }
+      ]
+    },
+    "expression": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["literal"],
+          "properties": { "literal": true }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ref"],
+          "properties": { "ref": { "type": "string", "minLength": 3, "maxLength": 65536 } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["op", "args"],
+          "properties": {
+            "op": {
+              "enum": [
+                "and", "or", "not", "eq", "ne", "lt", "lte", "gt", "gte",
+                "add", "sub", "mul", "div", "coalesce", "concat", "length", "contains"
+              ]
+            },
+            "args": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expression" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["object"],
+          "properties": {
+            "object": {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/identifier" },
+              "additionalProperties": { "$ref": "#/$defs/expression" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["array"],
+          "properties": {
+            "array": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expression" } }
+          }
+        }
+      ]
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "value"],
+      "properties": {
+        "target": { "type": "string", "pattern": "^/(?:[^~/]|~0|~1)+(?:/(?:[^~/]|~0|~1)+)*$" },
+        "value": { "$ref": "#/$defs/expression" }
+      }
+    },
+    "actionRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actionId", "version", "digest"],
+      "properties": {
+        "actionId": { "$ref": "#/$defs/identifier" },
+        "version": { "$ref": "#/$defs/identifier" },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "callAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetActionRef", "inputSchema", "resultSchema", "inputMap"],
+      "properties": {
+        "targetActionRef": { "$ref": "#/$defs/actionRef" },
+        "inputSchema": { "$ref": "#/$defs/objectSchema" },
+        "resultSchema": { "$ref": "#/$defs/objectSchema" },
+        "inputMap": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
+        "resultMap": { "type": "array", "items": { "$ref": "#/$defs/resultBinding" } }
+      }
+    },
+    "resultBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "target"],
+      "properties": {
+        "source": { "type": "string", "pattern": "^/(?:[^~/]|~0|~1)+(?:/(?:[^~/]|~0|~1)+)*$" },
+        "target": { "type": "string", "pattern": "^/(?:[^~/]|~0|~1)+(?:/(?:[^~/]|~0|~1)+)*$" }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "typeRef", "descriptorDigest", "inputSchema", "outputSchema"],
+      "properties": {
+        "nodeId": { "$ref": "#/$defs/identifier" },
+        "typeRef": { "$ref": "#/$defs/typeRef" },
+        "descriptorDigest": { "$ref": "#/$defs/digest" },
+        "inputSchema": { "$ref": "#/$defs/objectSchema" },
+        "outputSchema": { "$ref": "#/$defs/objectSchema" },
+        "fixedInputs": { "type": "object" },
+        "bindings": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
+        "callAction": { "$ref": "#/$defs/callAction" }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "kind"],
+      "properties": {
+        "from": { "$ref": "#/$defs/identifier" },
+        "to": { "$ref": "#/$defs/identifier" },
+        "kind": { "enum": ["control", "data"] }
+      }
+    }
+  }
+}

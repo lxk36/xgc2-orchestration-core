@@ -1,0 +1,99 @@
+{
+  "schemaVersion": "xgc.workflow/v1",
+  "workflowId": "hello.workflow",
+  "version": "v1",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "name": { "type": "string", "additionalProperties": false }
+    },
+    "required": ["name"],
+    "additionalProperties": false
+  },
+  "resultSchema": {
+    "type": "object",
+    "additionalProperties": false
+  },
+  "triggerSchema": {
+    "type": "object",
+    "properties": {
+      "eventId": { "type": "string", "additionalProperties": false }
+    },
+    "additionalProperties": false
+  },
+  "scopeSchema": {
+    "type": "object",
+    "properties": {
+      "runId": { "type": "string", "additionalProperties": false }
+    },
+    "additionalProperties": false
+  },
+  "entrypoints": {
+    "main": "prepare"
+  },
+  "nodes": [
+    {
+      "nodeId": "prepare",
+      "typeRef": "xgc.node.transform/v1",
+      "descriptorDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "additionalProperties": false }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "greeting": { "type": "string", "additionalProperties": false }
+        },
+        "required": ["greeting"],
+        "additionalProperties": false
+      },
+      "bindings": [
+        {
+          "target": "/name",
+          "value": { "ref": "inputs.name" }
+        }
+      ]
+    },
+    {
+      "nodeId": "render",
+      "typeRef": "xgc.node.transform/v1",
+      "descriptorDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string", "additionalProperties": false }
+        },
+        "required": ["message"],
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "additionalProperties": false }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      },
+      "bindings": [
+        {
+          "target": "/message",
+          "value": {
+            "op": "concat",
+            "args": [
+              { "literal": "Hello, " },
+              { "ref": "nodes.prepare.output.greeting" }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "edges": [
+    { "from": "prepare", "to": "render", "kind": "data" }
+  ]
+}

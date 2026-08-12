@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -60,6 +61,9 @@ func Decode(raw []byte, limits Limits) (any, error) {
 	}
 	if len(raw) > limits.MaxInputBytes {
 		return nil, fmt.Errorf("JSON input exceeds %d bytes", limits.MaxInputBytes)
+	}
+	if !utf8.Valid(raw) {
+		return nil, errors.New("JSON input is not valid UTF-8")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
@@ -224,8 +228,7 @@ func appendValue(output *bytes.Buffer, value any, limits Limits) error {
 			output.WriteString("false")
 		}
 	case string:
-		raw, _ := json.Marshal(typed)
-		output.Write(raw)
+		appendString(output, typed)
 	case json.Number:
 		normalized, err := normalizeNumber(typed.String(), limits)
 		if err != nil {
@@ -254,8 +257,7 @@ func appendValue(output *bytes.Buffer, value any, limits Limits) error {
 			if index != 0 {
 				output.WriteByte(',')
 			}
-			raw, _ := json.Marshal(key)
-			output.Write(raw)
+			appendString(output, key)
 			output.WriteByte(':')
 			if err := appendValue(output, typed[key], limits); err != nil {
 				return err
@@ -269,6 +271,38 @@ func appendValue(output *bytes.Buffer, value any, limits Limits) error {
 		return fmt.Errorf("canonical JSON exceeds %d bytes", limits.MaxCanonicalBytes)
 	}
 	return nil
+}
+
+func appendString(output *bytes.Buffer, value string) {
+	const hexadecimal = "0123456789abcdef"
+	output.WriteByte('"')
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		switch character {
+		case '"', '\\':
+			output.WriteByte('\\')
+			output.WriteByte(character)
+		case '\b':
+			output.WriteString(`\b`)
+		case '\f':
+			output.WriteString(`\f`)
+		case '\n':
+			output.WriteString(`\n`)
+		case '\r':
+			output.WriteString(`\r`)
+		case '\t':
+			output.WriteString(`\t`)
+		default:
+			if character < 0x20 {
+				output.WriteString(`\u00`)
+				output.WriteByte(hexadecimal[character>>4])
+				output.WriteByte(hexadecimal[character&0x0f])
+			} else {
+				output.WriteByte(character)
+			}
+		}
+	}
+	output.WriteByte('"')
 }
 
 func normalizeNumber(raw string, limits Limits) (string, error) {

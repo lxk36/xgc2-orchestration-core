@@ -93,6 +93,9 @@ func (schema Schema) validateDefinition(path string) error {
 	if schema.Format != "" && !(schema.Type == TypeString && schema.Format == FormatSecretHandle) {
 		return fmt.Errorf("%s: unsupported format %q", path, schema.Format)
 	}
+	if schema.Format == FormatSecretHandle && (len(schema.Default) != 0 || len(schema.Enum) != 0) {
+		return fmt.Errorf("%s: secret handle schema cannot declare default or enum", path)
+	}
 	if len(schema.Default) != 0 {
 		value, err := decodeJSON(schema.Default)
 		if err != nil {
@@ -112,6 +115,21 @@ func (schema Schema) validateDefinition(path string) error {
 		}
 	}
 	return nil
+}
+
+func (schema Schema) ContainsFormat(format string) bool {
+	if schema.Format == format {
+		return true
+	}
+	if schema.Items != nil && schema.Items.ContainsFormat(format) {
+		return true
+	}
+	for _, property := range schema.Properties {
+		if property.ContainsFormat(format) {
+			return true
+		}
+	}
+	return false
 }
 
 func (schema Schema) ValidateValue(value any) error {
@@ -274,7 +292,10 @@ func (schema Schema) Resolve(segments []string) (Schema, error) {
 			if current.Items == nil {
 				return Schema{}, fmt.Errorf("schema path reaches array without an item schema at segment %q", segment)
 			}
-			if _, err := strconv.Atoi(segment); err != nil {
+			if segment == "" || (len(segment) > 1 && segment[0] == '0') {
+				return Schema{}, fmt.Errorf("schema path segment %q at %d is not a canonical array index", segment, index)
+			}
+			if _, err := strconv.ParseUint(segment, 10, 31); err != nil {
 				return Schema{}, fmt.Errorf("schema path segment %q at %d is not an array index", segment, index)
 			}
 			current = *current.Items

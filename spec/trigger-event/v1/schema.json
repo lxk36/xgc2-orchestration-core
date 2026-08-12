@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/trigger-event/v1/schema.json",
+  "title": "XGC TriggerEvent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "eventId",
+    "kind",
+    "version",
+    "occurredAt",
+    "receivedAt",
+    "sourceRef",
+    "actorRef",
+    "payloadSchemaDigest",
+    "payload"
+  ],
+  "properties": {
+    "eventId": { "$ref": "#/$defs/identifier" },
+    "kind": {
+      "enum": [
+        "trigger.manual/v1",
+        "trigger.schedule/v1",
+        "trigger.webhook/v1",
+        "trigger.api/v1",
+        "trigger.panel/v1",
+        "trigger.xgc2-experiment/v1",
+        "trigger.action-call/v1"
+      ]
+    },
+    "version": { "$ref": "#/$defs/identifier" },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "receivedAt": { "type": "string", "format": "date-time" },
+    "sourceRef": { "$ref": "#/$defs/identifier" },
+    "actorRef": { "$ref": "#/$defs/identifier" },
+    "subjectRef": { "$ref": "#/$defs/identifier" },
+    "payloadSchemaDigest": { "$ref": "#/$defs/digest" },
+    "payload": { "type": "object" },
+    "rawArtifactRef": { "$ref": "#/$defs/identifier" },
+    "verificationReceiptRef": { "$ref": "#/$defs/identifier" }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

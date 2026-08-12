@@ -88,3 +88,13 @@ func TestExpressionLimitsAndNonTerminatingDivision(t *testing.T) {
 		t.Fatalf("division error = %v", err)
 	}
 }
+
+func TestEvaluateRejectsValuesThatViolateCheckedSchemas(t *testing.T) {
+	expr := contracts.ValueExpr{Op: "add", Args: []contracts.ValueExpr{
+		{Ref: "inputs.count"}, {Literal: raw(`1`)},
+	}}
+	_, err := Evaluate(expr, expressionEnvironment(), Values{Inputs: map[string]any{"count": "not-an-integer"}})
+	if err == nil || !strings.Contains(err.Error(), "inputs values") {
+		t.Fatalf("value validation error = %v", err)
+	}
+}

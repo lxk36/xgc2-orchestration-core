@@ -1,0 +1,11 @@
+{
+  "eventId": "event-webhook",
+  "kind": "trigger.webhook/v1",
+  "version": "v1",
+  "occurredAt": "2026-08-12T12:00:00Z",
+  "receivedAt": "2026-08-12T12:00:00Z",
+  "sourceRef": "webhook-source",
+  "actorRef": "webhook-actor",
+  "payloadSchemaDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload": {}
+}

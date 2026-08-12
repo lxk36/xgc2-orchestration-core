@@ -1,0 +1,11 @@
+{
+  "eventId": "event-xgc2-experiment",
+  "kind": "trigger.xgc2-experiment/v1",
+  "version": "v1",
+  "occurredAt": "2026-08-12T12:00:00Z",
+  "receivedAt": "2026-08-12T12:00:00Z",
+  "sourceRef": "xgc2-builder",
+  "actorRef": "operator-1",
+  "payloadSchemaDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload": {}
+}

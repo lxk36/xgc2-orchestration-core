@@ -50,3 +50,16 @@ func TestDecodeEnforcesDepthAndExponentLimits(t *testing.T) {
 		t.Fatal("expected exponent rejection")
 	}
 }
+
+func TestCanonicalStringsDoNotUseHostHTMLEscaping(t *testing.T) {
+	canonical, err := Canonicalize([]byte(`{"value":"<>&\u2028"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonical) != "{\"value\":\"<>&\u2028\"}" {
+		t.Fatalf("canonical string = %q", canonical)
+	}
+	if _, err := Canonicalize([]byte{'"', 0xff, '"'}); err == nil {
+		t.Fatal("expected invalid UTF-8 rejection")
+	}
+}

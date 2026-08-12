@@ -1,0 +1,11 @@
+{
+  "eventId": "event-api",
+  "kind": "trigger.api/v1",
+  "version": "v1",
+  "occurredAt": "2026-08-12T12:00:00Z",
+  "receivedAt": "2026-08-12T12:00:00Z",
+  "sourceRef": "api-source",
+  "actorRef": "api-actor",
+  "payloadSchemaDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload": {}
+}

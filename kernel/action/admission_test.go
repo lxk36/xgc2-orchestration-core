@@ -103,3 +103,15 @@ func TestAdmitRejectsOriginAndPresetEscape(t *testing.T) {
 		t.Fatalf("override error = %v", err)
 	}
 }
+
+func TestAdmitRejectsSecretHandleInPublicActionSchema(t *testing.T) {
+	action := testAction(contracts.TriggerManual)
+	action.InputSchema.Properties["credential"] = contracts.Schema{Type: contracts.TypeString, Format: contracts.FormatSecretHandle}
+	_, err := Admit(Request{
+		Action: action, Trigger: testTrigger(contracts.TriggerManual),
+		Candidate: map[string]any{"name": "demo"}, CandidateOrigin: contracts.OriginCaller,
+	})
+	if err == nil || !strings.Contains(err.Error(), "secret handle") {
+		t.Fatalf("secret schema error = %v", err)
+	}
+}

@@ -31,6 +31,9 @@ func EvaluateWithLimits(expr contracts.ValueExpr, environment Environment, value
 	if _, err := CheckWithLimits(expr, environment, limits); err != nil {
 		return nil, err
 	}
+	if err := validateValues(environment, values); err != nil {
+		return nil, err
+	}
 	evaluator := evaluator{values: values}
 	result, err := evaluator.expression(expr)
 	if err != nil {
@@ -47,6 +50,47 @@ func EvaluateWithLimits(expr contracts.ValueExpr, environment Environment, value
 		return nil, fmt.Errorf("expression result exceeds %d bytes", limits.MaxResultBytes)
 	}
 	return result, nil
+}
+
+func validateValues(environment Environment, values Values) error {
+	objects := []struct {
+		name   string
+		schema contracts.Schema
+		value  map[string]any
+	}{
+		{"inputs", environment.Inputs, values.Inputs},
+		{"trigger", environment.Trigger, values.Trigger},
+		{"scope", environment.Scope, values.Scope},
+	}
+	for _, item := range objects {
+		value := item.value
+		if value == nil {
+			value = map[string]any{}
+		}
+		if err := item.schema.ValidateValue(value); err != nil {
+			return fmt.Errorf("%s values: %w", item.name, err)
+		}
+	}
+	for nodeID, value := range values.NodeOutputs {
+		schema, exists := environment.NodeOutputs[nodeID]
+		if !exists {
+			return fmt.Errorf("node output value %q has no schema", nodeID)
+		}
+		if err := schema.ValidateValue(value); err != nil {
+			return fmt.Errorf("node output %q: %w", nodeID, err)
+		}
+	}
+	if environment.Iteration != nil {
+		if err := environment.Iteration.ValidateValue(values.Iteration); err != nil {
+			return fmt.Errorf("iteration value: %w", err)
+		}
+	}
+	for name, handle := range values.Secrets {
+		if !environment.Secrets[name] || !handle.Valid() {
+			return fmt.Errorf("secret handle %q is undeclared or invalid", name)
+		}
+	}
+	return nil
 }
 
 type evaluator struct {

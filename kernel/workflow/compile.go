@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/lxk36/xgc2-execution-platform/kernel/canonicaljson"
@@ -41,7 +40,10 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 	}
 	baseEnvironment := expression.Environment{
 		Inputs: definition.InputSchema, Trigger: definition.TriggerSchema, Scope: definition.ScopeSchema,
-		NodeOutputs: make(map[string]contracts.Schema, len(nodes)),
+		NodeOutputs: make(map[string]contracts.Schema, len(nodes)), Secrets: make(map[string]bool, len(definition.Secrets)),
+	}
+	for _, name := range definition.Secrets {
+		baseEnvironment.Secrets[name] = true
 	}
 	for nodeID, node := range nodes {
 		baseEnvironment.NodeOutputs[nodeID] = node.OutputSchema
@@ -54,7 +56,7 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 			return contracts.CompiledWorkflowPlan{}, err
 		}
 		if node.CallAction != nil {
-			if err := validateCallAction(*node.CallAction, environment, nodeID); err != nil {
+			if err := validateCallAction(*node.CallAction, node.OutputSchema, environment, nodeID); err != nil {
 				return contracts.CompiledWorkflowPlan{}, err
 			}
 		}
@@ -86,12 +88,25 @@ func validateIdentityAndSchemas(definition contracts.WorkflowDefinition) error {
 	if !contracts.ValidIdentifier(definition.WorkflowID) || !contracts.ValidIdentifier(definition.Version) {
 		return errors.New("workflow identity and version must be portable identifiers")
 	}
+	seenSecrets := make(map[string]bool, len(definition.Secrets))
+	for _, name := range definition.Secrets {
+		if !contracts.ValidIdentifier(name) {
+			return fmt.Errorf("workflow secret name %q is invalid", name)
+		}
+		if seenSecrets[name] {
+			return fmt.Errorf("workflow secret name %q is duplicated", name)
+		}
+		seenSecrets[name] = true
+	}
 	for name, schema := range map[string]contracts.Schema{
 		"input": definition.InputSchema, "result": definition.ResultSchema,
 		"trigger": definition.TriggerSchema, "scope": definition.ScopeSchema,
 	} {
 		if err := schema.ValidateDefinition(); err != nil {
 			return fmt.Errorf("workflow %s schema: %w", name, err)
+		}
+		if schema.ContainsFormat(contracts.FormatSecretHandle) {
+			return fmt.Errorf("workflow %s schema cannot expose secret handles", name)
 		}
 	}
 	if definition.InputSchema.Type != contracts.TypeObject || definition.ResultSchema.Type != contracts.TypeObject ||
@@ -110,6 +125,9 @@ func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]cont
 		if !contracts.ValidIdentifier(node.NodeID) || !contracts.ValidTypeRef(node.TypeRef) {
 			return nil, fmt.Errorf("node identity or typeRef %q/%q is invalid", node.NodeID, node.TypeRef)
 		}
+		if !contracts.ValidDigest(node.DescriptorDigest) {
+			return nil, fmt.Errorf("node %q descriptor digest is invalid", node.NodeID)
+		}
 		if _, duplicate := nodes[node.NodeID]; duplicate {
 			return nil, fmt.Errorf("node %q is duplicated", node.NodeID)
 		}
@@ -121,6 +139,9 @@ func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]cont
 		}
 		if err := node.OutputSchema.ValidateDefinition(); err != nil {
 			return nil, fmt.Errorf("node %q output schema: %w", node.NodeID, err)
+		}
+		if node.OutputSchema.ContainsFormat(contracts.FormatSecretHandle) {
+			return nil, fmt.Errorf("node %q output schema cannot expose secret handles", node.NodeID)
 		}
 		nodes[node.NodeID] = node
 	}
@@ -322,6 +343,9 @@ func validateFixed(schema contracts.Schema, value map[string]any, pointer string
 			return fmt.Errorf("unknown property %q", pointer+"/"+name)
 		}
 		childPointer := pointer + "/" + escapePointer(name)
+		if property.Format == contracts.FormatSecretHandle {
+			return fmt.Errorf("property %q is a secret slot and cannot have an authored fixed value", childPointer)
+		}
 		if object, ok := child.(map[string]any); ok && property.Type == contracts.TypeObject {
 			if err := validateFixed(property, object, childPointer, provided); err != nil {
 				return err
@@ -339,7 +363,7 @@ func validateFixed(schema contracts.Schema, value map[string]any, pointer string
 	return nil
 }
 
-func validateCallAction(call contracts.CallAction, environment expression.Environment, nodeID string) error {
+func validateCallAction(call contracts.CallAction, nodeOutput contracts.Schema, environment expression.Environment, nodeID string) error {
 	if !contracts.ValidIdentifier(call.TargetActionRef.ActionID) || !contracts.ValidIdentifier(call.TargetActionRef.Version) ||
 		!contracts.ValidDigest(call.TargetActionRef.Digest) {
 		return fmt.Errorf("node %q child action ref is invalid", nodeID)
@@ -350,7 +374,27 @@ func validateCallAction(call contracts.CallAction, environment expression.Enviro
 	if err := call.ResultSchema.ValidateDefinition(); err != nil {
 		return fmt.Errorf("node %q child result schema: %w", nodeID, err)
 	}
+	if call.ResultSchema.ContainsFormat(contracts.FormatSecretHandle) {
+		return fmt.Errorf("node %q child result schema cannot expose secret handles", nodeID)
+	}
 	if err := validateInputAssembly(call.InputSchema, nil, call.InputMap, environment, "node "+nodeID+" child inputMap"); err != nil {
+		return err
+	}
+	resultBindings := make([]contracts.ValueBinding, len(call.ResultMap))
+	for index, mapping := range call.ResultMap {
+		segments, err := pointerSegments(mapping.Source)
+		if err != nil {
+			return fmt.Errorf("node %q child resultMap source %q: %w", nodeID, mapping.Source, err)
+		}
+		resultBindings[index] = contracts.ValueBinding{
+			Target: mapping.Target,
+			Value:  contracts.ValueExpr{Ref: "inputs." + strings.Join(segments, ".")},
+		}
+	}
+	resultEnvironment := expression.Environment{
+		Inputs: call.ResultSchema, Trigger: contracts.Schema{Type: contracts.TypeObject}, Scope: contracts.Schema{Type: contracts.TypeObject},
+	}
+	if err := validateInputAssembly(nodeOutput, nil, resultBindings, resultEnvironment, "node "+nodeID+" child resultMap"); err != nil {
 		return err
 	}
 	return nil
@@ -416,8 +460,4 @@ func covered(pointer string, provided map[string]bool) bool {
 
 func escapePointer(value string) string {
 	return strings.ReplaceAll(strings.ReplaceAll(value, "~", "~0"), "/", "~1")
-}
-
-func indexPointer(index int) string {
-	return "/" + strconv.Itoa(index)
 }

@@ -50,4 +50,8 @@ func TestSchemaSecretFormatIsNarrow(t *testing.T) {
 	if err := invalid.ValidateDefinition(); err == nil {
 		t.Fatal("expected invalid secret format")
 	}
+	withDefault := Schema{Type: TypeString, Format: FormatSecretHandle, Default: json.RawMessage(`"secret"`)}
+	if err := withDefault.ValidateDefinition(); err == nil {
+		t.Fatal("expected secret default rejection")
+	}
 }

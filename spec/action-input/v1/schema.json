@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/action-input/v1/schema.json",
+  "title": "XGC ActionVersion v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "actionId",
+    "version",
+    "definitionDigest",
+    "entrypoint",
+    "inputSchema",
+    "resultSchema",
+    "acceptedTriggerKinds"
+  ],
+  "properties": {
+    "actionId": { "$ref": "#/$defs/identifier" },
+    "version": { "$ref": "#/$defs/identifier" },
+    "definitionDigest": { "$ref": "#/$defs/digest" },
+    "entrypoint": { "$ref": "#/$defs/identifier" },
+    "inputSchema": { "$ref": "#/$defs/objectSchema" },
+    "resultSchema": { "$ref": "#/$defs/schemaProfile" },
+    "acceptedTriggerKinds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "trigger.manual/v1",
+          "trigger.schedule/v1",
+          "trigger.webhook/v1",
+          "trigger.api/v1",
+          "trigger.panel/v1",
+          "trigger.xgc2-experiment/v1",
+          "trigger.action-call/v1"
+        ]
+      }
+    },
+    "requiredCapabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/identifier" }
+    },
+    "inputSizeLimit": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]*$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "objectSchema": {
+      "allOf": [
+        { "$ref": "#/$defs/schemaProfile" },
+        { "properties": { "type": { "const": "object" } } }
+      ]
+    },
+    "schemaProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "additionalProperties"],
+      "properties": {
+        "type": { "enum": ["object", "array", "string", "number", "integer", "boolean", "null"] },
+        "properties": {
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "$ref": "#/$defs/schemaProfile" }
+        },
+        "required": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
+        "additionalProperties": { "type": "boolean" },
+        "items": { "$ref": "#/$defs/schemaProfile" },
+        "default": true,
+        "enum": { "type": "array" },
+        "format": { "enum": ["xgc-secret-handle"] }
+      }
+    }
+  }
+}
