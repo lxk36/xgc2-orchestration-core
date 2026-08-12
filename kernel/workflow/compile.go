@@ -1,0 +1,423 @@
+// Package workflow compiles product-neutral Workflow definitions into a
+// deterministic plan after all graph, binding, and child-input checks pass.
+package workflow
+
+import (
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/lxk36/xgc2-execution-platform/kernel/canonicaljson"
+	"github.com/lxk36/xgc2-execution-platform/kernel/expression"
+	"github.com/lxk36/xgc2-execution-platform/sdk/go/contracts"
+)
+
+const SchemaVersion = "xgc.workflow/v1"
+
+func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflowPlan, error) {
+	if err := validateIdentityAndSchemas(definition); err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	nodes, err := indexNodes(definition.Nodes)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	graph, dataEdges, err := buildGraph(definition, nodes)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	entries, err := validateEntrypoints(definition.Entrypoints, nodes)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	order, err := topologicalOrder(graph)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	if err := validateReachability(graph, entries, nodes); err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	baseEnvironment := expression.Environment{
+		Inputs: definition.InputSchema, Trigger: definition.TriggerSchema, Scope: definition.ScopeSchema,
+		NodeOutputs: make(map[string]contracts.Schema, len(nodes)),
+	}
+	for nodeID, node := range nodes {
+		baseEnvironment.NodeOutputs[nodeID] = node.OutputSchema
+	}
+	for _, nodeID := range order {
+		node := nodes[nodeID]
+		environment := baseEnvironment
+		environment.VisibleNodes = visiblePredecessors(nodeID, dataEdges, graph, entries)
+		if err := validateInputAssembly(node.InputSchema, node.FixedInputs, node.Bindings, environment, "node "+nodeID); err != nil {
+			return contracts.CompiledWorkflowPlan{}, err
+		}
+		if node.CallAction != nil {
+			if err := validateCallAction(*node.CallAction, environment, nodeID); err != nil {
+				return contracts.CompiledWorkflowPlan{}, err
+			}
+		}
+	}
+	definitionDigest, err := canonicaljson.DigestValue(definition)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, fmt.Errorf("definition digest: %w", err)
+	}
+	unsigned := struct {
+		WorkflowID       string   `json:"workflowId"`
+		Version          string   `json:"version"`
+		DefinitionDigest string   `json:"definitionDigest"`
+		NodeOrder        []string `json:"nodeOrder"`
+	}{definition.WorkflowID, definition.Version, definitionDigest, order}
+	planDigest, err := canonicaljson.DigestValue(unsigned)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, fmt.Errorf("plan digest: %w", err)
+	}
+	return contracts.CompiledWorkflowPlan{
+		WorkflowID: definition.WorkflowID, Version: definition.Version, DefinitionDigest: definitionDigest,
+		NodeOrder: order, PlanDigest: planDigest,
+	}, nil
+}
+
+func validateIdentityAndSchemas(definition contracts.WorkflowDefinition) error {
+	if definition.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("schemaVersion must be %q", SchemaVersion)
+	}
+	if !contracts.ValidIdentifier(definition.WorkflowID) || !contracts.ValidIdentifier(definition.Version) {
+		return errors.New("workflow identity and version must be portable identifiers")
+	}
+	for name, schema := range map[string]contracts.Schema{
+		"input": definition.InputSchema, "result": definition.ResultSchema,
+		"trigger": definition.TriggerSchema, "scope": definition.ScopeSchema,
+	} {
+		if err := schema.ValidateDefinition(); err != nil {
+			return fmt.Errorf("workflow %s schema: %w", name, err)
+		}
+	}
+	if definition.InputSchema.Type != contracts.TypeObject || definition.ResultSchema.Type != contracts.TypeObject ||
+		definition.TriggerSchema.Type != contracts.TypeObject || definition.ScopeSchema.Type != contracts.TypeObject {
+		return errors.New("workflow input, result, trigger, and scope schemas must be objects")
+	}
+	return nil
+}
+
+func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]contracts.WorkflowNodeDefinition, error) {
+	if len(definitions) == 0 {
+		return nil, errors.New("workflow must contain at least one node")
+	}
+	nodes := make(map[string]contracts.WorkflowNodeDefinition, len(definitions))
+	for _, node := range definitions {
+		if !contracts.ValidIdentifier(node.NodeID) || !contracts.ValidTypeRef(node.TypeRef) {
+			return nil, fmt.Errorf("node identity or typeRef %q/%q is invalid", node.NodeID, node.TypeRef)
+		}
+		if _, duplicate := nodes[node.NodeID]; duplicate {
+			return nil, fmt.Errorf("node %q is duplicated", node.NodeID)
+		}
+		if node.InputSchema.Type != contracts.TypeObject || node.OutputSchema.Type != contracts.TypeObject {
+			return nil, fmt.Errorf("node %q input and output schemas must be objects", node.NodeID)
+		}
+		if err := node.InputSchema.ValidateDefinition(); err != nil {
+			return nil, fmt.Errorf("node %q input schema: %w", node.NodeID, err)
+		}
+		if err := node.OutputSchema.ValidateDefinition(); err != nil {
+			return nil, fmt.Errorf("node %q output schema: %w", node.NodeID, err)
+		}
+		nodes[node.NodeID] = node
+	}
+	return nodes, nil
+}
+
+type dependencyGraph map[string]map[string]struct{}
+
+func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contracts.WorkflowNodeDefinition) (dependencyGraph, map[string]map[string]bool, error) {
+	graph := make(dependencyGraph, len(nodes))
+	dataEdges := make(map[string]map[string]bool)
+	for nodeID := range nodes {
+		graph[nodeID] = make(map[string]struct{})
+	}
+	seen := make(map[string]struct{})
+	for _, edge := range definition.Edges {
+		if !edge.Kind.Valid() {
+			return nil, nil, fmt.Errorf("edge %s -> %s has invalid kind %q", edge.From, edge.To, edge.Kind)
+		}
+		if _, exists := nodes[edge.From]; !exists {
+			return nil, nil, fmt.Errorf("edge source %q does not exist", edge.From)
+		}
+		if _, exists := nodes[edge.To]; !exists {
+			return nil, nil, fmt.Errorf("edge target %q does not exist", edge.To)
+		}
+		if edge.From == edge.To {
+			return nil, nil, fmt.Errorf("node %q cannot depend on itself", edge.From)
+		}
+		identity := edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind)
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, nil, fmt.Errorf("edge %s -> %s (%s) is duplicated", edge.From, edge.To, edge.Kind)
+		}
+		seen[identity] = struct{}{}
+		graph[edge.From][edge.To] = struct{}{}
+		if edge.Kind == contracts.EdgeData {
+			if dataEdges[edge.To] == nil {
+				dataEdges[edge.To] = make(map[string]bool)
+			}
+			dataEdges[edge.To][edge.From] = true
+		}
+	}
+	return graph, dataEdges, nil
+}
+
+func validateEntrypoints(entrypoints map[string]string, nodes map[string]contracts.WorkflowNodeDefinition) ([]string, error) {
+	if len(entrypoints) == 0 {
+		return nil, errors.New("workflow must declare at least one entrypoint")
+	}
+	entries := make([]string, 0, len(entrypoints))
+	seenNodes := make(map[string]bool)
+	for name, nodeID := range entrypoints {
+		if !contracts.ValidIdentifier(name) {
+			return nil, fmt.Errorf("entrypoint %q is invalid", name)
+		}
+		if _, exists := nodes[nodeID]; !exists {
+			return nil, fmt.Errorf("entrypoint %q targets missing node %q", name, nodeID)
+		}
+		if !seenNodes[nodeID] {
+			entries = append(entries, nodeID)
+			seenNodes[nodeID] = true
+		}
+	}
+	sort.Strings(entries)
+	return entries, nil
+}
+
+func topologicalOrder(graph dependencyGraph) ([]string, error) {
+	indegree := make(map[string]int, len(graph))
+	for nodeID := range graph {
+		indegree[nodeID] = 0
+	}
+	for _, successors := range graph {
+		for successor := range successors {
+			indegree[successor]++
+		}
+	}
+	ready := make([]string, 0)
+	for nodeID, degree := range indegree {
+		if degree == 0 {
+			ready = append(ready, nodeID)
+		}
+	}
+	sort.Strings(ready)
+	order := make([]string, 0, len(graph))
+	for len(ready) != 0 {
+		nodeID := ready[0]
+		ready = ready[1:]
+		order = append(order, nodeID)
+		for successor := range graph[nodeID] {
+			indegree[successor]--
+			if indegree[successor] == 0 {
+				ready = append(ready, successor)
+				sort.Strings(ready)
+			}
+		}
+	}
+	if len(order) != len(graph) {
+		return nil, errors.New("workflow dependency graph contains a cycle")
+	}
+	return order, nil
+}
+
+func validateReachability(graph dependencyGraph, entries []string, nodes map[string]contracts.WorkflowNodeDefinition) error {
+	reached := reachable(graph, entries, "")
+	missing := make([]string, 0)
+	for nodeID := range nodes {
+		if !reached[nodeID] {
+			missing = append(missing, nodeID)
+		}
+	}
+	if len(missing) != 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("unreachable workflow nodes: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func reachable(graph dependencyGraph, starts []string, excluded string) map[string]bool {
+	result := make(map[string]bool)
+	queue := append([]string(nil), starts...)
+	for len(queue) != 0 {
+		nodeID := queue[0]
+		queue = queue[1:]
+		if nodeID == excluded || result[nodeID] {
+			continue
+		}
+		result[nodeID] = true
+		for successor := range graph[nodeID] {
+			queue = append(queue, successor)
+		}
+	}
+	return result
+}
+
+func visiblePredecessors(target string, dataEdges map[string]map[string]bool, graph dependencyGraph, entries []string) map[string]bool {
+	visible := make(map[string]bool)
+	for source := range dataEdges[target] {
+		if dominates(source, target, graph, entries) {
+			visible[source] = true
+		}
+	}
+	return visible
+}
+
+func dominates(source, target string, graph dependencyGraph, entries []string) bool {
+	if source == target {
+		return true
+	}
+	return !reachable(graph, entries, source)[target]
+}
+
+func validateInputAssembly(schema contracts.Schema, fixed map[string]any, bindings []contracts.ValueBinding, environment expression.Environment, context string) error {
+	provided := make(map[string]bool)
+	if fixed == nil {
+		fixed = map[string]any{}
+	}
+	if err := validateFixed(schema, fixed, "", provided); err != nil {
+		return fmt.Errorf("%s fixed inputs: %w", context, err)
+	}
+	seenTargets := make(map[string]bool)
+	for index, binding := range bindings {
+		segments, err := pointerSegments(binding.Target)
+		if err != nil {
+			return fmt.Errorf("%s binding %d: %w", context, index, err)
+		}
+		if seenTargets[binding.Target] || covered(binding.Target, provided) {
+			return fmt.Errorf("%s binding target %q is assigned more than once", context, binding.Target)
+		}
+		target, err := schema.Resolve(segments)
+		if err != nil {
+			return fmt.Errorf("%s binding target %q: %w", context, binding.Target, err)
+		}
+		if err := expression.CheckAssignable(binding.Value, environment, target); err != nil {
+			return fmt.Errorf("%s binding target %q: %w", context, binding.Target, err)
+		}
+		seenTargets[binding.Target] = true
+		provided[binding.Target] = true
+	}
+	defaults, defaultPaths, err := schema.ApplyDefaults(map[string]any{})
+	_ = defaults
+	if err != nil {
+		return fmt.Errorf("%s defaults: %w", context, err)
+	}
+	for pointer := range defaultPaths {
+		provided[pointer] = true
+	}
+	for _, required := range requiredPointers(schema, "") {
+		if !covered(required, provided) {
+			return fmt.Errorf("%s required input %q is not assigned", context, required)
+		}
+	}
+	return nil
+}
+
+func validateFixed(schema contracts.Schema, value map[string]any, pointer string, provided map[string]bool) error {
+	for name, child := range value {
+		property, exists := schema.Properties[name]
+		if !exists {
+			return fmt.Errorf("unknown property %q", pointer+"/"+name)
+		}
+		childPointer := pointer + "/" + escapePointer(name)
+		if object, ok := child.(map[string]any); ok && property.Type == contracts.TypeObject {
+			if err := validateFixed(property, object, childPointer, provided); err != nil {
+				return err
+			}
+			if len(object) == 0 {
+				provided[childPointer] = true
+			}
+			continue
+		}
+		if err := property.ValidateValue(child); err != nil {
+			return fmt.Errorf("property %q: %w", childPointer, err)
+		}
+		provided[childPointer] = true
+	}
+	return nil
+}
+
+func validateCallAction(call contracts.CallAction, environment expression.Environment, nodeID string) error {
+	if !contracts.ValidIdentifier(call.TargetActionRef.ActionID) || !contracts.ValidIdentifier(call.TargetActionRef.Version) ||
+		!contracts.ValidDigest(call.TargetActionRef.Digest) {
+		return fmt.Errorf("node %q child action ref is invalid", nodeID)
+	}
+	if call.InputSchema.Type != contracts.TypeObject || call.ResultSchema.Type != contracts.TypeObject {
+		return fmt.Errorf("node %q child action input and result schemas must be objects", nodeID)
+	}
+	if err := call.ResultSchema.ValidateDefinition(); err != nil {
+		return fmt.Errorf("node %q child result schema: %w", nodeID, err)
+	}
+	if err := validateInputAssembly(call.InputSchema, nil, call.InputMap, environment, "node "+nodeID+" child inputMap"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func pointerSegments(pointer string) ([]string, error) {
+	if pointer == "" || pointer == "/" || !strings.HasPrefix(pointer, "/") {
+		return nil, errors.New("binding target must be a non-root JSON Pointer")
+	}
+	rawSegments := strings.Split(pointer[1:], "/")
+	segments := make([]string, len(rawSegments))
+	for index, raw := range rawSegments {
+		if raw == "" {
+			return nil, errors.New("binding target contains an empty path segment")
+		}
+		var decoded strings.Builder
+		for position := 0; position < len(raw); position++ {
+			if raw[position] != '~' {
+				decoded.WriteByte(raw[position])
+				continue
+			}
+			if position+1 == len(raw) {
+				return nil, errors.New("binding target contains an invalid JSON Pointer escape")
+			}
+			position++
+			switch raw[position] {
+			case '0':
+				decoded.WriteByte('~')
+			case '1':
+				decoded.WriteByte('/')
+			default:
+				return nil, errors.New("binding target contains an invalid JSON Pointer escape")
+			}
+		}
+		segments[index] = decoded.String()
+	}
+	return segments, nil
+}
+
+func requiredPointers(schema contracts.Schema, pointer string) []string {
+	result := make([]string, 0)
+	for _, name := range schema.Required {
+		property := schema.Properties[name]
+		childPointer := pointer + "/" + escapePointer(name)
+		children := requiredPointers(property, childPointer)
+		if property.Type != contracts.TypeObject || len(children) == 0 {
+			result = append(result, childPointer)
+		} else {
+			result = append(result, children...)
+		}
+	}
+	return result
+}
+
+func covered(pointer string, provided map[string]bool) bool {
+	for assigned := range provided {
+		if assigned == pointer || strings.HasPrefix(pointer, assigned+"/") || strings.HasPrefix(assigned, pointer+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func escapePointer(value string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(value, "~", "~0"), "/", "~1")
+}
+
+func indexPointer(index int) string {
+	return "/" + strconv.Itoa(index)
+}
