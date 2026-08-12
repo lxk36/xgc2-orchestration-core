@@ -4,3 +4,4 @@ The durable wire form is a bounded structured AST, never JavaScript, a shell fra
 
 Secret handles can only be direct references assigned to declared secret slots. They cannot enter operators, objects, arrays, logs, outputs, or public input fields.
 
+An optional path that is absent evaluates to `missing`, which is not a JSON value. Only `coalesce` may consume `missing`; every other top-level, operator, object, or array use fails closed.

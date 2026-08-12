@@ -4,3 +4,4 @@ Every ingress adapter resolves an exact `ActionVersion`, normalizes one `Trigger
 
 Handlers cannot add defaults or merge trigger payload, UI state, environment variables, or a previous Run. Panel ingress requires an exact preset. Preset overrides are exact non-root JSON Pointers.
 
+Presets are accepted only by Manual and Panel ingress. Schedule and webhook adapters must freeze their versioned input template or mapping instead of resolving a preset again at admission time.

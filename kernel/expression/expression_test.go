@@ -98,3 +98,32 @@ func TestEvaluateRejectsValuesThatViolateCheckedSchemas(t *testing.T) {
 		t.Fatalf("value validation error = %v", err)
 	}
 }
+
+func TestCoalesceHandlesMissingOptionalReference(t *testing.T) {
+	expr := contracts.ValueExpr{Op: "coalesce", Args: []contracts.ValueExpr{
+		{Ref: "inputs.mode"}, {Literal: raw(`"fallback"`)},
+	}}
+	value, err := Evaluate(expr, expressionEnvironment(), Values{Inputs: map[string]any{"count": json.Number("1")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value != "fallback" {
+		t.Fatalf("coalesced value = %#v", value)
+	}
+	if _, err := Evaluate(contracts.ValueExpr{Ref: "inputs.mode"}, expressionEnvironment(), Values{Inputs: map[string]any{"count": json.Number("1")}}); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("bare optional ref error = %v", err)
+	}
+}
+
+func TestAssignableRequiresGuaranteedObjectFields(t *testing.T) {
+	environment := expressionEnvironment()
+	environment.Inputs.Properties["config"] = contracts.Schema{
+		Type: contracts.TypeObject, Properties: map[string]contracts.Schema{"name": {Type: contracts.TypeString}},
+	}
+	target := contracts.Schema{
+		Type: contracts.TypeObject, Properties: map[string]contracts.Schema{"name": {Type: contracts.TypeString}}, Required: []string{"name"},
+	}
+	if err := CheckAssignable(contracts.ValueExpr{Ref: "inputs.config"}, environment, target); err == nil || !strings.Contains(err.Error(), "not guaranteed") {
+		t.Fatalf("required guarantee error = %v", err)
+	}
+}

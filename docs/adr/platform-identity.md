@@ -48,4 +48,3 @@ remain replaceable modules outside the pure kernel.
 S1 proves compile-time independence only. Standalone Controller restart,
 persistence, execution, and container acceptance belong to later slices and
 must not be inferred from this ADR.
-

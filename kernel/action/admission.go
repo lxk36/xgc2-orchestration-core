@@ -54,6 +54,9 @@ func Admit(request Request) (Admission, error) {
 	if request.Trigger.Kind == contracts.TriggerPanel && request.Preset == nil {
 		return Admission{}, errors.New("panel trigger requires an exact preset")
 	}
+	if request.Preset != nil && request.Trigger.Kind != contracts.TriggerPanel && request.Trigger.Kind != contracts.TriggerManual {
+		return Admission{}, fmt.Errorf("trigger %q cannot apply an Action preset", request.Trigger.Kind)
+	}
 	if request.MappingDigest != "" && !contracts.ValidDigest(request.MappingDigest) {
 		return Admission{}, errors.New("candidate mapping digest is invalid")
 	}
@@ -77,12 +80,12 @@ func Admit(request Request) (Admission, error) {
 	}
 	provenance := make(map[string]contracts.InputFieldProvenance)
 	for pointer := range defaultPaths {
-		provenance[pointer] = contracts.InputFieldProvenance{
+		setProvenance(provenance, contracts.InputFieldProvenance{
 			TargetPointer: pointer,
 			OriginKind:    contracts.OriginSchemaDefault,
 			SourceRef:     request.Action.ActionID + "@" + request.Action.Version + "#inputSchema",
 			SourceDigest:  request.Action.DefinitionDigest,
-		}
+		})
 	}
 
 	presetRef, presetDigest := "", ""
@@ -98,13 +101,13 @@ func Admit(request Request) (Admission, error) {
 		presetRef = request.Preset.PresetID + "@" + request.Preset.Version
 		presetDigest = request.Preset.Digest
 		for pointer := range leafPointers(presetValues) {
-			provenance[pointer] = contracts.InputFieldProvenance{
+			setProvenance(provenance, contracts.InputFieldProvenance{
 				TargetPointer: pointer,
 				OriginKind:    contracts.OriginPreset,
 				SourceRef:     presetRef,
 				SourcePointer: pointer,
 				SourceDigest:  request.Preset.Digest,
-			}
+			})
 		}
 		if err := validateOverrides(candidate, request.Preset.OverridablePaths); err != nil {
 			return Admission{}, err
@@ -113,14 +116,14 @@ func Admit(request Request) (Admission, error) {
 
 	mergeObject(inputs, candidate)
 	for pointer := range leafPointers(candidate) {
-		provenance[pointer] = contracts.InputFieldProvenance{
+		setProvenance(provenance, contracts.InputFieldProvenance{
 			TargetPointer: pointer,
 			OriginKind:    request.CandidateOrigin,
 			SourceRef:     request.CandidateRef,
 			SourcePointer: pointer,
 			SourceDigest:  candidateDigest,
 			MappingDigest: request.MappingDigest,
-		}
+		})
 	}
 	if err := request.Action.InputSchema.ValidateValue(inputs); err != nil {
 		return Admission{}, fmt.Errorf("action inputs: %w", err)
@@ -162,6 +165,16 @@ func Admit(request Request) (Admission, error) {
 		PresetDigest:    presetDigest,
 		FieldProvenance: orderedProvenance,
 	}, nil
+}
+
+func setProvenance(target map[string]contracts.InputFieldProvenance, item contracts.InputFieldProvenance) {
+	for pointer := range target {
+		if pointer == item.TargetPointer || strings.HasPrefix(pointer, item.TargetPointer+"/") ||
+			strings.HasPrefix(item.TargetPointer, pointer+"/") {
+			delete(target, pointer)
+		}
+	}
+	target[item.TargetPointer] = item
 }
 
 func validateAction(action contracts.ActionVersion) error {

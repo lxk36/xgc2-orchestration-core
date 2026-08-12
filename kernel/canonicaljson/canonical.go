@@ -65,6 +65,9 @@ func Decode(raw []byte, limits Limits) (any, error) {
 	if !utf8.Valid(raw) {
 		return nil, errors.New("JSON input is not valid UTF-8")
 	}
+	if err := rejectUnpairedSurrogates(raw); err != nil {
+		return nil, err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	state := decodeState{decoder: decoder, limits: limits}
@@ -79,6 +82,26 @@ func Decode(raw []byte, limits Limits) (any, error) {
 		return nil, fmt.Errorf("trailing JSON data: %w", err)
 	}
 	return value, nil
+}
+
+// UnmarshalStrict applies the canonical wire parser before decoding a typed
+// contract and rejects fields unknown to that contract version.
+func UnmarshalStrict(raw []byte, target any) error {
+	canonical, err := Canonicalize(raw)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.DisallowUnknownFields()
+	decoder.UseNumber()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("multiple JSON values")
+	}
+	return nil
 }
 
 type decodeState struct {
@@ -376,4 +399,61 @@ func decimalDigits(value string) bool {
 		}
 	}
 	return true
+}
+
+func rejectUnpairedSurrogates(raw []byte) error {
+	insideString := false
+	for index := 0; index < len(raw); index++ {
+		switch raw[index] {
+		case '"':
+			insideString = !insideString
+		case '\\':
+			if !insideString || index+1 >= len(raw) {
+				continue
+			}
+			if raw[index+1] != 'u' {
+				index++
+				continue
+			}
+			code, ok := unicodeEscape(raw, index)
+			if !ok {
+				continue // encoding/json reports malformed hexadecimal escapes.
+			}
+			if code >= 0xdc00 && code <= 0xdfff {
+				return errors.New("JSON string contains an unpaired low surrogate")
+			}
+			if code >= 0xd800 && code <= 0xdbff {
+				next := index + 6
+				low, paired := unicodeEscape(raw, next)
+				if !paired || low < 0xdc00 || low > 0xdfff {
+					return errors.New("JSON string contains an unpaired high surrogate")
+				}
+				index = next + 5
+				continue
+			}
+			index += 5
+		}
+	}
+	return nil
+}
+
+func unicodeEscape(raw []byte, start int) (uint16, bool) {
+	if start < 0 || start+5 >= len(raw) || raw[start] != '\\' || raw[start+1] != 'u' {
+		return 0, false
+	}
+	var result uint16
+	for _, character := range raw[start+2 : start+6] {
+		result <<= 4
+		switch {
+		case character >= '0' && character <= '9':
+			result += uint16(character - '0')
+		case character >= 'a' && character <= 'f':
+			result += uint16(character-'a') + 10
+		case character >= 'A' && character <= 'F':
+			result += uint16(character-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return result, true
 }

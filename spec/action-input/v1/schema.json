@@ -77,7 +77,56 @@
         "default": true,
         "enum": { "type": "array" },
         "format": { "enum": ["xgc-secret-handle"] }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "object" } }, "required": ["type"] },
+          "then": {
+            "not": { "anyOf": [{ "required": ["items"] }, { "required": ["format"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "array" } }, "required": ["type"] },
+          "then": {
+            "required": ["items"],
+            "properties": {
+              "properties": { "maxProperties": 0 },
+              "required": { "maxItems": 0 },
+              "additionalProperties": { "const": false }
+            },
+            "not": { "required": ["format"] }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "string" } }, "required": ["type"] },
+          "then": {
+            "properties": {
+              "properties": { "maxProperties": 0 },
+              "required": { "maxItems": 0 },
+              "additionalProperties": { "const": false }
+            },
+            "not": { "required": ["items"] }
+          }
+        },
+        {
+          "if": {
+            "properties": { "type": { "enum": ["number", "integer", "boolean", "null"] } },
+            "required": ["type"]
+          },
+          "then": {
+            "properties": {
+              "properties": { "maxProperties": 0 },
+              "required": { "maxItems": 0 },
+              "additionalProperties": { "const": false }
+            },
+            "not": { "anyOf": [{ "required": ["items"] }, { "required": ["format"] }] }
+          }
+        },
+        {
+          "if": { "properties": { "format": { "const": "xgc-secret-handle" } }, "required": ["format"] },
+          "then": { "not": { "anyOf": [{ "required": ["default"] }, { "required": ["enum"] }] } }
+        }
+      ]
     }
   }
 }

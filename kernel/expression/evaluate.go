@@ -39,6 +39,9 @@ func EvaluateWithLimits(expr contracts.ValueExpr, environment Environment, value
 	if err != nil {
 		return nil, err
 	}
+	if _, missing := result.(missingValue); missing {
+		return nil, errors.New("expression result is missing")
+	}
 	if _, secret := result.(contracts.SecretHandle); secret {
 		return result, nil
 	}
@@ -97,6 +100,8 @@ type evaluator struct {
 	values Values
 }
 
+type missingValue struct{}
+
 func (evaluator evaluator) expression(expr contracts.ValueExpr) (any, error) {
 	switch {
 	case expr.Literal != nil:
@@ -104,11 +109,30 @@ func (evaluator evaluator) expression(expr contracts.ValueExpr) (any, error) {
 	case expr.Ref != "":
 		return evaluator.reference(expr.Ref)
 	case expr.Op != "":
+		if expr.Op == "coalesce" {
+			for _, child := range expr.Args {
+				value, err := evaluator.expression(child)
+				if err != nil {
+					return nil, err
+				}
+				if value == nil {
+					continue
+				}
+				if _, missing := value.(missingValue); missing {
+					continue
+				}
+				return value, nil
+			}
+			return nil, nil
+		}
 		arguments := make([]any, len(expr.Args))
 		for index, child := range expr.Args {
 			value, err := evaluator.expression(child)
 			if err != nil {
 				return nil, err
+			}
+			if _, missing := value.(missingValue); missing {
+				return nil, fmt.Errorf("operator %s argument %d is missing", expr.Op, index)
 			}
 			arguments[index] = value
 		}
@@ -120,6 +144,9 @@ func (evaluator evaluator) expression(expr contracts.ValueExpr) (any, error) {
 			if err != nil {
 				return nil, err
 			}
+			if _, missing := value.(missingValue); missing {
+				return nil, fmt.Errorf("object member %q is missing", name)
+			}
 			result[name] = value
 		}
 		return result, nil
@@ -129,6 +156,9 @@ func (evaluator evaluator) expression(expr contracts.ValueExpr) (any, error) {
 			value, err := evaluator.expression(child)
 			if err != nil {
 				return nil, err
+			}
+			if _, missing := value.(missingValue); missing {
+				return nil, fmt.Errorf("array item %d is missing", index)
 			}
 			result[index] = value
 		}
@@ -173,16 +203,19 @@ func resolveValue(value any, segments []string, ref string) (any, error) {
 		case map[string]any:
 			next, exists := typed[segment]
 			if !exists {
-				return nil, fmt.Errorf("reference %q has no value at %q", ref, segment)
+				return missingValue{}, nil
 			}
 			current = next
 		case []any:
 			index, err := strconv.Atoi(segment)
 			if err != nil || index < 0 || index >= len(typed) {
-				return nil, fmt.Errorf("reference %q has invalid array index %q", ref, segment)
+				return missingValue{}, nil
 			}
 			current = typed[index]
 		default:
+			if _, missing := current.(missingValue); missing {
+				return current, nil
+			}
 			return nil, fmt.Errorf("reference %q crosses scalar at %q", ref, segment)
 		}
 	}

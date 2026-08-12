@@ -500,9 +500,13 @@ func assignable(source, target contracts.Schema, path string) error {
 	}
 	switch target.Type {
 	case contracts.TypeObject:
+		sourceRequired := make(map[string]bool, len(source.Required))
+		for _, name := range source.Required {
+			sourceRequired[name] = true
+		}
 		for _, required := range target.Required {
 			property, exists := source.Properties[required]
-			if !exists {
+			if !exists || !sourceRequired[required] {
 				return fmt.Errorf("%s: required property %q is not guaranteed", path, required)
 			}
 			if err := assignable(property, target.Properties[required], path+"."+required); err != nil {

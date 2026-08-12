@@ -63,3 +63,27 @@ func TestCanonicalStringsDoNotUseHostHTMLEscaping(t *testing.T) {
 		t.Fatal("expected invalid UTF-8 rejection")
 	}
 }
+
+func TestCanonicalStringsRejectUnpairedSurrogates(t *testing.T) {
+	for _, raw := range []string{`"\ud800"`, `"\udfff"`} {
+		if _, err := Canonicalize([]byte(raw)); err == nil || !strings.Contains(err.Error(), "unpaired") {
+			t.Fatalf("surrogate error for %s = %v", raw, err)
+		}
+	}
+	canonical, err := Canonicalize([]byte(`"\ud83d\ude80"`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonical) != `"🚀"` {
+		t.Fatalf("surrogate pair = %s", canonical)
+	}
+}
+
+func TestUnmarshalStrictRejectsUnknownFields(t *testing.T) {
+	var target struct {
+		Name string `json:"name"`
+	}
+	if err := UnmarshalStrict([]byte(`{"name":"ok","legacy":true}`), &target); err == nil {
+		t.Fatal("expected unknown field rejection")
+	}
+}

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"go/parser"
 	"go/token"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -44,21 +43,7 @@ func readFixture(t *testing.T, segments ...string) []byte {
 }
 
 func strictDecode(raw []byte, target any) error {
-	canonical, err := canonicaljson.Canonicalize(raw)
-	if err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(canonical))
-	decoder.DisallowUnknownFields()
-	decoder.UseNumber()
-	if err := decoder.Decode(target); err != nil {
-		return err
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return errors.New("multiple JSON values")
-	}
-	return nil
+	return canonicaljson.UnmarshalStrict(raw, target)
 }
 
 func TestCanonicalGoldenFixtures(t *testing.T) {

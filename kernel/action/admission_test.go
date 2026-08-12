@@ -115,3 +115,37 @@ func TestAdmitRejectsSecretHandleInPublicActionSchema(t *testing.T) {
 		t.Fatalf("secret schema error = %v", err)
 	}
 }
+
+func TestAdmitReplacesAggregateProvenanceAndRestrictsPresetKinds(t *testing.T) {
+	arrayDefault := json.RawMessage(`["default-a","default-b"]`)
+	actionVersion := testAction(contracts.TriggerManual)
+	actionVersion.InputSchema.Properties["items"] = contracts.Schema{
+		Type: contracts.TypeArray, Items: &contracts.Schema{Type: contracts.TypeString}, Default: arrayDefault,
+	}
+	preset := contracts.ActionPresetVersion{
+		PresetID: "manual.default", Version: "v1", Digest: testDigest, ActionRef: actionVersion.Ref(),
+		Values: map[string]any{}, OverridablePaths: []string{"/name", "/items"},
+	}
+	admitted, err := Admit(Request{
+		Action: actionVersion, Trigger: testTrigger(contracts.TriggerManual), Preset: &preset,
+		Candidate: map[string]any{"name": "demo", "items": []any{"caller"}}, CandidateOrigin: contracts.OriginCaller,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, provenance := range admitted.FieldProvenance {
+		if strings.HasPrefix(provenance.TargetPointer, "/items/") {
+			t.Fatalf("stale default provenance = %#v", admitted.FieldProvenance)
+		}
+	}
+
+	scheduled := testAction(contracts.TriggerSchedule)
+	preset.ActionRef = scheduled.Ref()
+	_, err = Admit(Request{
+		Action: scheduled, Trigger: testTrigger(contracts.TriggerSchedule), Preset: &preset,
+		Candidate: map[string]any{"name": "demo"}, CandidateOrigin: contracts.OriginTriggerMap,
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot apply") {
+		t.Fatalf("schedule preset error = %v", err)
+	}
+}

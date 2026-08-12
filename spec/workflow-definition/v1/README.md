@@ -3,4 +3,3 @@
 A definition is a product-neutral DAG of typed node invocations. Both control and data edges are dependencies. A `nodes.<id>.output...` reference additionally requires a direct data edge and that the producer dominate the consumer on every reachable path.
 
 Every node input is assembled from authored fixed values, typed bindings, and direct secret-slot references before dispatch. A child Action receives only its explicit `inputMap`; there is no inherited parent context or pass-through-all option.
-

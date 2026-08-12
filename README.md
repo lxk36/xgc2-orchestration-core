@@ -58,9 +58,10 @@ context or an expression evaluator.
 ## Canonical JSON profile
 
 Content identities use one bounded profile: exactly one valid UTF-8 JSON value,
-no duplicate object member after escape decoding, object keys sorted by their
-decoded UTF-8 bytes, no insignificant whitespace, and arrays kept in authored
-order. Strings use the short JSON escapes for quote, backslash, and the five
+no unpaired Unicode surrogate, no duplicate object member after escape
+decoding, object keys sorted by their decoded UTF-8 bytes, no insignificant
+whitespace, and arrays kept in authored order. Strings use the short JSON
+escapes for quote, backslash, and the five
 named controls; other C0 controls use lowercase `\u00xx`; all other UTF-8 stays
 unescaped. Numbers use arbitrary-precision decimal normalization, never
 exponent notation, and negative zero becomes `0`.
