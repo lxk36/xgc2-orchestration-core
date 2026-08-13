@@ -480,6 +480,42 @@ func TestParentReplacementDuringOpenFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCanonicalAncestorSymlinkBackReplacementFailsClosed(t *testing.T) {
+	for _, replacement := range []string{"direct-parent", "ancestor"} {
+		t.Run(replacement, func(t *testing.T) {
+			root := t.TempDir()
+			ancestor := filepath.Join(root, "authority")
+			parent := filepath.Join(ancestor, "store")
+			if err := os.MkdirAll(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(parent, "data.db")
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer durable.Close()
+
+			replaced := parent
+			if replacement == "ancestor" {
+				replaced = ancestor
+			}
+			stale := replaced + ".stale"
+			if err := os.Rename(replaced, stale); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(stale, replaced); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = durable.GetAggregate(t.Context(), store.AggregateKey{Type: "run", ID: "missing"})
+			if !errors.Is(err, errUnsafePath) {
+				t.Fatalf("%s symlink-back replacement error = %v", replacement, err)
+			}
+		})
+	}
+}
+
 func TestOpenStoreDetectsNewHardlinkAliases(t *testing.T) {
 	for _, target := range []string{"data", "lock"} {
 		t.Run(target, func(t *testing.T) {

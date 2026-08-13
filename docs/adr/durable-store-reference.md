@@ -32,9 +32,13 @@ The exclusive process lock lives on the stable `<data>.lock` sidecar, not on
 the data inode replaced by compaction. `Open` pins the canonical parent
 directory and acquires the sidecar lock before opening or recovering data. It
 holds that lock until `Close`, including across data renames. Operations verify
-the parent, lock, and current data device/inode identities and link counts, so
-parent, sidecar, or data-path replacement is detected. Both files are mode
-`0600`; the sidecar is persistent rather than deleted and recreated.
+authority by re-walking every absolute parent component with
+`O_NOFOLLOW|O_DIRECTORY|O_CLOEXEC`, comparing the result to the pinned parent,
+then resolving lock and data names relative to that verified directory. Parent
+or ancestor symlink replacement (even a symlink back to the original inode),
+sidecar replacement, data-path replacement, and link-count changes are thereby
+detected. Both files are mode `0600`; the sidecar is persistent rather than
+deleted and recreated.
 
 The only accepted disk framing is destructive v2. There is no v1/legacy
 fallback. One complete state checkpoint is encoded as:

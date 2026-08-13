@@ -78,7 +78,6 @@ type Store struct {
 	file       *os.File
 	lockFile   *os.File
 	parent     *os.File
-	path       string
 	parentPath string
 	dataName   string
 	lockName   string
@@ -117,7 +116,7 @@ func openWithHooks(path string, hooks *ioHooks) (_ *Store, returnedErr error) {
 		return nil, err
 	}
 	result := &Store{
-		parent: parent, path: path, parentPath: parentPath, dataName: dataName,
+		parent: parent, parentPath: parentPath, dataName: dataName,
 		lockName: dataName + lockSuffix, parentID: parentID, hooks: hooks,
 	}
 	locked := false
@@ -1129,38 +1128,55 @@ func createStageAt(parent *os.File, dataName string) (string, *os.File, error) {
 }
 
 func (fileStore *Store) verifyParentAndLock() error {
-	parentInfo, err := os.Lstat(fileStore.parentPath)
+	return fileStore.verifyNamespace(false)
+}
+
+func (fileStore *Store) verifyAuthority() error {
+	return fileStore.verifyNamespace(true)
+}
+
+// verifyNamespace re-walks every parent component without following symlinks.
+// Comparing only the final parent inode is insufficient: an ancestor can be
+// renamed and replaced by a symlink back to the same inode.
+func (fileStore *Store) verifyNamespace(includeData bool) (returnedErr error) {
+	currentParent, currentParentID, err := openCanonicalParent(fileStore.parentPath)
 	if err != nil {
 		return errors.Join(errUnsafePath, err)
 	}
-	parentID, err := directoryIdentity(parentInfo)
-	if err != nil || parentID != fileStore.parentID {
+	defer func() {
+		returnedErr = errors.Join(returnedErr, currentParent.Close())
+	}()
+	if currentParentID != fileStore.parentID {
 		return errUnsafePath
 	}
-	lockInfo, err := os.Lstat(fileStore.path + lockSuffix)
-	if err != nil {
+	lockID, lockLinks, err := existingRegularIdentityAt(currentParent, fileStore.lockName)
+	if err != nil || lockLinks != 1 || lockID != fileStore.lockID {
 		return errors.Join(errUnsafePath, err)
 	}
-	lockID, nlink, err := identityFromInfo(lockInfo)
-	if err != nil || nlink != 1 || lockID != fileStore.lockID {
-		return errUnsafePath
+	if !includeData {
+		return nil
+	}
+	dataID, dataLinks, err := existingRegularIdentityAt(currentParent, fileStore.dataName)
+	if err != nil || dataLinks != 1 || dataID != fileStore.dataID || dataID == lockID {
+		return errors.Join(errUnsafePath, err)
 	}
 	return nil
 }
 
-func (fileStore *Store) verifyAuthority() error {
-	if err := fileStore.verifyParentAndLock(); err != nil {
-		return err
-	}
-	dataInfo, err := os.Lstat(fileStore.path)
+func existingRegularIdentityAt(parent *os.File, name string) (_ fileIdentity, _ uint64, returnedErr error) {
+	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return errors.Join(errUnsafePath, err)
+		return fileIdentity{}, 0, err
 	}
-	dataID, nlink, err := identityFromInfo(dataInfo)
-	if err != nil || nlink != 1 || dataID != fileStore.dataID || dataID == fileStore.lockID {
-		return errUnsafePath
+	file := os.NewFile(uintptr(fd), name)
+	defer func() {
+		returnedErr = errors.Join(returnedErr, file.Close())
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return fileIdentity{}, 0, err
 	}
-	return nil
+	return identityFromInfo(info)
 }
 
 func (fileStore *Store) writeAll(operation string, file *os.File, raw []byte) error {
