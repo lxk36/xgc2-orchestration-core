@@ -86,8 +86,11 @@ func validateDispatch(dispatch processport.Dispatch, action string) error {
 }
 
 func validateSpec(spec contracts.ProcessSpec) error {
+	if !contracts.ValidVersion(spec.Version) {
+		return errors.New("process spec version is invalid")
+	}
 	for _, value := range []string{
-		spec.ProcessID, spec.Version, spec.ExecutableRef, spec.ParameterSetRef,
+		spec.ProcessID, spec.ExecutableRef, spec.ParameterSetRef,
 		spec.StdoutArtifactRef, spec.StderrArtifactRef,
 	} {
 		if !contracts.ValidIdentifier(value) {
