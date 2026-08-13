@@ -1,6 +1,7 @@
 package filestore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -260,6 +261,83 @@ func TestFileLockAndIncompleteTailRecovery(t *testing.T) {
 	}
 	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
 		t.Fatalf("checksum corruption error = %v", err)
+	}
+}
+
+func TestOpenSeeksPastSupersededSnapshotsAndCompactsJournal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "seed.wal")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 8, 13, 11, 0, 0, 0, time.UTC)
+	decision, err := execution.AdmitRun(execution.AdmitRunCommand{
+		RunID: "run-compaction", NamespaceID: "lab",
+		ActionRef:        contracts.ActionRef{ActionID: "workflow", Version: "v1", Digest: fixtureDigest},
+		ExecutionPlanRef: "plan-1", PlanDigest: fixtureDigest, TriggerRef: "trigger-1", TriggerDigest: fixtureDigest,
+		InputDigest: fixtureDigest, ActorRef: "operator", SourceRef: "api", CommandID: "admit-compaction", At: t0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.Commit(t.Context(), runTransaction(t, decision, 0, "admit-compaction", t0)); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	frame, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const legacyFrames = 32
+	journal := bytes.Repeat(frame, legacyFrames)
+	// A superseded full snapshot may be damaged without affecting the newest
+	// checksummed snapshot. Recovery must not decode or trust the old payload.
+	journal[frameHeader+8] ^= 0xff
+	if err := os.WriteFile(path, journal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	durable, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = durable.Close() })
+	info, err := os.Stat(path)
+	if err != nil || info.Size() != int64(len(frame)) {
+		t.Fatalf("compacted journal bytes=%d want=%d err=%v", info.Size(), len(frame), err)
+	}
+	if _, err := Open(path); !errors.Is(err, store.ErrLocked) {
+		t.Fatalf("replacement inode lost the process lock: %v", err)
+	}
+	recovered, err := durable.GetAggregate(t.Context(), store.AggregateKey{Type: "run", ID: decision.Run.RunID})
+	if err != nil || recovered.Revision != decision.Run.Revision {
+		t.Fatalf("recovered latest aggregate=%#v err=%v", recovered, err)
+	}
+}
+
+func TestAppendKeepsOnlyBoundedFullSnapshotHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bounded.wal")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 100; index++ {
+		if err := durable.append(emptyState()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() > int64(len(frame)*retainedFrameBudget) {
+		t.Fatalf("bounded journal grew to %d bytes for a %d-byte frame", info.Size(), len(frame))
 	}
 }
 

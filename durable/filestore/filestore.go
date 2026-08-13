@@ -1,7 +1,9 @@
 // Package filestore is the standard-library durable Store reference adapter
-// for a single local orchestration controller. Each state change appends one
-// checksummed, fsynced snapshot frame; an incomplete final frame is discarded
-// on recovery. The file is process-locked and mode 0600.
+// for a single local orchestration controller. State changes use checksummed,
+// fsynced snapshot frames. Recovery seeks across superseded full snapshots and
+// decodes only the newest complete frame; the journal is periodically replaced
+// atomically so long-running workflows do not turn restart into a linear scan
+// of gigabytes of obsolete state. The file is process-locked and mode 0600.
 package filestore
 
 import (
@@ -28,10 +30,12 @@ import (
 )
 
 const (
-	diskVersion   = 1
-	frameHeader   = 8
-	frameChecksum = sha256.Size
-	maxFrameBytes = 64 << 20
+	diskVersion         = 1
+	frameHeader         = 8
+	frameChecksum       = sha256.Size
+	maxFrameBytes       = 64 << 20
+	maxJournalBytes     = 64 << 20
+	retainedFrameBudget = 4
 )
 
 type commandRecord struct {
@@ -88,7 +92,7 @@ func Open(path string) (*Store, error) {
 		}
 		return nil, err
 	}
-	state, recoveredOffset, err := load(file)
+	state, recoveredOffset, frameCount, err := load(file)
 	if err != nil {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		return nil, err
@@ -97,7 +101,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if recoveredOffset < info.Size() {
+	if frameCount == 0 && recoveredOffset < info.Size() {
 		if err := file.Truncate(recoveredOffset); err != nil {
 			return nil, err
 		}
@@ -105,8 +109,19 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
+	result := &Store{file: file, path: path, state: state}
+	if frameCount > 1 || (frameCount == 1 && recoveredOffset < info.Size()) {
+		frame, frameErr := encodeFrame(state)
+		if frameErr != nil {
+			return nil, frameErr
+		}
+		if err := result.replaceFrame(frame); err != nil {
+			_ = result.Close()
+			return nil, err
+		}
+	}
 	failed = false
-	return &Store{file: file, path: path, state: state}, nil
+	return result, nil
 }
 
 func (fileStore *Store) Close() error {
@@ -580,18 +595,17 @@ func validateKey(key store.AggregateKey) error {
 func keyString(key store.AggregateKey) string { return key.Type + "\x00" + key.ID }
 
 func (fileStore *Store) append(state diskState) error {
-	payload, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
+	frame, err := encodeFrame(state)
 	if err != nil {
 		return err
 	}
-	if len(payload) > maxFrameBytes {
-		return fmt.Errorf("durable frame exceeds %d bytes", maxFrameBytes)
+	info, err := fileStore.file.Stat()
+	if err != nil {
+		return err
 	}
-	frame := make([]byte, frameHeader+len(payload)+frameChecksum)
-	binary.BigEndian.PutUint64(frame[:frameHeader], uint64(len(payload)))
-	copy(frame[frameHeader:], payload)
-	sum := sha256.Sum256(payload)
-	copy(frame[frameHeader+len(payload):], sum[:])
+	if shouldCompact(info.Size(), int64(len(frame))) {
+		return fileStore.replaceFrame(frame)
+	}
 	if _, err := fileStore.file.Seek(0, io.SeekEnd); err != nil {
 		fileStore.poisoned = err
 		return err
@@ -607,56 +621,135 @@ func (fileStore *Store) append(state diskState) error {
 	return nil
 }
 
-func load(file *os.File) (diskState, int64, error) {
-	state := emptyState()
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return diskState{}, 0, err
+func encodeFrame(state diskState) ([]byte, error) {
+	payload, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
+	if err != nil {
+		return nil, err
 	}
+	if len(payload) > maxFrameBytes {
+		return nil, fmt.Errorf("durable frame exceeds %d bytes", maxFrameBytes)
+	}
+	frame := make([]byte, frameHeader+len(payload)+frameChecksum)
+	binary.BigEndian.PutUint64(frame[:frameHeader], uint64(len(payload)))
+	copy(frame[frameHeader:], payload)
+	sum := sha256.Sum256(payload)
+	copy(frame[frameHeader+len(payload):], sum[:])
+	return frame, nil
+}
+
+func shouldCompact(currentBytes, nextFrameBytes int64) bool {
+	return currentBytes+nextFrameBytes > maxJournalBytes ||
+		currentBytes > nextFrameBytes*int64(retainedFrameBudget-1)
+}
+
+// replaceFrame installs a complete snapshot on a new, already-locked inode.
+// Locking the stage before rename closes the process-ownership race: another
+// controller can observe either locked inode, never an unlocked path between
+// replacement and file-handle handoff.
+func (fileStore *Store) replaceFrame(frame []byte) error {
+	directory := filepath.Dir(fileStore.path)
+	stage, err := os.CreateTemp(directory, "."+filepath.Base(fileStore.path)+".compact-*")
+	if err != nil {
+		return err
+	}
+	stagePath := stage.Name()
+	installed := false
+	defer func() {
+		if installed {
+			return
+		}
+		_ = syscall.Flock(int(stage.Fd()), syscall.LOCK_UN)
+		_ = stage.Close()
+		_ = os.Remove(stagePath)
+	}()
+	if err := stage.Chmod(0o600); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(stage.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return err
+	}
+	if err := writeAll(stage, frame); err != nil {
+		return err
+	}
+	if err := stage.Sync(); err != nil {
+		return err
+	}
+	if err := os.Rename(stagePath, fileStore.path); err != nil {
+		return err
+	}
+	installed = true
+	prior := fileStore.file
+	fileStore.file = stage
+	parentErr := syncParent(fileStore.path)
+	unlockErr := syscall.Flock(int(prior.Fd()), syscall.LOCK_UN)
+	closeErr := prior.Close()
+	if err := errors.Join(parentErr, unlockErr, closeErr); err != nil {
+		fileStore.poisoned = err
+		return err
+	}
+	return nil
+}
+
+// load scans only fixed-size frame headers, seeks over superseded full
+// snapshots, and validates/decodes the newest complete frame. A truncated tail
+// is recoverable; a malformed frame boundary or corrupt newest frame is not.
+func load(file *os.File) (diskState, int64, int, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return diskState{}, 0, 0, err
+	}
+	fileSize := info.Size()
 	offset := int64(0)
-	for {
-		header := make([]byte, frameHeader)
-		read, err := io.ReadFull(file, header)
-		if errors.Is(err, io.EOF) && read == 0 {
-			return state, offset, nil
+	latestOffset := int64(-1)
+	latestLength := int64(0)
+	recoveredOffset := int64(0)
+	frameCount := 0
+	header := make([]byte, frameHeader)
+	for offset < fileSize {
+		remaining := fileSize - offset
+		if remaining < frameHeader {
+			break
 		}
-		if errors.Is(err, io.ErrUnexpectedEOF) || (errors.Is(err, io.EOF) && read > 0) {
-			return state, offset, nil
-		}
-		if err != nil {
-			return diskState{}, offset, err
+		if _, err := file.ReadAt(header, offset); err != nil {
+			return diskState{}, recoveredOffset, frameCount, err
 		}
 		length := binary.BigEndian.Uint64(header)
 		if length == 0 || length > maxFrameBytes {
-			return diskState{}, offset, store.ErrCorrupt
+			return diskState{}, recoveredOffset, frameCount, store.ErrCorrupt
 		}
-		payload := make([]byte, int(length))
-		if _, err := io.ReadFull(file, payload); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return state, offset, nil
-			}
-			return diskState{}, offset, err
+		frameBytes := int64(frameHeader) + int64(length) + int64(frameChecksum)
+		if frameBytes > remaining {
+			break
 		}
-		checksum := make([]byte, frameChecksum)
-		if _, err := io.ReadFull(file, checksum); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				return state, offset, nil
-			}
-			return diskState{}, offset, err
-		}
-		sum := sha256.Sum256(payload)
-		if !bytes.Equal(checksum, sum[:]) {
-			return diskState{}, offset, store.ErrCorrupt
-		}
-		var candidate diskState
-		if err := canonicaljson.UnmarshalStrictWithLimits(payload, &candidate, frameJSONLimits()); err != nil {
-			return diskState{}, offset, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
-		}
-		if err := validateState(candidate); err != nil {
-			return diskState{}, offset, err
-		}
-		state = candidate
-		offset += int64(frameHeader) + int64(length) + frameChecksum
+		latestOffset = offset
+		latestLength = int64(length)
+		offset += frameBytes
+		recoveredOffset = offset
+		frameCount++
 	}
+	if frameCount == 0 {
+		return emptyState(), 0, 0, nil
+	}
+	payload := make([]byte, int(latestLength))
+	if _, err := file.ReadAt(payload, latestOffset+frameHeader); err != nil {
+		return diskState{}, recoveredOffset, frameCount, err
+	}
+	checksum := make([]byte, frameChecksum)
+	if _, err := file.ReadAt(checksum, latestOffset+frameHeader+latestLength); err != nil {
+		return diskState{}, recoveredOffset, frameCount, err
+	}
+	sum := sha256.Sum256(payload)
+	if !bytes.Equal(checksum, sum[:]) {
+		return diskState{}, recoveredOffset, frameCount, store.ErrCorrupt
+	}
+	var state diskState
+	if err := canonicaljson.UnmarshalStrictWithLimits(payload, &state, frameJSONLimits()); err != nil {
+		return diskState{}, recoveredOffset, frameCount, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
+	}
+	if err := validateState(state); err != nil {
+		return diskState{}, recoveredOffset, frameCount, err
+	}
+	return state, recoveredOffset, frameCount, nil
 }
 
 func validateState(state diskState) error {
