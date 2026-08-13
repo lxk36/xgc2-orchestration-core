@@ -180,6 +180,37 @@ func TestCompileRejectsNonDominatingNodeOutput(t *testing.T) {
 	}
 }
 
+func TestCompileAcceptsSeveralDominatingDataInputsFromSerialControlChain(t *testing.T) {
+	definition := baseDefinition()
+	definition.Nodes = []contracts.WorkflowNodeDefinition{
+		{NodeID: "first", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest, InputSchema: object(nil), OutputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value")},
+		{NodeID: "second", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest, InputSchema: object(nil), OutputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value")},
+		{
+			NodeID: "join", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest,
+			InputSchema: object(map[string]contracts.Schema{
+				"values": {Type: contracts.TypeArray, Items: &contracts.Schema{Type: contracts.TypeString}},
+			}, "values"),
+			OutputSchema: object(nil),
+			Bindings: []contracts.ValueBinding{
+				{Target: "/values/0", Value: contracts.ValueExpr{Ref: "nodes.first.output.value"}},
+				{Target: "/values/1", Value: contracts.ValueExpr{Ref: "nodes.second.output.value"}},
+			},
+		},
+	}
+	definition.Entrypoints = map[string]string{"main": "first"}
+	definition.Edges = []contracts.WorkflowEdge{
+		{From: "first", To: "second", Kind: contracts.EdgeControl},
+		{From: "second", To: "join", Kind: contracts.EdgeControl},
+		{From: "first", To: "join", Kind: contracts.EdgeData},
+		{From: "second", To: "join", Kind: contracts.EdgeData},
+	}
+	definition.ResultBindings = map[string][]contracts.ValueBinding{"main": {}}
+
+	if _, err := Compile(definition); err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+}
+
 func TestCompileRejectsMissingChildInputAndAcceptsExplicitMap(t *testing.T) {
 	definition := baseDefinition()
 	child := contracts.CallAction{

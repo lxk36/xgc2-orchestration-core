@@ -23,7 +23,7 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, err
 	}
-	graph, dataEdges, err := buildGraph(definition, nodes)
+	graph, dataEdges, controlEdges, err := buildGraph(definition, nodes)
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, err
 	}
@@ -51,7 +51,7 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 	for _, nodeID := range order {
 		node := nodes[nodeID]
 		environment := baseEnvironment
-		environment.VisibleNodes = visiblePredecessors(nodeID, dataEdges, graph, entries)
+		environment.VisibleNodes = visiblePredecessors(nodeID, dataEdges, controlEdges, graph, entries)
 		if err := validateInputAssembly(node.InputSchema, node.FixedInputs, node.Bindings, environment, "node "+nodeID); err != nil {
 			return contracts.CompiledWorkflowPlan{}, err
 		}
@@ -199,29 +199,30 @@ func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]cont
 
 type dependencyGraph map[string]map[string]struct{}
 
-func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contracts.WorkflowNodeDefinition) (dependencyGraph, map[string]map[string]bool, error) {
+func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contracts.WorkflowNodeDefinition) (dependencyGraph, map[string]map[string]bool, map[string]map[string]bool, error) {
 	graph := make(dependencyGraph, len(nodes))
 	dataEdges := make(map[string]map[string]bool)
+	controlEdges := make(map[string]map[string]bool)
 	for nodeID := range nodes {
 		graph[nodeID] = make(map[string]struct{})
 	}
 	seen := make(map[string]struct{})
 	for _, edge := range definition.Edges {
 		if !edge.Kind.Valid() {
-			return nil, nil, fmt.Errorf("edge %s -> %s has invalid kind %q", edge.From, edge.To, edge.Kind)
+			return nil, nil, nil, fmt.Errorf("edge %s -> %s has invalid kind %q", edge.From, edge.To, edge.Kind)
 		}
 		if _, exists := nodes[edge.From]; !exists {
-			return nil, nil, fmt.Errorf("edge source %q does not exist", edge.From)
+			return nil, nil, nil, fmt.Errorf("edge source %q does not exist", edge.From)
 		}
 		if _, exists := nodes[edge.To]; !exists {
-			return nil, nil, fmt.Errorf("edge target %q does not exist", edge.To)
+			return nil, nil, nil, fmt.Errorf("edge target %q does not exist", edge.To)
 		}
 		if edge.From == edge.To {
-			return nil, nil, fmt.Errorf("node %q cannot depend on itself", edge.From)
+			return nil, nil, nil, fmt.Errorf("node %q cannot depend on itself", edge.From)
 		}
 		identity := edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind)
 		if _, duplicate := seen[identity]; duplicate {
-			return nil, nil, fmt.Errorf("edge %s -> %s (%s) is duplicated", edge.From, edge.To, edge.Kind)
+			return nil, nil, nil, fmt.Errorf("edge %s -> %s (%s) is duplicated", edge.From, edge.To, edge.Kind)
 		}
 		seen[identity] = struct{}{}
 		graph[edge.From][edge.To] = struct{}{}
@@ -230,9 +231,14 @@ func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contra
 				dataEdges[edge.To] = make(map[string]bool)
 			}
 			dataEdges[edge.To][edge.From] = true
+		} else {
+			if controlEdges[edge.To] == nil {
+				controlEdges[edge.To] = make(map[string]bool)
+			}
+			controlEdges[edge.To][edge.From] = true
 		}
 	}
-	return graph, dataEdges, nil
+	return graph, dataEdges, controlEdges, nil
 }
 
 func validateEntrypoints(entrypoints map[string]string, nodes map[string]contracts.WorkflowNodeDefinition) ([]string, error) {
@@ -325,10 +331,32 @@ func reachable(graph dependencyGraph, starts []string, excluded string) map[stri
 	return result
 }
 
-func visiblePredecessors(target string, dataEdges map[string]map[string]bool, graph dependencyGraph, entries []string) map[string]bool {
+func visiblePredecessors(target string, dataEdges, controlEdges map[string]map[string]bool, graph dependencyGraph, entries []string) map[string]bool {
+	// A target may assemble one input from several earlier nodes in a serial
+	// control chain. Direct data edges are conjunctive dependencies, but if they
+	// remain in the reachability graph each earlier edge becomes a synthetic
+	// shortcut around later producers. Judge dominance with all of the target's
+	// incoming data-only edges removed, while retaining any parallel control
+	// edge between the same nodes.
+	dominanceGraph := make(dependencyGraph, len(graph))
+	for nodeID, successors := range graph {
+		dominanceGraph[nodeID] = successors
+	}
+	for source := range dataEdges[target] {
+		if controlEdges[target][source] {
+			continue
+		}
+		successors := make(map[string]struct{}, len(graph[source]))
+		for successor := range graph[source] {
+			if successor != target {
+				successors[successor] = struct{}{}
+			}
+		}
+		dominanceGraph[source] = successors
+	}
 	visible := make(map[string]bool)
 	for source := range dataEdges[target] {
-		if dominates(source, target, graph, entries) {
+		if dominates(source, target, dominanceGraph, entries) {
 			visible[source] = true
 		}
 	}
