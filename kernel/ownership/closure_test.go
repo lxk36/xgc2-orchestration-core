@@ -1,6 +1,7 @@
 package ownership
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -57,12 +58,13 @@ func TestClosureFactsAreDerivedFromExactOwnershipGraph(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	facts, err := ClosureFacts(contracts.OwnershipGraph{
-		Run: run, Revision: 9, Invocations: []contracts.InvocationLedger{invocation.Ledger},
+	base := contracts.OwnershipClosureBase{
+		Run: run, Invocations: []contracts.InvocationLedger{invocation.Ledger},
 		ChildRuns: []contracts.Run{child}, Effects: []contracts.EffectRecord{effectDecision.Effect},
 		Runtimes:  []contracts.RuntimeBinding{runtimeDecision.Binding},
 		Resources: []contracts.ResourceOwnershipFact{{BindingID: "gpu-lease", RunID: run.RunID, Ownership: contracts.EffectOwned, State: contracts.ResourceBindingActive}},
-	})
+	}
+	facts, err := DeriveClosureFacts(base, 9)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,12 +74,64 @@ func TestClosureFactsAreDerivedFromExactOwnershipGraph(t *testing.T) {
 		t.Fatalf("closure facts = %#v", facts)
 	}
 
-	empty, err := ClosureFacts(contracts.OwnershipGraph{Run: run, Revision: 10})
+	running, err := execution.TransitionRun(run, execution.RunTransitionCommand{
+		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunRunning,
+		CommandID: "start-empty", At: t0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty, err := DeriveClosureFacts(contracts.OwnershipClosureBase{Run: running.Run}, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !empty.Satisfied() {
 		t.Fatalf("empty ownership closure = %#v", empty)
+	}
+	terminal, err := execution.TransitionRun(running.Run, execution.RunTransitionCommand{
+		RunID: running.Run.RunID, ExpectedRevision: running.Run.Revision, To: contracts.RunSucceeded,
+		ResultRef: "result-empty", Closure: empty, CommandID: "complete-empty", At: t0.Add(2 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	graph := contracts.OwnershipGraph{
+		SchemaVersion: contracts.OwnershipGraphSchemaVersion, Revision: 10,
+		ClosureBase: contracts.OwnershipClosureBase{Run: running.Run}, ClosureFacts: empty,
+		TerminalRun: terminal.Run,
+	}
+	if verified, err := ClosureFacts(graph); err != nil || verified != empty ||
+		verified.RunRevision == graph.TerminalRun.Revision {
+		t.Fatalf("verified ownership graph = %#v err=%v", verified, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*contracts.OwnershipGraph)
+	}{
+		{name: "persisted-facts", mutate: func(value *contracts.OwnershipGraph) { value.ClosureFacts.RunRevision++ }},
+		{name: "graph-revision", mutate: func(value *contracts.OwnershipGraph) { value.Revision++ }},
+		{name: "terminal-revision", mutate: func(value *contracts.OwnershipGraph) { value.TerminalRun.Revision++ }},
+		{name: "terminal-kind", mutate: func(value *contracts.OwnershipGraph) {
+			value.TerminalRun.TerminationKind = contracts.TerminationStopped
+		}},
+		{name: "base-revision", mutate: func(value *contracts.OwnershipGraph) { value.ClosureBase.Run.Revision++ }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tampered := graph
+			test.mutate(&tampered)
+			if _, err := ClosureFacts(tampered); err == nil {
+				t.Fatal("tampered ownership graph validated")
+			}
+		})
+	}
+	open := graph
+	open.ClosureFacts.OpenChildCount = 1
+	if _, err := ClosureFacts(open); err == nil || errors.Is(err, execution.ErrClosureOpen) {
+		// The persisted fact first disagrees with the exact base, so this must be
+		// an integrity error rather than merely an open-closure result.
+		t.Fatalf("tampered open fact error = %v", err)
 	}
 }
 

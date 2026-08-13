@@ -47,6 +47,13 @@ Before a stopped or canceled Run becomes terminal:
   completed; and
 - the persisted `OwnershipGraph` derives zero open counts.
 
+The closure record is a single `xgc.ownership-graph/v1` envelope. It persists
+the exact pre-terminal `closureBase`, the exactly derived `closureFacts`, and
+the exact next-revision `terminalRun` in the same transaction as the Run
+aggregate. `closureFacts.runRevision` always names the closure-base Run, never
+the terminal projection. Readers validate the complete envelope and canonical
+terminal Run equality; they do not join mutable state into the proof snapshot.
+
 The coordinator continues outbox, wait-resolution, child-resolution, and
 cleanup intents while a Run is stopping. It never converts a missing provider
 observation into success. An uncertain Effect therefore keeps closure open

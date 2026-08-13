@@ -7,7 +7,7 @@
   "required": ["schemaVersion", "kind", "value"],
   "properties": {
     "schemaVersion": { "const": "xgc.orchestration-state/v1" },
-    "kind": { "enum": ["run", "invocation-ledger", "effect", "runtime-binding", "command-ledger", "domain-event"] },
+    "kind": { "enum": ["run", "invocation-ledger", "effect", "runtime-binding", "command-ledger", "ownership-graph", "domain-event"] },
     "value": true
   },
   "allOf": [
@@ -16,6 +16,7 @@
     { "if": { "properties": { "kind": { "const": "effect" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/effect" } } } },
     { "if": { "properties": { "kind": { "const": "runtime-binding" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/runtimeBinding" } } } },
     { "if": { "properties": { "kind": { "const": "command-ledger" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/commandLedger" } } } },
+    { "if": { "properties": { "kind": { "const": "ownership-graph" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/ownershipGraph" } } } },
     { "if": { "properties": { "kind": { "const": "domain-event" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/domainEvent" } } } }
   ],
   "$defs": {
@@ -144,6 +145,47 @@
         "observationDigest": { "$ref": "#/$defs/digest" }, "observationAt": { "$ref": "#/$defs/timestamp" }, "primaryFailure": { "$ref": "#/$defs/failure" },
         "createdAt": { "$ref": "#/$defs/timestamp" }, "activatedAt": { "$ref": "#/$defs/timestamp" }, "releaseStartedAt": { "$ref": "#/$defs/timestamp" },
         "finishedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "resourceOwnershipFact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bindingId", "runId", "ownership", "state"],
+      "properties": {
+        "bindingId": { "$ref": "#/$defs/identifier" }, "runId": { "$ref": "#/$defs/identifier" },
+        "ownership": { "enum": ["owned", "attached", "shared", "detached"] },
+        "state": { "enum": ["active", "releasing", "released", "lost"] }
+      }
+    },
+    "runClosureFacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runRevision", "ownershipGraphRevision", "activeInvocationCount", "liveAttemptCount", "openWaitCount", "openChildCount", "openEffectCount", "openEffectCompensationCount", "openOwnedRuntimeBindingCount", "openOwnedResourceLeaseCount"],
+      "properties": {
+        "runRevision": { "type": "integer", "minimum": 1 }, "ownershipGraphRevision": { "type": "integer", "minimum": 1 },
+        "activeInvocationCount": { "type": "integer", "minimum": 0 }, "liveAttemptCount": { "type": "integer", "minimum": 0 },
+        "openWaitCount": { "type": "integer", "minimum": 0 }, "openChildCount": { "type": "integer", "minimum": 0 },
+        "openEffectCount": { "type": "integer", "minimum": 0 }, "openEffectCompensationCount": { "type": "integer", "minimum": 0 },
+        "openOwnedRuntimeBindingCount": { "type": "integer", "minimum": 0 }, "openOwnedResourceLeaseCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ownershipClosureBase": {
+      "type": "object", "additionalProperties": false,
+      "required": ["run", "invocations", "childRuns", "effects", "runtimes", "resources"],
+      "properties": {
+        "run": { "$ref": "#/$defs/run" },
+        "invocations": { "type": "array", "items": { "$ref": "#/$defs/invocationLedger" } },
+        "childRuns": { "type": "array", "items": { "$ref": "#/$defs/run" } },
+        "effects": { "type": "array", "items": { "$ref": "#/$defs/effect" } },
+        "runtimes": { "type": "array", "items": { "$ref": "#/$defs/runtimeBinding" } },
+        "resources": { "type": "array", "items": { "$ref": "#/$defs/resourceOwnershipFact" } }
+      }
+    },
+    "ownershipGraph": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "revision", "closureBase", "closureFacts", "terminalRun"],
+      "properties": {
+        "schemaVersion": { "const": "xgc.ownership-graph/v1" }, "revision": { "type": "integer", "minimum": 1 },
+        "closureBase": { "$ref": "#/$defs/ownershipClosureBase" }, "closureFacts": { "$ref": "#/$defs/runClosureFacts" },
+        "terminalRun": { "$ref": "#/$defs/run" }
       }
     },
     "revisionFence": { "type": "object", "additionalProperties": false, "required": ["targetId", "expectedRevision"], "properties": { "targetId": { "$ref": "#/$defs/identifier" }, "expectedRevision": { "type": "integer", "minimum": 1 } } },

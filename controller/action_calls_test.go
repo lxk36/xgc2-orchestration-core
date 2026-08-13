@@ -102,7 +102,7 @@ func TestControllerExecutesPinnedChildActionWithExplicitContextAndResultMaps(t *
 		t.Fatalf("child lineage = %+v err=%v", child, err)
 	}
 	graph, err := fixture.controller.OwnershipGraph(context.Background(), completed.RunID)
-	if err != nil || len(graph.ChildRuns) != 1 || graph.ChildRuns[0].RunID != childRunID {
+	if err != nil || len(graph.ClosureBase.ChildRuns) != 1 || graph.ClosureBase.ChildRuns[0].RunID != childRunID {
 		t.Fatalf("parent ownership graph = %+v err=%v", graph, err)
 	}
 }

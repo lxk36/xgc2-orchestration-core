@@ -7,6 +7,7 @@ import (
 
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/ownership"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
@@ -145,7 +146,12 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 			return run, ErrRunClosureOpen
 		}
 	}
-	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	closureBase, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	graphRevision := graphExpected + 1
+	closure, err := ownership.DeriveClosureFacts(closureBase, graphRevision)
 	if err != nil {
 		return contracts.Run{}, err
 	}
@@ -160,6 +166,13 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 		CommandID: commandID, At: at,
 	})
 	if err != nil {
+		return contracts.Run{}, err
+	}
+	graph := contracts.OwnershipGraph{
+		SchemaVersion: contracts.OwnershipGraphSchemaVersion, Revision: graphRevision,
+		ClosureBase: closureBase, ClosureFacts: closure, TerminalRun: decision.Run,
+	}
+	if _, err := ownership.ClosureFacts(graph); err != nil {
 		return contracts.Run{}, err
 	}
 	runMutation, err := aggregateMutation(runKey(run.RunID), runRecord.Revision, decision.Run)
@@ -224,7 +237,12 @@ func (controller *Controller) succeedRun(
 			Class: contracts.FailurePermanent, Code: "cleanup.required-failed", Message: "one or more required Effect compensations failed",
 		}, at)
 	}
-	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	closureBase, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	graphRevision := graphExpected + 1
+	closure, err := ownership.DeriveClosureFacts(closureBase, graphRevision)
 	if err != nil {
 		return contracts.Run{}, err
 	}
@@ -239,6 +257,13 @@ func (controller *Controller) succeedRun(
 		CommandID: commandID, At: at,
 	})
 	if err != nil {
+		return contracts.Run{}, err
+	}
+	graph := contracts.OwnershipGraph{
+		SchemaVersion: contracts.OwnershipGraphSchemaVersion, Revision: graphRevision,
+		ClosureBase: closureBase, ClosureFacts: closure, TerminalRun: decision.Run,
+	}
+	if _, err := ownership.ClosureFacts(graph); err != nil {
 		return contracts.Run{}, err
 	}
 	snapshot.Result = result

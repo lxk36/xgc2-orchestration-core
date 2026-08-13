@@ -89,12 +89,14 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 		t.Fatalf("listed runs = %#v, err = %v", runs, err)
 	}
 	graph, err := fixture.controller.OwnershipGraph(t.Context(), run.RunID)
-	if err != nil || graph.Revision != 1 || graph.Run.Revision != run.Revision ||
-		graph.Run.Status != contracts.RunSucceeded || len(graph.Invocations) != 2 {
+	if err != nil || graph.Revision != 1 || graph.TerminalRun.Revision != run.Revision ||
+		graph.TerminalRun.Status != contracts.RunSucceeded || graph.ClosureBase.Run.Revision+1 != run.Revision ||
+		len(graph.ClosureBase.Invocations) != 2 {
 		t.Fatalf("ownership graph = %#v, terminal revision=%d err=%v", graph, run.Revision, err)
 	}
 	facts, err := ownership.ClosureFacts(graph)
-	if err != nil || !facts.Satisfied() || facts.OwnershipGraphRevision != graph.Revision {
+	if err != nil || !facts.Satisfied() || facts.OwnershipGraphRevision != graph.Revision ||
+		facts.RunRevision != graph.ClosureBase.Run.Revision || facts.RunRevision == graph.TerminalRun.Revision {
 		t.Fatalf("closure facts = %#v, err=%v", facts, err)
 	}
 	path := fixture.path
@@ -119,6 +121,66 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 	}
 	if recoveredGraph, graphErr := recovered.OwnershipGraph(t.Context(), run.RunID); graphErr != nil || recoveredGraph.Revision != graph.Revision {
 		t.Fatalf("recovered ownership graph = %#v, err=%v", recoveredGraph, graphErr)
+	} else {
+		before, beforeErr := canonicaljson.Marshal(graph)
+		after, afterErr := canonicaljson.Marshal(recoveredGraph)
+		if beforeErr != nil || afterErr != nil || string(before) != string(after) {
+			t.Fatalf("recovered ownership graph is not the exact persisted snapshot: before=%s after=%s errors=%v/%v", before, after, beforeErr, afterErr)
+		}
+	}
+}
+
+func TestOwnershipGraphReadFailsClosedWhenTerminalRunAggregateDiffers(t *testing.T) {
+	fixture := newControllerFixture(t)
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-ownership-tamper", "invoke-ownership-tamper"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || terminal.Status != contracts.RunSucceeded {
+		t.Fatalf("terminal run = %#v err=%v", terminal, err)
+	}
+	graphRecord, err := fixture.store.GetAggregate(t.Context(), ownershipGraphKey(terminal.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runRecord, err := fixture.store.GetAggregate(t.Context(), runKey(terminal.RunID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := terminal
+	tampered.ResultRef = "result-tampered"
+	runMutation, err := aggregateMutation(runKey(terminal.RunID), runRecord.Revision, tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := terminal.UpdatedAt.Add(time.Second)
+	event, err := aggregateEvent(runMutation, "run.test-tampered", "tamper-terminal-run", at, map[string]any{"runId": terminal.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := canonicaljson.Marshal(tampered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{"commandId": "tamper-terminal-run", "mutation": runMutation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.Commit(t.Context(), store.Transaction{
+		CommandID: "tamper-terminal-run", IdentityDigest: identity,
+		Expected:  []store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}},
+		Mutations: []store.AggregateRecord{runMutation}, Events: []contracts.DomainEvent{event},
+		Outcome: outcome, At: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.OwnershipGraph(t.Context(), terminal.RunID); err == nil {
+		t.Fatal("ownership graph dynamically accepted a different terminal Run aggregate")
+	}
+	if unchanged, err := fixture.store.GetAggregate(t.Context(), ownershipGraphKey(terminal.RunID)); err != nil ||
+		unchanged.Revision != graphRecord.Revision || unchanged.PayloadDigest != graphRecord.PayloadDigest {
+		t.Fatalf("ownership graph changed during failed read: %#v err=%v", unchanged, err)
 	}
 }
 

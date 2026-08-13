@@ -37,7 +37,9 @@ The standard-library-only Go kernel currently provides:
 - an intent worker that requires explicit complete/retry/dead/leave results and
   never treats uncertain external effects as automatically retryable;
 - independent RuntimeBinding ownership, generation fencing, lease takeover,
-  provider observation, and exact ownership-graph closure facts;
+  provider observation, and a self-contained ownership-graph envelope that
+  persists the pre-terminal closure base, exact facts, and terminal Run in one
+  transaction;
 - a Linux local-process provider with process groups, PID/start-time reuse
   protection, TERM/KILL/reap control, generation high-water fencing, and
   immutable receipts;

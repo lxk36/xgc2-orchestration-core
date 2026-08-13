@@ -29,12 +29,27 @@ type ResourceOwnershipFact struct {
 	State     ResourceBindingState `json:"state"`
 }
 
-type OwnershipGraph struct {
+const OwnershipGraphSchemaVersion = "xgc.ownership-graph/v1"
+
+// OwnershipClosureBase is the exact pre-terminal state against which Run
+// closure was proved. Its Run revision deliberately differs from TerminalRun
+// by one; neither field is a projection of the other.
+type OwnershipClosureBase struct {
 	Run         Run                     `json:"run"`
-	Revision    uint64                  `json:"revision"`
 	Invocations []InvocationLedger      `json:"invocations"`
 	ChildRuns   []Run                   `json:"childRuns"`
 	Effects     []EffectRecord          `json:"effects"`
 	Runtimes    []RuntimeBinding        `json:"runtimes"`
 	Resources   []ResourceOwnershipFact `json:"resources"`
+}
+
+// OwnershipGraph is the immutable, self-contained closure record committed in
+// the same transaction as TerminalRun. ClosureFacts is persisted as the exact
+// proof output and must equal a fresh derivation from ClosureBase.
+type OwnershipGraph struct {
+	SchemaVersion string               `json:"schemaVersion"`
+	Revision      uint64               `json:"revision"`
+	ClosureBase   OwnershipClosureBase `json:"closureBase"`
+	ClosureFacts  RunClosureFacts      `json:"closureFacts"`
+	TerminalRun   Run                  `json:"terminalRun"`
 }

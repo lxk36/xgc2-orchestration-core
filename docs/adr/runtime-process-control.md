@@ -26,8 +26,11 @@ only after the provider proves the exact external identity is stopped.
 Attached/shared bindings only detach; they never issue destructive cleanup.
 Lost is explicit and does not masquerade as stopped.
 
-`kernel/ownership` derives Run closure facts from an exact ownership graph
-revision. It counts active invocations/attempts/waits/children, primary or
+`kernel/ownership` derives Run closure facts from the explicit pre-terminal
+`closureBase` inside one exact ownership graph revision. That same immutable
+envelope stores the derived facts and the terminal Run committed with them;
+the two Run revisions remain distinct and are validated without a dynamic
+join. It counts active invocations/attempts/waits/children, primary or
 uncertain Effects, required Effect compensation, owned Runtime bindings, and
 owned resource bindings. Run terminal reducers consume these facts rather than
 inferring cleanup from a product status field.
