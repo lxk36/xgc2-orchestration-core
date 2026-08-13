@@ -130,11 +130,32 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	}); err == nil {
 		t.Fatal("mismatched signal resolution was accepted")
 	}
-	completed, err := orchestrator.ResolveExternalWait(t.Context(), ResolveExternalWaitRequest{
+	resolution := ResolveExternalWaitRequest{
 		RunID: waiting.RunID, SubjectRef: wait.SubjectRef, ConditionDigest: wait.ConditionDigest,
 		Status: contracts.NodeWaitResolvedSucceeded, Payload: map[string]any{"signalId": wait.SubjectRef},
 		ObservedAt: clock.Now().Add(time.Second), CommandID: "resolve-exact-signal",
-	})
+	}
+	type outcome struct {
+		run contracts.Run
+		err error
+	}
+	gate := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			<-gate
+			run, resolveErr := orchestrator.ResolveExternalWait(t.Context(), resolution)
+			outcomes <- outcome{run: run, err: resolveErr}
+		}()
+	}
+	close(gate)
+	for range 2 {
+		result := <-outcomes
+		if result.err != nil || result.run.RunID != waiting.RunID {
+			t.Fatalf("concurrent external wait = %+v err=%v", result.run, result.err)
+		}
+	}
+	completed, err := orchestrator.GetRun(t.Context(), waiting.RunID)
 	if err != nil || completed.Status != contracts.RunSucceeded {
 		t.Fatalf("resolved external wait = %+v err=%v", completed, err)
 	}

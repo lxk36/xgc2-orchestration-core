@@ -113,6 +113,12 @@ func (controller *Controller) ResolveExternalWait(ctx context.Context, request R
 			return contracts.Run{}, err
 		}
 	}
+	resolutionIdentityDigest, err := canonicaljson.DigestValue(map[string]any{
+		"runId": request.RunID, "commandId": request.CommandID, "resolution": resolution,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
 
 	var result contracts.NodeResult
 	failure := request.Failure
@@ -169,10 +175,16 @@ func (controller *Controller) ResolveExternalWait(ctx context.Context, request R
 		return contracts.Run{}, err
 	}
 	eventType := "snapshot.node-resumed"
-	eventPayload := map[string]any{"nodeId": ledger.Invocation.NodeID, "waitSubjectRef": wait.SubjectRef, "outputDigest": outputDigest}
+	eventPayload := map[string]any{
+		"nodeId": ledger.Invocation.NodeID, "waitSubjectRef": wait.SubjectRef,
+		"outputDigest": outputDigest, "resolutionIdentityDigest": resolutionIdentityDigest,
+	}
 	if failure != nil {
 		eventType = "snapshot.node-failed"
-		eventPayload = map[string]any{"nodeId": ledger.Invocation.NodeID, "waitSubjectRef": wait.SubjectRef, "failureCode": failure.Code}
+		eventPayload = map[string]any{
+			"nodeId": ledger.Invocation.NodeID, "waitSubjectRef": wait.SubjectRef,
+			"failureCode": failure.Code, "resolutionIdentityDigest": resolutionIdentityDigest,
+		}
 	}
 	snapshotEvent, err := aggregateEvent(snapshotMutation, eventType, commandID, now, eventPayload)
 	if err != nil {
@@ -212,7 +224,41 @@ func (controller *Controller) ResolveExternalWait(ctx context.Context, request R
 		append(append(runDecision.Events, invocationDecision.Events...), snapshotEvent),
 		runDecision.Intents, runDecision.Run,
 	); err != nil {
+		if errors.Is(err, store.ErrIdentityConflict) {
+			return controller.replayExternalWait(ctx, run.RunID, commandID, resolutionIdentityDigest)
+		}
 		return contracts.Run{}, err
 	}
 	return controller.Drive(ctx, run.RunID)
+}
+
+func (controller *Controller) replayExternalWait(
+	ctx context.Context,
+	runID, commandID, resolutionIdentityDigest string,
+) (contracts.Run, error) {
+	afterRevision := uint64(0)
+	for {
+		events, err := controller.store.EventsAfter(ctx, snapshotKey(runID), afterRevision, 500)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		for _, event := range events {
+			if event.CommandID != commandID {
+				continue
+			}
+			persisted, _ := event.Payload["resolutionIdentityDigest"].(string)
+			if persisted != resolutionIdentityDigest {
+				return contracts.Run{}, store.ErrIdentityConflict
+			}
+			record, err := controller.store.GetAggregate(ctx, runKey(runID))
+			if err != nil {
+				return contracts.Run{}, err
+			}
+			return decodeRun(record)
+		}
+		if len(events) < 500 {
+			return contracts.Run{}, store.ErrIdentityConflict
+		}
+		afterRevision = events[len(events)-1].AggregateRevision
+	}
 }
