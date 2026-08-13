@@ -312,6 +312,16 @@ func (adapter *successfulEffectAdapter) Dispatch(_ context.Context, _ contracts.
 	return contracts.CommandLedger{Envelope: envelope, Receipts: []contracts.CommandReceipt{accepted, succeeded}}, nil
 }
 
+type uncertainEffectAdapter struct{}
+
+func (uncertainEffectAdapter) Descriptor() EffectAdapterDescriptor {
+	return EffectAdapterDescriptor{Kind: "xgc.process-start/v1", ProviderRef: "provider-test", ProviderDigest: testPackageDigest}
+}
+
+func (uncertainEffectAdapter) Dispatch(context.Context, contracts.EffectIntent, contracts.CommandEnvelope, string) (contracts.CommandLedger, error) {
+	return contracts.CommandLedger{}, errors.New("provider outcome is unknown")
+}
+
 func TestDurableWorkersDispatchOutboxThenResumeRun(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-workers")
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
@@ -372,6 +382,75 @@ func TestDurableWorkersDispatchOutboxThenResumeRun(t *testing.T) {
 	run, err = fixture.controller.GetRun(t.Context(), run.RunID)
 	if err != nil || run.Status != contracts.RunSucceeded {
 		t.Fatalf("worker-resolved run = %#v, err=%v", run, err)
+	}
+}
+
+func TestWaitIntentCompletesAfterUncertainEffectMovesRunToStopping(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-effect-uncertain")
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || run.Status != contracts.RunWaiting {
+		t.Fatalf("waiting run = %#v, err=%v", run, err)
+	}
+	invocationID, _ := execution.StableInvocationID(run.RunID, "launch")
+	effectID, _ := effect.StableEffectID(invocationID, "start-process")
+	begin := BeginEffectRequest{
+		EffectID: effectID, CommandID: "dispatch-uncertain-process",
+		IdempotencyKey: "uncertain-idempotency", CapabilityToken: "uncertain-capability",
+		Action: "process.start", ActorRef: "operator", SourceRef: "worker-test",
+		ReasonCode: "experiment.launch", Risk: contracts.RiskModerate,
+		Fence: contracts.TargetFence{Kind: contracts.FenceGeneration, Generation: &contracts.GenerationFence{
+			BindingID: "simulator", Generation: 1, FencingToken: 13,
+		}},
+		Deadline: fixture.clock.Now().Add(5 * time.Second), CancellationID: "cancel-uncertain-process",
+	}
+	if _, err := fixture.controller.BeginEffect(t.Context(), begin); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := NewEffectOutboxHandler(fixture.controller, staticEffectCredentials{
+		idempotency: begin.IdempotencyKey, capability: begin.CapabilityToken,
+	}, uncertainEffectAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waits, err := NewWaitResolutionHandler(fixture.controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableWorker := worker.Worker{
+		Store: fixture.store, OwnerRef: "uncertain-worker",
+		Handlers: map[contracts.DurableIntentKind]worker.Handler{
+			contracts.IntentOutbox: outbox, contracts.IntentWaitResolution: waits,
+		},
+	}
+	now := fixture.clock.Now()
+	outboxBatch, err := durableWorker.RunOnce(t.Context(), worker.Batch{
+		Kinds: []contracts.DurableIntentKind{contracts.IntentOutbox}, LeaseToken: "uncertain-outbox-lease",
+		Now: now, LeaseExpiresAt: now.Add(time.Minute), Limit: 10,
+	})
+	if err != nil || outboxBatch.Completed != 1 {
+		t.Fatalf("uncertain outbox = %#v, err=%v", outboxBatch, err)
+	}
+	waitBatch, err := durableWorker.RunOnce(t.Context(), worker.Batch{
+		Kinds: []contracts.DurableIntentKind{contracts.IntentWaitResolution}, LeaseToken: "uncertain-wait-lease",
+		Now: now, LeaseExpiresAt: now.Add(time.Minute), Limit: 10,
+	})
+	if err != nil || waitBatch.Completed != 1 || waitBatch.Retried != 0 {
+		t.Fatalf("uncertain wait = %#v, err=%v", waitBatch, err)
+	}
+	run, err = fixture.controller.GetRun(t.Context(), run.RunID)
+	if err != nil || run.Status != contracts.RunStopping || run.PrimaryFailure != nil {
+		t.Fatalf("uncertain run = %#v, err=%v", run, err)
+	}
+	currentEffect, err := fixture.controller.GetEffect(t.Context(), effectID)
+	if err != nil || currentEffect.State != contracts.EffectUncertain {
+		t.Fatalf("uncertain effect = %#v, err=%v", currentEffect, err)
+	}
+	if _, err := fixture.controller.Drive(t.Context(), run.RunID); !errors.Is(err, ErrRunClosureOpen) {
+		t.Fatalf("uncertain ownership closure error = %v", err)
 	}
 }
 
