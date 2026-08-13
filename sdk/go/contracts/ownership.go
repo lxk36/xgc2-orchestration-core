@@ -45,7 +45,8 @@ type OwnershipClosureBase struct {
 
 // OwnershipGraph is the immutable, self-contained closure record committed in
 // the same transaction as TerminalRun. ClosureFacts is persisted as the exact
-// proof output and must equal a fresh derivation from ClosureBase.
+// proof output and must equal a fresh derivation from ClosureBase. Each Run has
+// exactly one graph, whose aggregate revision is always one.
 type OwnershipGraph struct {
 	SchemaVersion string               `json:"schemaVersion"`
 	Revision      uint64               `json:"revision"`

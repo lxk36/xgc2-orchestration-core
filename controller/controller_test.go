@@ -184,6 +184,64 @@ func TestOwnershipGraphReadFailsClosedWhenTerminalRunAggregateDiffers(t *testing
 	}
 }
 
+func TestPreexistingOwnershipGraphPreventsTerminalTransition(t *testing.T) {
+	fixture := newControllerFixture(t)
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-forged-ownership", "invoke-forged-ownership"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := fixture.controller.GetRun(t.Context(), invoked.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := map[string]any{"forged": true, "runId": run.RunID}
+	mutation, err := aggregateMutation(ownershipGraphKey(run.RunID), 0, forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := run.UpdatedAt.Add(time.Second)
+	event, err := aggregateEvent(mutation, "ownership-graph.forged", "forge-ownership-graph", at, map[string]any{"runId": run.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := canonicaljson.Marshal(forged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{"commandId": "forge-ownership-graph", "mutation": mutation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.Commit(t.Context(), store.Transaction{
+		CommandID: "forge-ownership-graph", IdentityDigest: identity,
+		Expected: []store.ExpectedRevision{{Key: mutation.Key, Revision: 0}}, Mutations: []store.AggregateRecord{mutation},
+		Events: []contracts.DomainEvent{event}, Outcome: outcome, At: at,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var driveErr error
+	for range 10 {
+		_, driveErr = fixture.controller.Drive(t.Context(), run.RunID)
+		if driveErr != nil {
+			break
+		}
+	}
+	if driveErr == nil || !strings.Contains(driveErr.Error(), "immutable ownership closure proof") {
+		t.Fatalf("forged graph drive error = %v", driveErr)
+	}
+	after, err := fixture.controller.GetRun(t.Context(), run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status.Terminal() {
+		t.Fatalf("forged graph allowed terminal transition: %#v", after)
+	}
+	record, err := fixture.store.GetAggregate(t.Context(), ownershipGraphKey(run.RunID))
+	if err != nil || record.Revision != 1 || record.PayloadDigest != mutation.PayloadDigest {
+		t.Fatalf("forged graph was overwritten: %#v err=%v", record, err)
+	}
+}
+
 func TestControllerExpiresClaimAndReplaysOnlyPureDeterministicNode(t *testing.T) {
 	fixture := newControllerFixture(t)
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-recover", "invoke-recover"))

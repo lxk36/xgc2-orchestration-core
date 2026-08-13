@@ -146,11 +146,11 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 			return run, ErrRunClosureOpen
 		}
 	}
-	closureBase, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	closureBase, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	graphRevision := graphExpected + 1
+	const graphRevision = uint64(1)
 	closure, err := ownership.DeriveClosureFacts(closureBase, graphRevision)
 	if err != nil {
 		return contracts.Run{}, err
@@ -179,7 +179,7 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), graphExpected, graph)
+	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), 0, graph)
 	if err != nil {
 		return contracts.Run{}, err
 	}
@@ -188,7 +188,7 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 		return contracts.Run{}, err
 	}
 	if err := controller.commit(ctx, commandID, at,
-		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: graphExpected}},
+		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: 0}},
 		[]store.AggregateRecord{runMutation, graphMutation}, append(decision.Events, graphEvent), decision.Intents, decision.Run,
 	); err != nil {
 		return contracts.Run{}, err
@@ -237,11 +237,11 @@ func (controller *Controller) succeedRun(
 			Class: contracts.FailurePermanent, Code: "cleanup.required-failed", Message: "one or more required Effect compensations failed",
 		}, at)
 	}
-	closureBase, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	closureBase, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	graphRevision := graphExpected + 1
+	const graphRevision = uint64(1)
 	closure, err := ownership.DeriveClosureFacts(closureBase, graphRevision)
 	if err != nil {
 		return contracts.Run{}, err
@@ -280,7 +280,7 @@ func (controller *Controller) succeedRun(
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), graphExpected, graph)
+	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), 0, graph)
 	if err != nil {
 		return contracts.Run{}, err
 	}
@@ -289,7 +289,7 @@ func (controller *Controller) succeedRun(
 		return contracts.Run{}, err
 	}
 	if err := controller.commit(ctx, commandID, at,
-		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}, {Key: graphMutation.Key, Revision: graphExpected}},
+		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}, {Key: graphMutation.Key, Revision: 0}},
 		[]store.AggregateRecord{runMutation, snapshotMutation, graphMutation}, append(append(decision.Events, snapshotEvent), graphEvent), decision.Intents, decision.Run,
 	); err != nil {
 		return contracts.Run{}, err

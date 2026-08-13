@@ -53,6 +53,8 @@ the exact next-revision `terminalRun` in the same transaction as the Run
 aggregate. `closureFacts.runRevision` always names the closure-base Run, never
 the terminal projection. Readers validate the complete envelope and canonical
 terminal Run equality; they do not join mutable state into the proof snapshot.
+The graph is a create-once aggregate at revision 1. Any pre-existing graph
+prevents a later terminal transition instead of being overwritten.
 
 The coordinator continues outbox, wait-resolution, child-resolution, and
 cleanup intents while a Run is stopping. It never converts a missing provider

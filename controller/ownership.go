@@ -52,22 +52,21 @@ func (controller *Controller) OwnershipGraph(ctx context.Context, runID string) 
 	return graph, nil
 }
 
-func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run contracts.Run) (contracts.OwnershipClosureBase, uint64, error) {
-	graphExpected := uint64(0)
-	if current, err := controller.store.GetAggregate(ctx, ownershipGraphKey(run.RunID)); err == nil {
-		graphExpected = current.Revision
+func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run contracts.Run) (contracts.OwnershipClosureBase, error) {
+	if _, err := controller.store.GetAggregate(ctx, ownershipGraphKey(run.RunID)); err == nil {
+		return contracts.OwnershipClosureBase{}, errors.New("Run already has an immutable ownership closure proof")
 	} else if !errors.Is(err, store.ErrNotFound) {
-		return contracts.OwnershipClosureBase{}, 0, err
+		return contracts.OwnershipClosureBase{}, err
 	}
 	base := contracts.OwnershipClosureBase{Run: run}
 	invocations, err := listAllAggregates(ctx, controller.store, invocationType)
 	if err != nil {
-		return contracts.OwnershipClosureBase{}, 0, err
+		return contracts.OwnershipClosureBase{}, err
 	}
 	for _, record := range invocations {
 		ledger, decodeErr := decodeLedger(record)
 		if decodeErr != nil {
-			return contracts.OwnershipClosureBase{}, 0, decodeErr
+			return contracts.OwnershipClosureBase{}, decodeErr
 		}
 		if ledger.Invocation.RunID == run.RunID {
 			base.Invocations = append(base.Invocations, ledger)
@@ -75,12 +74,12 @@ func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run co
 	}
 	runs, err := listAllAggregates(ctx, controller.store, runAggregateType)
 	if err != nil {
-		return contracts.OwnershipClosureBase{}, 0, err
+		return contracts.OwnershipClosureBase{}, err
 	}
 	for _, record := range runs {
 		child, decodeErr := decodeRun(record)
 		if decodeErr != nil {
-			return contracts.OwnershipClosureBase{}, 0, decodeErr
+			return contracts.OwnershipClosureBase{}, decodeErr
 		}
 		if child.Parent != nil && child.Parent.ParentRunID == run.RunID {
 			base.ChildRuns = append(base.ChildRuns, child)
@@ -88,18 +87,18 @@ func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run co
 	}
 	effects, err := listAllAggregates(ctx, controller.store, effectAggregateType)
 	if err != nil {
-		return contracts.OwnershipClosureBase{}, 0, err
+		return contracts.OwnershipClosureBase{}, err
 	}
 	for _, record := range effects {
 		current, decodeErr := decodeEffect(record)
 		if decodeErr != nil {
-			return contracts.OwnershipClosureBase{}, 0, decodeErr
+			return contracts.OwnershipClosureBase{}, decodeErr
 		}
 		if current.Intent.RunID == run.RunID {
 			base.Effects = append(base.Effects, current)
 		}
 	}
-	return base, graphExpected, nil
+	return base, nil
 }
 
 func listAllAggregates(ctx context.Context, durable store.Store, aggregateType string) ([]store.AggregateRecord, error) {
@@ -123,7 +122,7 @@ func decodeOwnershipGraph(record store.AggregateRecord) (contracts.OwnershipGrap
 	if record.Key.Type != ownershipGraphType || record.Revision == 0 || canonicaljson.UnmarshalStrict(record.Payload, &graph) != nil {
 		return contracts.OwnershipGraph{}, errors.New("durable ownership graph is invalid")
 	}
-	if graph.SchemaVersion != contracts.OwnershipGraphSchemaVersion ||
+	if record.Revision != 1 || graph.SchemaVersion != contracts.OwnershipGraphSchemaVersion ||
 		graph.ClosureBase.Run.RunID != record.Key.ID || graph.TerminalRun.RunID != record.Key.ID ||
 		graph.Revision != record.Revision {
 		return contracts.OwnershipGraph{}, errors.New("durable ownership graph identity or revision is invalid")
