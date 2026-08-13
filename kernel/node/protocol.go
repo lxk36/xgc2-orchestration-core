@@ -120,8 +120,8 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 	}
 	switch result.Status {
 	case contracts.NodeResultSucceeded:
-		if result.Output == nil || result.Wait != nil || result.Failure != nil {
-			return errors.New("successful node result requires output and no wait/failure")
+		if result.Output == nil || result.Wait != nil || result.Failure != nil || len(result.Effects) != 0 {
+			return errors.New("successful node result requires output and no wait, failure, or effect")
 		}
 		canonical, err := canonicaljson.Marshal(result.Output)
 		if err != nil || len(canonical) > descriptor.MaxOutputBytes {
@@ -143,6 +143,14 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 		}
 		if err := validateWait(*result.Wait, request); err != nil {
 			return err
+		}
+		if result.Wait.Kind == contracts.NodeWaitEffect {
+			if len(result.Effects) != 1 || result.Effects[0].EffectKey != result.Wait.SubjectRef ||
+				result.Effects[0].IntentDigest != result.Wait.ConditionDigest {
+				return errors.New("effect wait requires exactly one matching effect proposal")
+			}
+		} else if len(result.Effects) != 0 {
+			return errors.New("non-effect wait cannot propose an effect")
 		}
 	case contracts.NodeResultFailed:
 		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" || result.Wait != nil || len(result.Effects) != 0 {

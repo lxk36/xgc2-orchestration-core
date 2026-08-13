@@ -41,9 +41,12 @@ The standard-library-only Go kernel currently provides:
 - a sealed Node registry, descriptor/request/result protocol, declarative
   Effect proposal boundary, explicit capability grants, structured output, and
   reusable node-pack conformance suite;
+- fail-closed v1 Effect result semantics: a waiting Node may propose exactly
+  one Effect matching its durable wait key and intent digest; successful,
+  failed, and non-Effect-wait results cannot carry Effect proposals;
 - a durable single-controller runtime that admits exact Action/Workflow pins,
   executes only the selected entrypoint, freezes node inputs/results, prepares
-  Effects atomically before waiting, and recovers expired pure-node attempts
+  that Effect atomically before waiting, and recovers expired pure-node attempts
   while failing effectful uncertainty closed;
 - atomic Effect begin, public CommandLedger persistence, leased outbox dispatch,
   private credential rehydration, immutable provider Receipt observation, and

@@ -100,6 +100,43 @@ func TestCapabilitiesAndEffectsFailClosed(t *testing.T) {
 	if err := ValidateResult(descriptor, request, result); err == nil {
 		t.Fatal("undeclared effect kind was accepted")
 	}
+	result.Effects[0].Kind = "xgc.mcp-call/v1"
+
+	result.Effects = append(result.Effects, result.Effects[0])
+	result.Effects[1].EffectKey = "invoke-tool-again"
+	if err := ValidateResult(descriptor, request, result); err == nil {
+		t.Fatal("multiple effect proposals were accepted without group semantics")
+	}
+	result.Effects = result.Effects[:1]
+
+	result.Wait.SubjectRef = "another-effect"
+	if err := ValidateResult(descriptor, request, result); err == nil {
+		t.Fatal("effect wait for a different effect was accepted")
+	}
+	result.Wait.SubjectRef = result.Effects[0].EffectKey
+	result.Wait.ConditionDigest = digest
+	if err := ValidateResult(descriptor, request, result); err == nil {
+		t.Fatal("effect wait with a different intent digest was accepted")
+	}
+	result.Wait.ConditionDigest = result.Effects[0].IntentDigest
+
+	output := map[string]any{"message": "hello"}
+	outputDigest, _ := canonicaljson.DigestValue(output)
+	succeededWithEffect := contracts.NodeResult{
+		Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest,
+		EvidenceDigest: digest, Effects: result.Effects,
+	}
+	if err := ValidateResult(descriptor, request, succeededWithEffect); err == nil {
+		t.Fatal("successful result carrying an effect was accepted")
+	}
+
+	timerWaitWithEffect := result
+	timerWaitWithEffect.Wait = &contracts.NodeWait{
+		Kind: contracts.NodeWaitTimer, SubjectRef: "retry-timer", ConditionDigest: digest,
+	}
+	if err := ValidateResult(descriptor, request, timerWaitWithEffect); err == nil {
+		t.Fatal("non-effect wait carrying an effect was accepted")
+	}
 }
 
 func TestBadOutputDigestAndAmbientGrantAreRejected(t *testing.T) {
