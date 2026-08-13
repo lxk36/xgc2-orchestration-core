@@ -60,20 +60,8 @@ type Coordinator struct {
 }
 
 func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
-	if config.Controller == nil || config.Store == nil || config.Planner == nil ||
-		config.Credentials == nil || !contracts.ValidIdentifier(config.OwnerRef) {
-		return nil, errors.New("coordinator controller, store, planner, credentials, and owner are required")
-	}
-	if len(config.Adapters) == 0 {
-		return nil, errors.New("coordinator requires at least one effect adapter")
-	}
-	outbox, err := NewEffectOutboxHandler(config.Controller, config.Credentials, config.Adapters...)
-	if err != nil {
-		return nil, err
-	}
-	waits, err := NewWaitResolutionHandler(config.Controller)
-	if err != nil {
-		return nil, err
+	if config.Controller == nil || config.Store == nil || !contracts.ValidIdentifier(config.OwnerRef) {
+		return nil, errors.New("coordinator controller, store, and owner are required")
 	}
 	children, err := NewChildResolutionHandler(config.Controller)
 	if err != nil {
@@ -92,6 +80,24 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		config.MaxSteps = 1000
 	}
 	kinds := make(map[string]struct{}, len(config.Adapters))
+	handlers := map[contracts.DurableIntentKind]worker.Handler{
+		contracts.IntentChildResolution: children,
+	}
+	if len(config.Adapters) != 0 {
+		if config.Planner == nil || config.Credentials == nil {
+			return nil, errors.New("coordinator effect planner and credentials are required when adapters are installed")
+		}
+		outbox, outboxErr := NewEffectOutboxHandler(config.Controller, config.Credentials, config.Adapters...)
+		if outboxErr != nil {
+			return nil, outboxErr
+		}
+		waits, waitsErr := NewWaitResolutionHandler(config.Controller)
+		if waitsErr != nil {
+			return nil, waitsErr
+		}
+		handlers[contracts.IntentOutbox] = outbox
+		handlers[contracts.IntentWaitResolution] = waits
+	}
 	for _, adapter := range config.Adapters {
 		kinds[adapter.Descriptor().Kind] = struct{}{}
 	}
@@ -99,10 +105,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		controller: config.Controller, store: config.Store, planner: config.Planner,
 		worker: worker.Worker{
 			Store: config.Store, OwnerRef: config.OwnerRef,
-			Handlers: map[contracts.DurableIntentKind]worker.Handler{
-				contracts.IntentOutbox: outbox, contracts.IntentWaitResolution: waits,
-				contracts.IntentChildResolution: children,
-			},
+			Handlers: handlers,
 		},
 		adapterKinds: kinds, leaseDuration: config.LeaseDuration,
 		batchLimit: config.BatchLimit, maxSteps: config.MaxSteps, clock: config.Clock,

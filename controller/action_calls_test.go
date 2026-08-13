@@ -107,6 +107,25 @@ func TestControllerExecutesPinnedChildActionWithExplicitContextAndResultMaps(t *
 	}
 }
 
+func TestCoordinatorNeedsNoEffectProviderForPureChildActions(t *testing.T) {
+	fixture := newActionCallFixture(t, nil)
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.controller.store,
+		OwnerRef: "pure-child-coordinator", Clock: fixture.controller.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if err != nil || completed.Status != contracts.RunSucceeded {
+		t.Fatalf("pure child parent = %+v err=%v", completed, err)
+	}
+}
+
 func TestControllerFailsClosedWhenChildActionCannotResolve(t *testing.T) {
 	fixture := newActionCallFixture(t, errors.New("catalog unavailable"))
 	invoked, err := fixture.controller.Invoke(context.Background(), fixture.request)
