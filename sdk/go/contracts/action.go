@@ -10,14 +10,14 @@ const (
 	TriggerWebhook        TriggerKind = "trigger.webhook/v1"
 	TriggerAPI            TriggerKind = "trigger.api/v1"
 	TriggerPanel          TriggerKind = "trigger.panel/v1"
-	TriggerXGC2Experiment TriggerKind = "trigger.xgc2-experiment/v1"
+	TriggerProductBuilder TriggerKind = "trigger.product-builder/v1"
 	TriggerActionCall     TriggerKind = "trigger.action-call/v1"
 )
 
 func (kind TriggerKind) Valid() bool {
 	switch kind {
 	case TriggerManual, TriggerSchedule, TriggerWebhook, TriggerAPI, TriggerPanel,
-		TriggerXGC2Experiment, TriggerActionCall:
+		TriggerProductBuilder, TriggerActionCall:
 		return true
 	default:
 		return false
@@ -78,12 +78,12 @@ type ActionPresetVersion struct {
 type InputOriginKind string
 
 const (
-	OriginSchemaDefault     InputOriginKind = "schema-default"
-	OriginPreset            InputOriginKind = "preset"
-	OriginCaller            InputOriginKind = "caller"
-	OriginTriggerMap        InputOriginKind = "trigger-map"
-	OriginParentMap         InputOriginKind = "parent-map"
-	OriginExperimentBuilder InputOriginKind = "experiment-builder"
+	OriginSchemaDefault  InputOriginKind = "schema-default"
+	OriginPreset         InputOriginKind = "preset"
+	OriginCaller         InputOriginKind = "caller"
+	OriginTriggerMap     InputOriginKind = "trigger-map"
+	OriginParentMap      InputOriginKind = "parent-map"
+	OriginProductBuilder InputOriginKind = "product-builder"
 )
 
 type InputFieldProvenance struct {

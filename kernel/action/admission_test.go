@@ -76,7 +76,7 @@ func TestAllPublicTriggerKindsUseOneAdmissionContract(t *testing.T) {
 		{contracts.TriggerSchedule, contracts.OriginTriggerMap},
 		{contracts.TriggerWebhook, contracts.OriginTriggerMap},
 		{contracts.TriggerAPI, contracts.OriginCaller},
-		{contracts.TriggerXGC2Experiment, contracts.OriginExperimentBuilder},
+		{contracts.TriggerProductBuilder, contracts.OriginProductBuilder},
 	}
 	for _, test := range cases {
 		t.Run(string(test.kind), func(t *testing.T) {

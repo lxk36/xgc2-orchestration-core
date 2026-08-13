@@ -76,7 +76,7 @@ func TestSixIngressFixturesUseOneAdmissionPath(t *testing.T) {
 		{"webhook", contracts.OriginTriggerMap},
 		{"api", contracts.OriginCaller},
 		{"panel", contracts.OriginCaller},
-		{"xgc2-experiment", contracts.OriginExperimentBuilder},
+		{"product-builder", contracts.OriginProductBuilder},
 	}
 	var inputDigest string
 	for _, fixture := range fixtures {

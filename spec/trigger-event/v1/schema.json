@@ -24,7 +24,7 @@
         "trigger.webhook/v1",
         "trigger.api/v1",
         "trigger.panel/v1",
-        "trigger.xgc2-experiment/v1",
+        "trigger.product-builder/v1",
         "trigger.action-call/v1"
       ]
     },

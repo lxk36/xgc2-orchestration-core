@@ -285,8 +285,8 @@ func expectedOrigin(kind contracts.TriggerKind) (contracts.InputOriginKind, erro
 		return contracts.OriginCaller, nil
 	case contracts.TriggerSchedule, contracts.TriggerWebhook:
 		return contracts.OriginTriggerMap, nil
-	case contracts.TriggerXGC2Experiment:
-		return contracts.OriginExperimentBuilder, nil
+	case contracts.TriggerProductBuilder:
+		return contracts.OriginProductBuilder, nil
 	case contracts.TriggerActionCall:
 		return contracts.OriginParentMap, nil
 	default:
