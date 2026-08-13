@@ -10,6 +10,7 @@ import (
 
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/durable/worker"
+	effectport "github.com/lxk36/xgc2-orchestration-core/provider/effect"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
@@ -28,6 +29,13 @@ var (
 // prepared public Effect. Raw credentials are not persisted by the core.
 type EffectDispatchPlanner interface {
 	PlanEffectDispatch(context.Context, contracts.EffectRecord) (BeginEffectRequest, error)
+}
+
+// EffectCompensationPlanner supplies a fresh, deterministic command envelope
+// for reversing one applied Effect. It is a host policy boundary because
+// action names, credentials, and target fences are provider concerns.
+type EffectCompensationPlanner interface {
+	PlanEffectCompensation(context.Context, contracts.EffectRecord) (BeginEffectRequest, error)
 }
 
 type CoordinatorConfig struct {
@@ -97,6 +105,24 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 		}
 		handlers[contracts.IntentOutbox] = outbox
 		handlers[contracts.IntentWaitResolution] = waits
+		hasCompensator := false
+		for _, adapter := range config.Adapters {
+			if _, ok := adapter.(effectport.Compensator); ok {
+				hasCompensator = true
+				break
+			}
+		}
+		if hasCompensator {
+			compensationPlanner, ok := config.Planner.(EffectCompensationPlanner)
+			if !ok {
+				return nil, errors.New("coordinator effect planner does not implement compensation planning")
+			}
+			cleanup, cleanupErr := NewEffectCleanupHandler(config.Controller, compensationPlanner, config.Credentials, config.Adapters...)
+			if cleanupErr != nil {
+				return nil, cleanupErr
+			}
+			handlers[contracts.IntentCleanup] = cleanup
+		}
 	}
 	for _, adapter := range config.Adapters {
 		kinds[adapter.Descriptor().Kind] = struct{}{}
@@ -121,11 +147,21 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 	}
 	for step := 0; step < coordinator.maxSteps; step++ {
 		run, driveErr := coordinator.controller.Drive(ctx, runID)
-		if driveErr != nil && !errors.Is(driveErr, ErrRunWaiting) {
+		if driveErr != nil && !errors.Is(driveErr, ErrRunWaiting) && !errors.Is(driveErr, ErrRunClosureOpen) {
 			return run, driveErr
 		}
 		if run.Status.Terminal() {
 			return run, nil
+		}
+		if errors.Is(driveErr, ErrRunClosureOpen) {
+			batch, cleanupErr := coordinator.runBatch(ctx, contracts.IntentCleanup, "cleanup")
+			if cleanupErr != nil {
+				return run, cleanupErr
+			}
+			if batch.Claimed == 0 {
+				return run, driveErr
+			}
+			continue
 		}
 		if run.Status != contracts.RunWaiting {
 			return run, driveErr

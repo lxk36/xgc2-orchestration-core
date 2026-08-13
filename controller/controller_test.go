@@ -458,6 +458,107 @@ type staticEffectPlan struct {
 	clock *fakeClock
 }
 
+type staticCompensationPlan struct{ staticEffectPlan }
+
+func (plan staticCompensationPlan) PlanEffectCompensation(_ context.Context, current contracts.EffectRecord) (BeginEffectRequest, error) {
+	return BeginEffectRequest{
+		EffectID: current.EffectID, CommandID: "compensate-" + current.EffectID,
+		IdempotencyKey:  "compensate-idempotency-" + current.EffectID,
+		CapabilityToken: "compensate-capability-" + current.EffectID,
+		Action:          "process.stop", ActorRef: "operator", SourceRef: "coordinator-test",
+		ReasonCode: "workflow.compensation", Risk: contracts.RiskHigh,
+		Fence: contracts.TargetFence{Kind: contracts.FenceIdempotentCreate, IdempotentCreate: &contracts.IdempotentCreateFence{
+			TargetNamespace: "test-compensation", IdentityDigest: current.Intent.IntentDigest,
+		}},
+		Deadline: plan.clock.Now().Add(5 * time.Second), CancellationID: "cancel-compensate-" + current.EffectID,
+	}, nil
+}
+
+type compensatingEffectAdapter struct {
+	*successfulEffectAdapter
+	mu    sync.Mutex
+	order []string
+}
+
+func (adapter *compensatingEffectAdapter) Compensate(
+	_ context.Context,
+	applied contracts.EffectRecord,
+	envelope contracts.CommandEnvelope,
+	authorizationDigest string,
+) (contracts.CommandLedger, error) {
+	if applied.State != contracts.EffectApplied || applied.ExternalIdentity == "" {
+		return contracts.CommandLedger{}, errors.New("compensation lacks an applied external identity")
+	}
+	adapter.mu.Lock()
+	adapter.order = append(adapter.order, applied.Intent.InvocationID)
+	adapter.mu.Unlock()
+	descriptor := adapter.Descriptor()
+	accepted, err := syntheticReceipt(envelope, descriptor, authorizationDigest, 1, contracts.ReceiptAccepted, nil, adapter.clock.Now())
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	succeeded, err := syntheticReceipt(envelope, descriptor, authorizationDigest, 2, contracts.ReceiptSucceeded, nil, adapter.clock.Now())
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	succeeded.ResultDigest, _ = canonicaljson.DigestValue(map[string]any{"stopped": applied.ExternalIdentity})
+	succeeded.ExternalIdentity = applied.ExternalIdentity
+	envelope.IdempotencyKey, envelope.CapabilityToken = "", ""
+	return contracts.CommandLedger{Envelope: envelope, Receipts: []contracts.CommandReceipt{accepted, succeeded}}, nil
+}
+
+func (adapter *compensatingEffectAdapter) Order() []string {
+	adapter.mu.Lock()
+	defer adapter.mu.Unlock()
+	return append([]string(nil), adapter.order...)
+}
+
+func TestCoordinatorCompensatesOwnedEffectsInReverseWorkflowOrder(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-effect-compensation")
+	fixture.executor.owned = true
+	second := fixture.request.Definition.Nodes[0]
+	second.NodeID = "launch-again"
+	fixture.request.Definition.Nodes = append(fixture.request.Definition.Nodes, second)
+	fixture.request.Definition.Edges = []contracts.WorkflowEdge{{From: "launch", To: "launch-again", Kind: contracts.EdgeControl}}
+	plan, err := workflowkernel.Compile(fixture.request.Definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Action.DefinitionDigest = plan.DefinitionDigest
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &compensatingEffectAdapter{successfulEffectAdapter: &successfulEffectAdapter{clock: fixture.clock}}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.store,
+		Planner:     staticCompensationPlan{staticEffectPlan{clock: fixture.clock}},
+		Credentials: staticEffectCredentials{idempotency: "coordinate-idempotency", capability: "coordinate-capability"},
+		Adapters:    []EffectAdapter{adapter}, OwnerRef: "compensation-coordinator", Clock: fixture.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if err != nil || run.Status != contracts.RunSucceeded {
+		t.Fatalf("compensated run = %#v, err=%v", run, err)
+	}
+	first, _ := execution.StableInvocationID(run.RunID, "launch")
+	secondInvocation, _ := execution.StableInvocationID(run.RunID, "launch-again")
+	if order := adapter.Order(); len(order) != 2 || order[0] != secondInvocation || order[1] != first {
+		t.Fatalf("compensation order = %#v, want [%s %s]", order, secondInvocation, first)
+	}
+	effects, err := fixture.controller.ListEffects(t.Context(), "", 10)
+	if err != nil || len(effects) != 2 {
+		t.Fatalf("effects = %#v, err=%v", effects, err)
+	}
+	for _, current := range effects {
+		if current.CompensationState != contracts.EffectCompensationSucceeded || current.CompensationCommandID == "" {
+			t.Fatalf("effect compensation = %#v", current)
+		}
+	}
+}
+
 func (plan staticEffectPlan) PlanEffectDispatch(_ context.Context, current contracts.EffectRecord) (BeginEffectRequest, error) {
 	return BeginEffectRequest{
 		EffectID: current.EffectID, CommandID: "coordinate-" + current.EffectID,
@@ -574,6 +675,7 @@ type effectExecutor struct {
 	descriptor contracts.NodeDescriptor
 	mu         sync.Mutex
 	calls      int
+	owned      bool
 }
 
 func (executor *effectExecutor) Descriptor() contracts.NodeDescriptor { return executor.descriptor }
@@ -584,10 +686,14 @@ func (executor *effectExecutor) Execute(_ context.Context, request contracts.Nod
 	executor.mu.Unlock()
 	intent := map[string]any{"executableRef": "simulator"}
 	intentDigest, _ := canonicaljson.DigestValue(intent)
+	ownership, compensation := contracts.EffectDetached, contracts.CompensationNone
+	if executor.owned {
+		ownership, compensation = contracts.EffectOwned, contracts.CompensationRequired
+	}
 	proposal := contracts.EffectProposal{
 		EffectKey: "start-process", Kind: "xgc.process-start/v1", TargetRef: "simulator",
 		IntentSchemaDigest: testPackageDigest, Intent: intent, IntentDigest: intentDigest,
-		Ownership: contracts.EffectDetached, CompensationPolicy: contracts.CompensationNone,
+		Ownership: ownership, CompensationPolicy: compensation,
 		RequiredCapabilityRefs: []string{"process.control"}, PolicyDigest: request.CapabilityGrants[0].AuthorizationDigest,
 		Deadline: request.Deadline,
 	}

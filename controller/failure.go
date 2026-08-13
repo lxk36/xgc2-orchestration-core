@@ -116,6 +116,17 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 	if run.Termination == nil || run.Termination.PrimaryFailure == nil {
 		return contracts.Run{}, errors.New("stopping failed run lacks its termination failure")
 	}
+	snapshot, _, err := controller.GetSnapshot(ctx, run.RunID)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	scheduled, cleanupFailures, err := controller.scheduleNextEffectCompensation(ctx, run, snapshot, at)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if scheduled {
+		return run, ErrRunClosureOpen
+	}
 	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
 		return contracts.Run{}, err
@@ -126,7 +137,7 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 	commandID := phaseCommand(run.RunID, "failed", run.Revision)
 	decision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
 		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunFailed,
-		Closure:   closure,
+		Closure: closure, CleanupFailures: cleanupFailures,
 		CommandID: commandID, At: at,
 	})
 	if err != nil {
@@ -168,6 +179,18 @@ func (controller *Controller) succeedRun(
 	resultDigest, err := digestResult(result)
 	if err != nil {
 		return contracts.Run{}, err
+	}
+	scheduled, cleanupFailures, err := controller.scheduleNextEffectCompensation(ctx, run, snapshot, at)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if scheduled {
+		return run, ErrRunClosureOpen
+	}
+	if len(cleanupFailures) != 0 {
+		return controller.beginFailure(ctx, runRecord, run, snapshot, snapshotRevision, contracts.StructuredFailure{
+			Class: contracts.FailurePermanent, Code: "cleanup.required-failed", Message: "one or more required Effect compensations failed",
+		}, at)
 	}
 	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {

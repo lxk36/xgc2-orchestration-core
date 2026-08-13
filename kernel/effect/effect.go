@@ -62,6 +62,13 @@ type CompensationCommand struct {
 	At                    time.Time
 }
 
+type ObserveCompensationCommand struct {
+	EffectID         string
+	ExpectedRevision uint64
+	Receipt          contracts.CommandReceipt
+	CommandID        string
+}
+
 type Decision struct {
 	Effect  contracts.EffectRecord
 	Ledger  *contracts.CommandLedger
@@ -352,6 +359,65 @@ func TransitionCompensation(current contracts.EffectRecord, command Compensation
 		decision.Intents = []contracts.DurableIntent{intent}
 	}
 	return decision, nil
+}
+
+// ObserveCompensation appends one receipt to the independently persisted
+// compensation command ledger and folds terminal provider evidence into the
+// Effect compensation state. Primary Effect evidence is immutable here.
+func ObserveCompensation(current contracts.EffectRecord, ledger contracts.CommandLedger, command ObserveCompensationCommand) (Decision, error) {
+	if err := ValidateRecord(current); err != nil {
+		return Decision{}, fmt.Errorf("current effect: %w", err)
+	}
+	if err := ValidateLedger(ledger); err != nil {
+		return Decision{}, fmt.Errorf("current compensation ledger: %w", err)
+	}
+	if command.EffectID != current.EffectID || command.ExpectedRevision != current.Revision {
+		return Decision{}, ErrRevisionConflict
+	}
+	if current.State != contracts.EffectApplied || current.CompensationState != contracts.EffectCompensationRunning ||
+		ledger.Envelope.CommandID != current.CompensationCommandID || ledger.Envelope.EffectID != current.EffectID {
+		return Decision{}, fmt.Errorf("%w: receipt does not target the running compensation", ErrInvalidTransition)
+	}
+	if err := validateIdentity(command.CommandID, "compensation observation command id"); err != nil {
+		return Decision{}, err
+	}
+	receipt := cloneReceipt(command.Receipt)
+	if err := validateNextReceipt(ledger, receipt); err != nil {
+		return Decision{}, err
+	}
+	nextLedger := cloneLedger(ledger)
+	nextLedger.Receipts = append(nextLedger.Receipts, receipt)
+	if err := ValidateLedger(nextLedger); err != nil {
+		return Decision{}, err
+	}
+	next := cloneRecord(current)
+	next.UpdatedAt = receipt.ObservedAt.UTC()
+	next.Revision++
+	switch receipt.Status {
+	case contracts.ReceiptAccepted:
+		// Running remains observable while the compensator owns the command.
+	case contracts.ReceiptSucceeded:
+		next.CompensationState = contracts.EffectCompensationSucceeded
+		finished := receipt.ObservedAt.UTC()
+		next.CompensationFinishedAt = &finished
+	case contracts.ReceiptRejected, contracts.ReceiptFailed, contracts.ReceiptUncertain:
+		next.CompensationState = contracts.EffectCompensationFailed
+		next.CompensationFailure = cloneFailure(receipt.Failure)
+		finished := receipt.ObservedAt.UTC()
+		next.CompensationFinishedAt = &finished
+	default:
+		return Decision{}, ErrReceiptConflict
+	}
+	if err := ValidateRecord(next); err != nil {
+		return Decision{}, err
+	}
+	event, err := newEvent(next, "effect.compensation.receipt."+string(receipt.Status), command.CommandID, receipt.ObservedAt, map[string]any{
+		"commandId": receipt.CommandID, "receiptId": receipt.ReceiptID, "sequence": receipt.Sequence,
+	})
+	if err != nil {
+		return Decision{}, err
+	}
+	return Decision{Effect: next, Ledger: &nextLedger, Events: []contracts.DomainEvent{event}}, nil
 }
 
 func ValidateIntent(intent contracts.EffectIntent, at time.Time) error {

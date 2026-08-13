@@ -240,6 +240,150 @@ func deadIntent(code, message string) worker.Result {
 var _ worker.Handler = (*EffectOutboxHandler)(nil)
 var _ worker.Handler = (*WaitResolutionHandler)(nil)
 
+type EffectCleanupHandler struct {
+	controller *Controller
+	planner    EffectCompensationPlanner
+	broker     EffectCredentialBroker
+	adapters   map[string]effectport.Compensator
+}
+
+func NewEffectCleanupHandler(
+	controller *Controller,
+	planner EffectCompensationPlanner,
+	broker EffectCredentialBroker,
+	adapters ...EffectAdapter,
+) (*EffectCleanupHandler, error) {
+	if controller == nil || planner == nil || broker == nil {
+		return nil, errors.New("effect cleanup controller, planner, and credential broker are required")
+	}
+	registered := make(map[string]effectport.Compensator)
+	for _, adapter := range adapters {
+		if compensator, ok := adapter.(effectport.Compensator); ok {
+			registered[adapter.Descriptor().Kind] = compensator
+		}
+	}
+	return &EffectCleanupHandler{controller: controller, planner: planner, broker: broker, adapters: registered}, nil
+}
+
+func (handler *EffectCleanupHandler) Handle(ctx context.Context, claimed store.ClaimedIntent) worker.Result {
+	if claimed.Record.Intent.Kind != contracts.IntentCleanup {
+		return deadIntent("cleanup.kind", "claimed intent is not cleanup work")
+	}
+	// Run and Invocation cleanup intents are scheduling signals consumed by the
+	// controller drive. Only Effect cleanup carries an effectId payload.
+	effectID, _ := claimed.Record.Intent.Payload["effectId"].(string)
+	if effectID == "" {
+		return worker.Result{Disposition: worker.Complete}
+	}
+	current, err := handler.controller.GetEffect(ctx, effectID)
+	if err != nil {
+		return retryIntent(handler.controller.clock.Now(), "cleanup.effect-load", err)
+	}
+	if current.CompensationState.Terminal() {
+		return worker.Result{Disposition: worker.Complete}
+	}
+	if current.CompensationState == contracts.EffectCompensationPending {
+		request, planErr := handler.planner.PlanEffectCompensation(ctx, current)
+		if planErr != nil {
+			return retryIntent(handler.controller.clock.Now(), "cleanup.plan", planErr)
+		}
+		if request.EffectID == "" {
+			request.EffectID = current.EffectID
+		}
+		if request.EffectID != current.EffectID {
+			return deadIntent("cleanup.plan-conflict", "compensation planner changed the Effect identity")
+		}
+		begun, beginErr := handler.controller.BeginEffectCompensation(ctx, request)
+		if beginErr != nil {
+			return retryIntent(handler.controller.clock.Now(), "cleanup.begin", beginErr)
+		}
+		current = begun.Effect
+	}
+	if current.CompensationState != contracts.EffectCompensationRunning {
+		return deadIntent("cleanup.effect-state", "cleanup does not target a pending or running compensation")
+	}
+	ledger, err := handler.controller.GetCommandLedger(ctx, current.CompensationCommandID)
+	if err != nil {
+		return retryIntent(handler.controller.clock.Now(), "cleanup.ledger-load", err)
+	}
+	compensator := handler.adapters[current.Intent.Kind]
+	if compensator == nil {
+		return handler.fail(ctx, current, ledger, EffectAdapterDescriptor{
+			Kind: current.Intent.Kind, ProviderRef: handler.controller.ownerRef, ProviderDigest: current.Intent.DescriptorDigest,
+		}, current.Intent.PolicyDigest, "compensator.not-installed", "no compensator is installed for the applied Effect kind")
+	}
+	credentials, err := handler.broker.ResolveEffectCredentials(ctx, current, ledger)
+	if err != nil {
+		return handler.fail(ctx, current, ledger, compensator.Descriptor(), current.Intent.PolicyDigest, "compensation.credential", err.Error())
+	}
+	envelope := ledger.Envelope
+	envelope.IdempotencyKey = credentials.IdempotencyKey
+	envelope.CapabilityToken = credentials.CapabilityToken
+	now := handler.controller.clock.Now().UTC()
+	if err := effect.ValidateEnvelope(envelope); err != nil || !envelope.Deadline.After(now) {
+		if err == nil {
+			err = errors.New("compensation command deadline has elapsed")
+		}
+		return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.command-invalid", err.Error())
+	}
+	providerLedger, dispatchErr := compensator.Compensate(ctx, current, envelope, credentials.AuthorizationDigest)
+	if dispatchErr != nil {
+		return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.dispatch-uncertain", dispatchErr.Error())
+	}
+	if err := effect.ValidateLedger(providerLedger); err != nil || len(providerLedger.Receipts) == 0 ||
+		!providerLedger.Receipts[len(providerLedger.Receipts)-1].Status.Terminal() || !samePublicEnvelope(providerLedger.Envelope, ledger.Envelope) {
+		if err == nil {
+			err = errors.New("compensator returned no terminal ledger or a conflicting command envelope")
+		}
+		return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.ledger-invalid", err.Error())
+	}
+	for _, receipt := range providerLedger.Receipts {
+		observed, observeErr := handler.controller.ObserveEffectCompensation(ctx, ObserveEffectCompensationRequest{
+			EffectID: current.EffectID, Receipt: receipt,
+			CommandID: phaseCommand(current.EffectID, "compensation-receipt", uint64(receipt.Sequence)),
+		})
+		if observeErr != nil {
+			return retryIntent(now, "cleanup.receipt-persist", observeErr)
+		}
+		current = observed.Effect
+	}
+	return worker.Result{Disposition: worker.Complete}
+}
+
+func (handler *EffectCleanupHandler) fail(
+	ctx context.Context,
+	current contracts.EffectRecord,
+	ledger contracts.CommandLedger,
+	descriptor EffectAdapterDescriptor,
+	authorizationDigest, code, message string,
+) worker.Result {
+	at := handler.controller.clock.Now().UTC()
+	if at.Before(current.UpdatedAt) {
+		at = current.UpdatedAt
+	}
+	sequence := uint32(len(ledger.Receipts) + 1)
+	status := contracts.ReceiptUncertain
+	class := contracts.FailureUncertain
+	if code == "compensator.not-installed" || code == "compensation.command-invalid" || code == "compensation.credential" {
+		status = contracts.ReceiptRejected
+		class = contracts.FailurePermanent
+	}
+	receipt, err := syntheticReceipt(ledger.Envelope, descriptor, authorizationDigest, sequence, status,
+		&contracts.StructuredFailure{Class: class, Code: code, Message: message}, at)
+	if err != nil {
+		return retryIntent(at, "cleanup.failure-receipt", err)
+	}
+	if _, err := handler.controller.ObserveEffectCompensation(ctx, ObserveEffectCompensationRequest{
+		EffectID: current.EffectID, Receipt: receipt,
+		CommandID: phaseCommand(current.EffectID, "compensation-failed", uint64(sequence)),
+	}); err != nil {
+		return retryIntent(at, "cleanup.failure-persist", err)
+	}
+	return worker.Result{Disposition: worker.Complete}
+}
+
+var _ worker.Handler = (*EffectCleanupHandler)(nil)
+
 type ChildResolutionHandler struct{ controller *Controller }
 
 func NewChildResolutionHandler(controller *Controller) (*ChildResolutionHandler, error) {

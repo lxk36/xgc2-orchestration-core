@@ -29,3 +29,12 @@ type Adapter interface {
 	Descriptor() AdapterDescriptor
 	Dispatch(context.Context, contracts.EffectIntent, contracts.CommandEnvelope, string) (contracts.CommandLedger, error)
 }
+
+// Compensator is the optional Saga port for an adapter whose applied Effects
+// can be reversed. The core durably records the compensation command before
+// calling this method. Implementations must address only the exact external
+// identity recorded on applied and use the command envelope idempotently.
+type Compensator interface {
+	Adapter
+	Compensate(context.Context, contracts.EffectRecord, contracts.CommandEnvelope, string) (contracts.CommandLedger, error)
+}

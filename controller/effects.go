@@ -52,6 +52,12 @@ type ObserveEffectResult struct {
 	Replay bool                    `json:"replay"`
 }
 
+type ObserveEffectCompensationRequest struct {
+	EffectID  string
+	Receipt   contracts.CommandReceipt
+	CommandID string
+}
+
 func (controller *Controller) GetEffect(ctx context.Context, effectID string) (contracts.EffectRecord, error) {
 	record, err := controller.store.GetAggregate(ctx, effectKey(effectID))
 	if err != nil {
@@ -252,6 +258,184 @@ func (controller *Controller) ObserveEffect(ctx context.Context, request Observe
 		Events:    append(decision.Events, ledgerEvent),
 		Intents:   resolutionSeeds,
 		Outcome:   outcome, At: request.Receipt.ObservedAt,
+	})
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	if committed.Replay {
+		if err := canonicaljson.UnmarshalStrict(committed.Outcome, &result); err != nil {
+			return ObserveEffectResult{}, err
+		}
+		result.Replay = true
+	}
+	return result, nil
+}
+
+// BeginEffectCompensation durably fences a compensation command and creates
+// its immutable ledger before any provider is called. Reusing the same command
+// is an idempotent replay; changing it after dispatch is rejected.
+func (controller *Controller) BeginEffectCompensation(ctx context.Context, request BeginEffectRequest) (BeginEffectResult, error) {
+	if ctx == nil {
+		return BeginEffectResult{}, errors.New("begin effect compensation context is required")
+	}
+	effectRecord, err := controller.store.GetAggregate(ctx, effectKey(request.EffectID))
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	current, err := decodeEffect(effectRecord)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	envelope, err := buildCommandEnvelope(current.Intent, request)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	if current.CompensationCommandID == request.CommandID {
+		ledger, replayErr := controller.GetCommandLedger(ctx, request.CommandID)
+		if replayErr != nil {
+			return BeginEffectResult{}, replayErr
+		}
+		if !samePublicEnvelope(ledger.Envelope, envelope) {
+			return BeginEffectResult{}, effect.ErrCommandConflict
+		}
+		return BeginEffectResult{Effect: current, Ledger: ledger, Replay: true}, nil
+	}
+	at := controller.clock.Now().UTC()
+	if at.Before(current.UpdatedAt) {
+		at = current.UpdatedAt
+	}
+	decision, err := effect.TransitionCompensation(current, effect.CompensationCommand{
+		EffectID: current.EffectID, ExpectedRevision: current.Revision,
+		To: contracts.EffectCompensationRunning, CompensationCommandID: request.CommandID,
+		CommandID: request.CommandID, At: at,
+	})
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	durableLedger := contracts.CommandLedger{Envelope: envelope, Receipts: []contracts.CommandReceipt{}}
+	durableLedger.Envelope.IdempotencyKey = ""
+	durableLedger.Envelope.CapabilityToken = ""
+	if err := effect.ValidateLedger(durableLedger); err != nil {
+		return BeginEffectResult{}, err
+	}
+	effectMutation, err := aggregateMutation(effectKey(current.EffectID), effectRecord.Revision, decision.Effect)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.CommandID), 0, durableLedger)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	ledgerEvent, err := aggregateEvent(ledgerMutation, "compensation-command.enqueued", request.CommandID, at, map[string]any{
+		"effectId": current.EffectID, "commandIdentityDigest": envelope.IdentityDigest,
+	})
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	result := BeginEffectResult{Effect: decision.Effect, Ledger: durableLedger}
+	outcome, err := canonicaljson.Marshal(result)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{
+		"operation": "effect.compensation.begin", "effectId": current.EffectID, "command": envelope,
+	})
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	committed, err := controller.store.Commit(ctx, store.Transaction{
+		CommandID: request.CommandID, IdentityDigest: identity,
+		Expected: []store.ExpectedRevision{
+			{Key: effectMutation.Key, Revision: effectRecord.Revision},
+			{Key: ledgerMutation.Key, Revision: 0},
+		},
+		Mutations: []store.AggregateRecord{effectMutation, ledgerMutation},
+		Events:    append(decision.Events, ledgerEvent), Outcome: outcome, At: at,
+	})
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	if committed.Replay {
+		if err := canonicaljson.UnmarshalStrict(committed.Outcome, &result); err != nil {
+			return BeginEffectResult{}, err
+		}
+		result.Replay = true
+	}
+	return result, nil
+}
+
+// ObserveEffectCompensation persists one provider receipt without mutating the
+// primary Effect result. Terminal receipts close the independent Saga state.
+func (controller *Controller) ObserveEffectCompensation(ctx context.Context, request ObserveEffectCompensationRequest) (ObserveEffectResult, error) {
+	if ctx == nil {
+		return ObserveEffectResult{}, errors.New("observe effect compensation context is required")
+	}
+	effectRecord, err := controller.store.GetAggregate(ctx, effectKey(request.EffectID))
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	current, err := decodeEffect(effectRecord)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerRecord, err := controller.store.GetAggregate(ctx, commandLedgerKey(request.Receipt.CommandID))
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledger, err := decodeCommandLedger(ledgerRecord)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	for _, prior := range ledger.Receipts {
+		if prior.ReceiptID != request.Receipt.ReceiptID {
+			continue
+		}
+		if !sameReceipt(prior, request.Receipt) {
+			return ObserveEffectResult{}, effect.ErrReceiptConflict
+		}
+		return ObserveEffectResult{Effect: current, Ledger: ledger, Replay: true}, nil
+	}
+	decision, err := effect.ObserveCompensation(current, ledger, effect.ObserveCompensationCommand{
+		EffectID: current.EffectID, ExpectedRevision: current.Revision,
+		Receipt: request.Receipt, CommandID: request.CommandID,
+	})
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	effectMutation, err := aggregateMutation(effectKey(current.EffectID), effectRecord.Revision, decision.Effect)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.Receipt.CommandID), ledgerRecord.Revision, *decision.Ledger)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerEvent, err := aggregateEvent(ledgerMutation, "compensation-command.receipt."+string(request.Receipt.Status), request.CommandID, request.Receipt.ObservedAt, map[string]any{
+		"effectId": current.EffectID, "receiptId": request.Receipt.ReceiptID,
+		"sequence": request.Receipt.Sequence, "status": request.Receipt.Status,
+	})
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	result := ObserveEffectResult{Effect: decision.Effect, Ledger: *decision.Ledger}
+	outcome, err := canonicaljson.Marshal(result)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{
+		"operation": "effect.compensation.observe", "effectId": current.EffectID, "receipt": request.Receipt,
+	})
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	committed, err := controller.store.Commit(ctx, store.Transaction{
+		CommandID: request.CommandID, IdentityDigest: identity,
+		Expected: []store.ExpectedRevision{
+			{Key: effectMutation.Key, Revision: effectRecord.Revision},
+			{Key: ledgerMutation.Key, Revision: ledgerRecord.Revision},
+		},
+		Mutations: []store.AggregateRecord{effectMutation, ledgerMutation},
+		Events:    append(decision.Events, ledgerEvent), Outcome: outcome, At: request.Receipt.ObservedAt,
 	})
 	if err != nil {
 		return ObserveEffectResult{}, err
