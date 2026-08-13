@@ -18,6 +18,17 @@ type staticResolver struct {
 	err        error
 }
 
+type recordingResolver struct {
+	resolution Resolution
+	prepared   contracts.EffectIntent
+	intent     Intent
+}
+
+func (resolver *recordingResolver) ResolveProcess(_ context.Context, prepared contracts.EffectIntent, intent Intent) (Resolution, error) {
+	resolver.prepared, resolver.intent = prepared, intent
+	return resolver.resolution, nil
+}
+
 func (resolver staticResolver) ResolveProcess(context.Context, contracts.EffectIntent, Intent) (Resolution, error) {
 	return resolver.resolution, resolver.err
 }
@@ -89,6 +100,36 @@ func TestStartResolverCannotReplacePublicProcessPin(t *testing.T) {
 	}
 	if provider.start != nil {
 		t.Fatal("provider was called after a start pin replacement")
+	}
+}
+
+func TestStartCompensationStopsExactAppliedExternalIdentity(t *testing.T) {
+	provider := &recordingProvider{}
+	spec := contracts.ProcessSpec{ProcessID: "simulator", Version: "v1"}
+	identity := contracts.ProcessIdentity{PID: 123, PGID: 123, StartTicks: 456}
+	resolver := &recordingResolver{resolution: Resolution{Spec: &spec, KnownIdentity: &identity}}
+	adapter, err := New(Config{
+		Kind: KindStart, ProviderRef: "local-process", ProviderDigest: adapterTestDigest,
+		Provider: provider, Resolver: resolver,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := contracts.EffectRecord{
+		EffectID: "effect-start-1", State: contracts.EffectApplied, ExternalIdentity: "process-instance-1",
+		Intent: contracts.EffectIntent{Kind: KindStart, RunID: "start-run-1"},
+	}
+	envelope := contracts.CommandEnvelope{EffectID: applied.EffectID, TargetRef: applied.ExternalIdentity}
+	if _, err := adapter.Compensate(t.Context(), applied, envelope, adapterTestDigest); err != nil {
+		t.Fatal(err)
+	}
+	if resolver.prepared.Kind != KindStop || resolver.prepared.TargetRef != applied.ExternalIdentity ||
+		resolver.intent.ExternalIdentityRef != applied.ExternalIdentity || resolver.intent.OwnerRunRef != applied.Intent.RunID {
+		t.Fatalf("private compensation resolution = prepared %#v intent %#v", resolver.prepared, resolver.intent)
+	}
+	if provider.stop == nil || provider.stop.Envelope.TargetRef != applied.ExternalIdentity ||
+		provider.stop.KnownIdentity == nil || *provider.stop.KnownIdentity != identity {
+		t.Fatalf("exact compensation dispatch = %#v", provider.stop)
 	}
 }
 

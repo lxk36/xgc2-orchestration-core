@@ -147,4 +147,51 @@ func (adapter *Adapter) Dispatch(
 	return result.Ledger, nil
 }
 
+// Compensate reverses one exact applied process-start Effect. The provider-side
+// resolver restores the immutable ProcessSpec and PID identity from the public
+// external identity plus producing Run owner; no process-name scan is allowed.
+func (adapter *Adapter) Compensate(
+	ctx context.Context,
+	applied contracts.EffectRecord,
+	envelope contracts.CommandEnvelope,
+	authorizationDigest string,
+) (contracts.CommandLedger, error) {
+	if adapter.descriptor.Kind != KindStart || applied.State != contracts.EffectApplied ||
+		applied.Intent.Kind != KindStart || !contracts.ValidIdentifier(applied.ExternalIdentity) ||
+		envelope.EffectID != applied.EffectID || envelope.TargetRef != applied.ExternalIdentity {
+		return contracts.CommandLedger{}, errors.New("process compensation requires one exact applied start identity")
+	}
+	intent := Intent{ExternalIdentityRef: applied.ExternalIdentity, OwnerRunRef: applied.Intent.RunID}
+	prepared := applied.Intent
+	prepared.Kind = KindStop
+	prepared.TargetRef = applied.ExternalIdentity
+	prepared.Intent = map[string]any{
+		"externalIdentityRef": applied.ExternalIdentity,
+		"ownerRunRef":         applied.Intent.RunID,
+	}
+	prepared.IntentDigest, _ = canonicaljson.DigestValue(prepared.Intent)
+	prepared.IntentArtifactRef = ""
+	resolved, err := adapter.resolver.ResolveProcess(ctx, prepared, intent)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	if resolved.Spec == nil || resolved.KnownIdentity == nil {
+		return contracts.CommandLedger{}, errors.New("process compensation resolver did not restore the exact process spec and identity")
+	}
+	dispatch := processport.Dispatch{
+		Envelope: envelope, Spec: *resolved.Spec,
+		Executable: resolved.Executable, Arguments: append([]string(nil), resolved.Arguments...),
+		Environment: append([]string(nil), resolved.Environment...), WorkingDirectory: resolved.WorkingDirectory,
+		StdoutPath: resolved.StdoutPath, StderrPath: resolved.StderrPath,
+		KnownIdentity: resolved.KnownIdentity, AuthorizationDigest: authorizationDigest,
+		At: adapter.clock.Now().UTC(),
+	}
+	result, err := adapter.provider.Stop(ctx, dispatch)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	return result.Ledger, nil
+}
+
 var _ effectport.Adapter = (*Adapter)(nil)
+var _ effectport.Compensator = (*Adapter)(nil)

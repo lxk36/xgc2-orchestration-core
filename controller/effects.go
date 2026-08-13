@@ -286,7 +286,18 @@ func (controller *Controller) BeginEffectCompensation(ctx context.Context, reque
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
-	envelope, err := buildCommandEnvelope(current.Intent, request)
+	compensationIntent := current.Intent
+	compensationIntent.TargetRef = current.ExternalIdentity
+	compensationIntent.Intent = map[string]any{
+		"effectId": current.EffectID, "externalIdentityRef": current.ExternalIdentity,
+		"ownerRunRef": current.Intent.RunID, "originalIntentDigest": current.Intent.IntentDigest,
+	}
+	compensationIntent.IntentArtifactRef = ""
+	compensationIntent.IntentDigest, err = canonicaljson.DigestValue(compensationIntent.Intent)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	envelope, err := buildCommandEnvelope(compensationIntent, request)
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
