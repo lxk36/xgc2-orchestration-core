@@ -363,6 +363,46 @@ func TestDurableWorkersDispatchOutboxThenResumeRun(t *testing.T) {
 	}
 }
 
+type staticEffectPlan struct {
+	clock *fakeClock
+}
+
+func (plan staticEffectPlan) PlanEffectDispatch(_ context.Context, current contracts.EffectRecord) (BeginEffectRequest, error) {
+	return BeginEffectRequest{
+		EffectID: current.EffectID, CommandID: "coordinate-effect",
+		IdempotencyKey: "coordinate-idempotency", CapabilityToken: "coordinate-capability",
+		Action: "process.start", ActorRef: "operator", SourceRef: "coordinator-test",
+		ReasonCode: "experiment.launch", Risk: contracts.RiskModerate,
+		Fence: contracts.TargetFence{Kind: contracts.FenceGeneration, Generation: &contracts.GenerationFence{
+			BindingID: current.Intent.TargetRef, Generation: 1, FencingToken: 12,
+		}},
+		Deadline: plan.clock.Now().Add(5 * time.Second), CancellationID: "cancel-coordinate-effect",
+	}, nil
+}
+
+func TestCoordinatorOwnsCompleteEffectWaitLoop(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-effect-coordinator")
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &successfulEffectAdapter{clock: fixture.clock}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.store,
+		Planner: staticEffectPlan{clock: fixture.clock}, Credentials: staticEffectCredentials{
+			idempotency: "coordinate-idempotency", capability: "coordinate-capability",
+		},
+		Adapters: []EffectAdapter{adapter}, OwnerRef: "coordinator-test", Clock: fixture.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if err != nil || run.Status != contracts.RunSucceeded || !adapter.seenPrivate || fixture.executor.Calls() != 1 {
+		t.Fatalf("coordinated run = %#v, private=%v calls=%d err=%v", run, adapter.seenPrivate, fixture.executor.Calls(), err)
+	}
+}
+
 func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-expired")
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
