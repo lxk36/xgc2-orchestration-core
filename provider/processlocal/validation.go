@@ -49,7 +49,10 @@ func validateDispatch(dispatch processport.Dispatch, action string) error {
 	if err := validateSpec(dispatch.Spec); err != nil {
 		return err
 	}
-	if dispatch.Spec.DescriptorDigest != dispatch.Envelope.DescriptorDigest {
+	// Start is authorized by the descriptor that authored the immutable
+	// ProcessSpec. Stop is a different node/effect descriptor and instead uses
+	// the privately restored original spec plus exact ProcessIdentity.
+	if action == processport.ActionStart && dispatch.Spec.DescriptorDigest != dispatch.Envelope.DescriptorDigest {
 		return errors.New("process spec and command descriptor digests disagree")
 	}
 	if action == processport.ActionStart {

@@ -93,6 +93,7 @@ func TestStartInspectStopWholeProcessGroupAndReplay(t *testing.T) {
 	stop := testDispatch(t, "command-stop", processport.ActionStop, t0.Add(4*time.Second), stdout, stderr)
 	stop.Envelope.Fence.Generation.Generation = 2
 	stop.Envelope.Fence.Generation.FencingToken = 8
+	stop.Envelope.DescriptorDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	stop.Envelope.IdentityDigest, err = effect.CommandIdentityDigest(stop.Envelope)
 	if err != nil {
 		t.Fatal(err)
