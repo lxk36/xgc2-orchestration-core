@@ -21,8 +21,10 @@ const (
 )
 
 type Intent struct {
-	Spec          contracts.ProcessSpec      `json:"spec"`
-	KnownIdentity *contracts.ProcessIdentity `json:"knownIdentity,omitempty"`
+	Spec                contracts.ProcessSpec      `json:"spec"`
+	KnownIdentity       *contracts.ProcessIdentity `json:"knownIdentity,omitempty"`
+	ExternalIdentityRef string                     `json:"externalIdentityRef,omitempty"`
+	OwnerRunRef         string                     `json:"ownerRunRef,omitempty"`
 }
 
 type Resolution struct {

@@ -145,6 +145,19 @@ func TestCompensationHasIndependentRetryLifecycle(t *testing.T) {
 	}
 }
 
+func TestDetachedEffectCannotClaimCompensation(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	intent := prepareTestEffect(t, t0, contracts.CompensationNone).Intent
+	intent.Ownership = contracts.EffectDetached
+	if err := ValidateIntent(intent, t0); err != nil {
+		t.Fatalf("detached non-compensating effect: %v", err)
+	}
+	intent.CompensationPolicy = contracts.CompensationRequired
+	if err := ValidateIntent(intent, t0); err == nil {
+		t.Fatal("detached effect claimed Run-owned compensation")
+	}
+}
+
 func prepareTestEffect(t *testing.T, at time.Time, policy contracts.CompensationPolicy) contracts.EffectRecord {
 	t.Helper()
 	effectID, err := StableEffectID("invocation-1", "start-simulator")

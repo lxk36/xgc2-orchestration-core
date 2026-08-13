@@ -8,10 +8,15 @@ const (
 	EffectOwned    EffectOwnership = "owned"
 	EffectAttached EffectOwnership = "attached"
 	EffectShared   EffectOwnership = "shared"
+	// EffectDetached transfers lifecycle responsibility to an explicit
+	// provider/product resource owner. The producing Run retains the immutable
+	// Receipt and external identity but must not claim it will compensate the
+	// long-lived resource during Run closure.
+	EffectDetached EffectOwnership = "detached"
 )
 
 func (ownership EffectOwnership) Valid() bool {
-	return ownership == EffectOwned || ownership == EffectAttached || ownership == EffectShared
+	return ownership == EffectOwned || ownership == EffectAttached || ownership == EffectShared || ownership == EffectDetached
 }
 
 type CompensationPolicy string
