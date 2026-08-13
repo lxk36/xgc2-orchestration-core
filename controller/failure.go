@@ -116,16 +116,38 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 	if run.Termination == nil || run.Termination.PrimaryFailure == nil {
 		return contracts.Run{}, errors.New("stopping failed run lacks its termination failure")
 	}
+	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if !closure.Satisfied() {
+		return run, openClosureError(closure)
+	}
 	commandID := phaseCommand(run.RunID, "failed", run.Revision)
 	decision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
 		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunFailed,
-		Closure:   contracts.RunClosureFacts{RunRevision: run.Revision, OwnershipGraphRevision: 1},
+		Closure:   closure,
 		CommandID: commandID, At: at,
 	})
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	if err := controller.commitRunDecision(ctx, runRecord.Revision, decision, commandID, at); err != nil {
+	runMutation, err := aggregateMutation(runKey(run.RunID), runRecord.Revision, decision.Run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), graphExpected, graph)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	graphEvent, err := aggregateEvent(graphMutation, "ownership-graph.closed", commandID, at, map[string]any{"runId": run.RunID, "terminalStatus": decision.Run.Status})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if err := controller.commit(ctx, commandID, at,
+		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: graphExpected}},
+		[]store.AggregateRecord{runMutation, graphMutation}, append(decision.Events, graphEvent), decision.Intents, decision.Run,
+	); err != nil {
 		return contracts.Run{}, err
 	}
 	return decision.Run, nil
@@ -147,11 +169,18 @@ func (controller *Controller) succeedRun(
 	if err != nil {
 		return contracts.Run{}, err
 	}
+	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if !closure.Satisfied() {
+		return run, openClosureError(closure)
+	}
 	commandID := phaseCommand(run.RunID, "succeeded", run.Revision)
 	decision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
 		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunSucceeded,
 		ResultRef: digestRef("result", resultDigest),
-		Closure:   contracts.RunClosureFacts{RunRevision: run.Revision, OwnershipGraphRevision: 1},
+		Closure:   closure,
 		CommandID: commandID, At: at,
 	})
 	if err != nil {
@@ -171,9 +200,17 @@ func (controller *Controller) succeedRun(
 	if err != nil {
 		return contracts.Run{}, err
 	}
+	graphMutation, err := aggregateMutation(ownershipGraphKey(run.RunID), graphExpected, graph)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	graphEvent, err := aggregateEvent(graphMutation, "ownership-graph.closed", commandID, at, map[string]any{"runId": run.RunID, "terminalStatus": decision.Run.Status})
+	if err != nil {
+		return contracts.Run{}, err
+	}
 	if err := controller.commit(ctx, commandID, at,
-		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}},
-		[]store.AggregateRecord{runMutation, snapshotMutation}, append(decision.Events, snapshotEvent), decision.Intents, decision.Run,
+		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}, {Key: graphMutation.Key, Revision: graphExpected}},
+		[]store.AggregateRecord{runMutation, snapshotMutation, graphMutation}, append(append(decision.Events, snapshotEvent), graphEvent), decision.Intents, decision.Run,
 	); err != nil {
 		return contracts.Run{}, err
 	}

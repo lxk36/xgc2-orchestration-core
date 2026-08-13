@@ -15,6 +15,7 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/kernel/effect"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/node"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/ownership"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 	nodesdk "github.com/lxk36/xgc2-orchestration-core/sdk/go/node"
@@ -87,6 +88,14 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 	if err != nil || len(runs) != 1 || runs[0].RunID != run.RunID {
 		t.Fatalf("listed runs = %#v, err = %v", runs, err)
 	}
+	graph, err := fixture.controller.OwnershipGraph(t.Context(), run.RunID)
+	if err != nil || graph.Revision != 1 || graph.Run.Revision+1 != run.Revision || len(graph.Invocations) != 2 {
+		t.Fatalf("ownership graph = %#v, terminal revision=%d err=%v", graph, run.Revision, err)
+	}
+	facts, err := ownership.ClosureFacts(graph)
+	if err != nil || !facts.Satisfied() || facts.OwnershipGraphRevision != graph.Revision {
+		t.Fatalf("closure facts = %#v, err=%v", facts, err)
+	}
 	path := fixture.path
 	if err := fixture.store.Close(); err != nil {
 		t.Fatal(err)
@@ -106,6 +115,9 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 	run, err = recovered.Drive(t.Context(), run.RunID)
 	if err != nil || run.Status != contracts.RunSucceeded || fixture.prepare.Calls() != 1 || fixture.render.Calls() != 1 {
 		t.Fatalf("recovered run = %#v, err = %v, calls=%d/%d", run, err, fixture.prepare.Calls(), fixture.render.Calls())
+	}
+	if recoveredGraph, graphErr := recovered.OwnershipGraph(t.Context(), run.RunID); graphErr != nil || recoveredGraph.Revision != graph.Revision {
+		t.Fatalf("recovered ownership graph = %#v, err=%v", recoveredGraph, graphErr)
 	}
 }
 
@@ -476,7 +488,7 @@ func (executor *effectExecutor) Execute(_ context.Context, request contracts.Nod
 	proposal := contracts.EffectProposal{
 		EffectKey: "start-process", Kind: "xgc.process-start/v1", TargetRef: "simulator",
 		IntentSchemaDigest: testPackageDigest, Intent: intent, IntentDigest: intentDigest,
-		Ownership: contracts.EffectOwned, CompensationPolicy: contracts.CompensationRequired,
+		Ownership: contracts.EffectDetached, CompensationPolicy: contracts.CompensationNone,
 		RequiredCapabilityRefs: []string{"process.control"}, PolicyDigest: request.CapabilityGrants[0].AuthorizationDigest,
 		Deadline: request.Deadline,
 	}
@@ -533,7 +545,6 @@ func newEffectControllerFixture(t *testing.T, runID string) effectControllerFixt
 	descriptor.Mode = contracts.NodeEffectful
 	descriptor.RequiredCapabilities = []contracts.CapabilityRequirement{{CapabilityRef: "process.control", Scope: "target"}}
 	descriptor.AllowedEffectKinds = []string{"xgc.process-start/v1"}
-	descriptor.CompensationTypeRef = "xgc.test.effect-compensate/v1"
 	descriptor.DescriptorDigest = ""
 	descriptor.DescriptorDigest, _ = node.DescriptorDigest(descriptor)
 	executor := &effectExecutor{descriptor: descriptor}

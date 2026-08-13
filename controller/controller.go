@@ -24,6 +24,7 @@ import (
 var (
 	ErrAttemptLeaseActive = errors.New("node invocation is owned by a live attempt lease")
 	ErrRunWaiting         = errors.New("workflow run is durably waiting")
+	ErrRunClosureOpen     = errors.New("workflow run ownership closure is still open")
 	errContinueDrive      = errors.New("continue driving workflow")
 )
 
@@ -33,6 +34,7 @@ const (
 	invocationType        = "invocation"
 	effectAggregateType   = "effect"
 	commandLedgerType     = "command-ledger"
+	ownershipGraphType    = "ownership-graph"
 	eventSchemaDigest     = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
 )
 
