@@ -29,13 +29,14 @@ var (
 )
 
 const (
-	runAggregateType      = "run"
-	snapshotAggregateType = "run-snapshot"
-	invocationType        = "invocation"
-	effectAggregateType   = "effect"
-	commandLedgerType     = "command-ledger"
-	ownershipGraphType    = "ownership-graph"
-	eventSchemaDigest     = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
+	runAggregateType         = "run"
+	snapshotAggregateType    = "run-snapshot"
+	invocationType           = "invocation"
+	effectAggregateType      = "effect"
+	commandLedgerType        = "command-ledger"
+	ownershipGraphType       = "ownership-graph"
+	activeOwnerAggregateType = "active-run-owner"
+	eventSchemaDigest        = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
 )
 
 type Clock interface{ Now() time.Time }
@@ -68,29 +69,38 @@ func (cryptoTokenSource) NewToken() (string, error) {
 }
 
 type Config struct {
-	Store             store.Store
-	Nodes             *node.Registry
-	OwnerRef          string
-	LeaseDuration     time.Duration
-	InvocationTimeout time.Duration
-	Clock             Clock
-	Grants            GrantResolver
-	Actions           ActionResolver
-	Tokens            TokenSource
+	Store                   store.Store
+	Nodes                   *node.Registry
+	OwnerRef                string
+	LeaseDuration           time.Duration
+	InvocationTimeout       time.Duration
+	Clock                   Clock
+	Grants                  GrantResolver
+	Actions                 ActionResolver
+	Tokens                  TokenSource
+	ReservedIngressPolicies []*ReservedIngressPolicy
 }
 
 type Controller struct {
-	store             store.Store
-	nodes             *node.Registry
-	descriptors       map[string]contracts.NodeDescriptor
-	ownerRef          string
-	leaseDuration     time.Duration
-	invocationTimeout time.Duration
-	clock             Clock
-	grants            GrantResolver
-	actions           ActionResolver
-	tokens            TokenSource
-	afterClaim        func(contracts.InvocationLedger) error
+	store              store.Store
+	nodes              *node.Registry
+	descriptors        map[string]contracts.NodeDescriptor
+	ownerRef           string
+	leaseDuration      time.Duration
+	invocationTimeout  time.Duration
+	clock              Clock
+	grants             GrantResolver
+	actions            ActionResolver
+	tokens             TokenSource
+	afterClaim         func(contracts.InvocationLedger) error
+	reservedIngress    []registeredIngressPolicy
+	reservedNamespaces map[string]struct{}
+}
+
+type registeredIngressPolicy struct {
+	policy *ReservedIngressPolicy
+	spec   ReservedIngressPolicySpec
+	digest string
 }
 
 type InvokeRequest struct {
@@ -110,6 +120,8 @@ type InvokeRequest struct {
 	CommandID       string
 	Parent          *contracts.ParentRunLink
 	RootRunID       string
+	IngressPermit   *IngressPermit
+	ActiveOwnerKey  *contracts.ActiveOwnerKey
 }
 
 type InvokeResult struct {
@@ -196,22 +208,91 @@ func New(config Config) (*Controller, error) {
 	for _, descriptor := range catalog {
 		descriptors[descriptor.TypeRef] = descriptor
 	}
+	reservedIngress := make([]registeredIngressPolicy, 0, len(config.ReservedIngressPolicies))
+	reservedNamespaces := make(map[string]struct{}, len(config.ReservedIngressPolicies))
+	policyRefs := make(map[string]struct{}, len(config.ReservedIngressPolicies))
+	seenPolicies := make(map[*ReservedIngressPolicy]struct{}, len(config.ReservedIngressPolicies))
+	for _, policy := range config.ReservedIngressPolicies {
+		spec, valid := policy.Spec()
+		if !valid {
+			return nil, errors.New("reserved ingress policy is not an issued capability")
+		}
+		if _, duplicate := seenPolicies[policy]; duplicate {
+			return nil, errors.New("reserved ingress policy capability is duplicated")
+		}
+		if _, duplicate := policyRefs[spec.PolicyRef]; duplicate {
+			return nil, errors.New("reserved ingress policy ref is duplicated")
+		}
+		digest := policy.Digest()
+		if !contracts.ValidDigest(digest) {
+			return nil, errors.New("reserved ingress policy digest is invalid")
+		}
+		reservedIngress = append(reservedIngress, registeredIngressPolicy{policy: policy, spec: spec, digest: digest})
+		reservedNamespaces[spec.NamespaceID] = struct{}{}
+		policyRefs[spec.PolicyRef] = struct{}{}
+		seenPolicies[policy] = struct{}{}
+	}
 	return &Controller{
 		store: config.Store, nodes: config.Nodes, descriptors: descriptors, ownerRef: config.OwnerRef,
 		leaseDuration: config.LeaseDuration, invocationTimeout: config.InvocationTimeout,
 		clock: config.Clock, grants: config.Grants, actions: config.Actions, tokens: config.Tokens,
+		reservedIngress: reservedIngress, reservedNamespaces: reservedNamespaces,
 	}, nil
 }
 
 func (controller *Controller) Invoke(ctx context.Context, request InvokeRequest) (InvokeResult, error) {
-	if ctx == nil {
-		return InvokeResult{}, errors.New("invoke context is required")
+	if request.Parent != nil || request.RootRunID != "" || request.Trigger.Kind == contracts.TriggerActionCall {
+		return InvokeResult{}, fmt.Errorf("%w: child Action ingress is kernel-private", ErrReservedIngressDenied)
+	}
+	return controller.invoke(ctx, request, nil)
+}
+
+type childIngressProof struct{ requestDigest string }
+
+func (controller *Controller) invokeChild(ctx context.Context, request InvokeRequest) (InvokeResult, error) {
+	digest, err := childIngressRequestDigest(request)
+	if err != nil {
+		return InvokeResult{}, err
+	}
+	return controller.invoke(ctx, request, &childIngressProof{requestDigest: digest})
+}
+
+func childIngressRequestDigest(request InvokeRequest) (string, error) {
+	return canonicaljson.DigestValue(map[string]any{
+		"schemaVersion": "xgc.child-ingress-proof/v1", "runId": request.RunID,
+		"namespaceId": request.NamespaceID, "actionRef": request.Action.Ref(), "parent": request.Parent,
+		"rootRunId": request.RootRunID, "mappingDigest": request.MappingDigest,
+		"trigger": request.Trigger, "candidate": request.Candidate, "candidateOrigin": request.CandidateOrigin,
+		"scope": request.Scope, "scopeRef": request.ScopeRef, "correlationRef": request.CorrelationRef,
+		"commandId": request.CommandID,
+	})
+}
+
+func (controller *Controller) invoke(ctx context.Context, request InvokeRequest, childProof *childIngressProof) (InvokeResult, error) {
+	if controller == nil || ctx == nil {
+		return InvokeResult{}, errors.New("controller and invoke context are required")
 	}
 	if !contracts.ValidIdentifier(request.RunID) || !contracts.ValidIdentifier(request.NamespaceID) ||
 		!contracts.ValidIdentifier(request.CommandID) {
 		return InvokeResult{}, errors.New("invoke run, namespace, or command identity is invalid")
 	}
+	childShape := request.Parent != nil || request.RootRunID != "" || request.Trigger.Kind == contracts.TriggerActionCall
+	if childShape {
+		if childProof == nil {
+			return InvokeResult{}, fmt.Errorf("%w: child Action ingress lacks a kernel proof", ErrReservedIngressDenied)
+		}
+		digest, digestErr := childIngressRequestDigest(request)
+		if digestErr != nil || digest != childProof.requestDigest {
+			return InvokeResult{}, fmt.Errorf("%w: child Action ingress proof differs from request", ErrReservedIngressDenied)
+		}
+	} else if childProof != nil {
+		return InvokeResult{}, fmt.Errorf("%w: root ingress cannot carry a child proof", ErrReservedIngressDenied)
+	}
 	if err := controller.validateInvokeLineage(ctx, request); err != nil {
+		return InvokeResult{}, err
+	}
+	ingress, err := controller.admitIngress(request)
+	if err != nil {
 		return InvokeResult{}, err
 	}
 	plan, err := workflowkernel.Compile(request.Definition)
@@ -240,66 +321,162 @@ func (controller *Controller) Invoke(ctx context.Context, request InvokeRequest)
 	if err != nil {
 		return InvokeResult{}, err
 	}
-	at := controller.clock.Now().UTC()
-	decision, err := execution.AdmitRun(execution.AdmitRunCommand{
-		RunID: request.RunID, NamespaceID: request.NamespaceID, ActionRef: request.Action.Ref(),
-		ExecutionPlanRef: digestRef("plan", plan.PlanDigest), PlanDigest: plan.PlanDigest,
-		TriggerRef: request.Trigger.EventID, TriggerDigest: admission.TriggerDigest, InputDigest: admission.InputDigest,
-		ProvenanceArtifactRef: digestRef("provenance", admission.InputDigest), ScopeRef: request.ScopeRef,
-		Parent: request.Parent, RootRunID: request.RootRunID,
-		ActorRef: request.Trigger.ActorRef, SourceRef: request.Trigger.SourceRef, CorrelationRef: request.CorrelationRef,
-		CommandID: request.CommandID, At: at,
-	})
+	scopeDigest, err := canonicaljson.DigestValue(request.Scope)
 	if err != nil {
 		return InvokeResult{}, err
 	}
-	nodeOrder := append([]string(nil), plan.EntrypointNodeOrder[request.Action.Entrypoint]...)
-	snapshot := RunSnapshot{
-		SchemaVersion: "xgc.run-snapshot/v1", RunID: request.RunID, Action: request.Action,
-		Definition: request.Definition, Plan: plan, Entrypoint: request.Action.Entrypoint, NodeOrder: nodeOrder,
-		Inputs: admission.Inputs, Trigger: admission.Trigger.Payload, Scope: request.Scope,
-		Provenance: admission.FieldProvenance, NodeOutputs: map[string]map[string]any{},
-	}
-	runMutation, err := aggregateMutation(runKey(request.RunID), 0, decision.Run)
-	if err != nil {
-		return InvokeResult{}, err
-	}
-	snapshotMutation, err := aggregateMutation(snapshotKey(request.RunID), 0, snapshot)
-	if err != nil {
-		return InvokeResult{}, err
-	}
-	snapshotEvent, err := aggregateEvent(snapshotMutation, "snapshot.created", request.CommandID, at, map[string]any{
-		"planDigest": plan.PlanDigest, "entrypoint": request.Action.Entrypoint, "inputDigest": admission.InputDigest,
-	})
+	provenanceDigest, err := canonicaljson.DigestValue(admission.FieldProvenance)
 	if err != nil {
 		return InvokeResult{}, err
 	}
 	identityDigest, err := canonicaljson.DigestValue(map[string]any{
-		"runId": request.RunID, "actionRef": request.Action.Ref(), "planDigest": plan.PlanDigest,
-		"triggerDigest": admission.TriggerDigest, "inputDigest": admission.InputDigest,
-		"parent": request.Parent, "rootRunId": request.RootRunID,
+		"schemaVersion": "xgc.run-admission-command/v1", "commandId": request.CommandID,
+		"runId": request.RunID, "namespaceId": request.NamespaceID, "action": request.Action,
+		"planDigest": plan.PlanDigest, "triggerDigest": admission.TriggerDigest,
+		"inputDigest": admission.InputDigest, "provenanceDigest": provenanceDigest,
+		"scope": request.Scope, "scopeDigest": scopeDigest, "scopeRef": request.ScopeRef,
+		"candidateRef": request.CandidateRef, "mappingDigest": request.MappingDigest,
+		"parent": request.Parent, "rootRunId": request.RootRunID, "correlationRef": request.CorrelationRef,
+		"admissionPolicyRef": ingress.policyRef, "admissionPolicyDigest": ingress.policyDigest,
+		"activeOwnerKeyDigest": ingress.keyDigest,
 	})
 	if err != nil {
 		return InvokeResult{}, err
 	}
-	outcome, err := canonicaljson.Marshal(decision.Run)
-	if err != nil {
-		return InvokeResult{}, err
+	if ingress.ownerKey != nil {
+		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, request.CommandID); receiptErr != nil {
+			return InvokeResult{}, receiptErr
+		} else if found {
+			if receipt.RequestIdentityDigest != identityDigest {
+				return InvokeResult{}, store.ErrIdentityConflict
+			}
+			return InvokeResult{Run: receipt.AcceptedRun, Replay: true}, nil
+		}
 	}
-	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identityDigest,
-		Expected:  []store.ExpectedRevision{{Key: runMutation.Key, Revision: 0}, {Key: snapshotMutation.Key, Revision: 0}},
-		Mutations: []store.AggregateRecord{runMutation, snapshotMutation},
-		Events:    append(decision.Events, snapshotEvent), Outcome: outcome, At: at,
-	})
-	if err != nil {
-		return InvokeResult{}, err
+	at := controller.clock.Now().UTC()
+	nodeOrder := append([]string(nil), plan.EntrypointNodeOrder[request.Action.Entrypoint]...)
+	for attempt := 0; attempt < 4; attempt++ {
+		owner, ownerExpected := contracts.ActiveRunOwner{}, uint64(0)
+		if ingress.ownerKey != nil {
+			owner, ownerExpected, err = controller.prepareActiveOwnerAcquire(ctx, ingress, request.RunID, at)
+			if err != nil {
+				return InvokeResult{}, err
+			}
+		}
+		decision, admitErr := execution.AdmitRun(execution.AdmitRunCommand{
+			RunID: request.RunID, NamespaceID: request.NamespaceID, ActionRef: request.Action.Ref(),
+			ExecutionPlanRef: digestRef("plan", plan.PlanDigest), PlanDigest: plan.PlanDigest,
+			TriggerRef: request.Trigger.EventID, TriggerDigest: admission.TriggerDigest, InputDigest: admission.InputDigest,
+			ProvenanceArtifactRef: digestRef("provenance", admission.InputDigest), ScopeRef: request.ScopeRef,
+			Parent: request.Parent, RootRunID: request.RootRunID,
+			ActorRef: request.Trigger.ActorRef, SourceRef: request.Trigger.SourceRef, CorrelationRef: request.CorrelationRef,
+			AdmissionPolicyRef: ingress.policyRef, AdmissionPolicyDigest: ingress.policyDigest,
+			ActiveOwnerRef: ingress.ownerRef, ActiveOwnerGeneration: owner.Generation,
+			CommandID: request.CommandID, At: at,
+		})
+		if admitErr != nil {
+			return InvokeResult{}, admitErr
+		}
+		snapshot := RunSnapshot{
+			SchemaVersion: "xgc.run-snapshot/v1", RunID: request.RunID, Action: request.Action,
+			Definition: request.Definition, Plan: plan, Entrypoint: request.Action.Entrypoint, NodeOrder: nodeOrder,
+			Inputs: admission.Inputs, Trigger: admission.Trigger.Payload, Scope: request.Scope,
+			Provenance: admission.FieldProvenance, NodeOutputs: map[string]map[string]any{},
+		}
+		runMutation, mutationErr := aggregateMutation(runKey(request.RunID), 0, decision.Run)
+		if mutationErr != nil {
+			return InvokeResult{}, mutationErr
+		}
+		snapshotMutation, mutationErr := aggregateMutation(snapshotKey(request.RunID), 0, snapshot)
+		if mutationErr != nil {
+			return InvokeResult{}, mutationErr
+		}
+		snapshotEvent, eventErr := aggregateEvent(snapshotMutation, "snapshot.created", request.CommandID, at, map[string]any{
+			"planDigest": plan.PlanDigest, "entrypoint": request.Action.Entrypoint, "inputDigest": admission.InputDigest,
+		})
+		if eventErr != nil {
+			return InvokeResult{}, eventErr
+		}
+		expected := []store.ExpectedRevision{{Key: runMutation.Key, Revision: 0}, {Key: snapshotMutation.Key, Revision: 0}}
+		mutations := []store.AggregateRecord{runMutation, snapshotMutation}
+		events := append(append([]contracts.DomainEvent(nil), decision.Events...), snapshotEvent)
+		if ingress.ownerKey != nil {
+			ownerMutation, ownerErr := aggregateMutation(activeOwnerKey(owner.OwnerRef), ownerExpected, owner)
+			if ownerErr != nil {
+				return InvokeResult{}, ownerErr
+			}
+			ownerEvent, ownerErr := aggregateEvent(ownerMutation, "active-run-owner.acquired", request.CommandID, at, map[string]any{
+				"runId": request.RunID, "ownerRef": owner.OwnerRef, "generation": owner.Generation,
+				"policyRef": owner.PolicyRef, "keyDigest": owner.KeyDigest,
+			})
+			if ownerErr != nil {
+				return InvokeResult{}, ownerErr
+			}
+			receipt := runAdmissionReceipt{
+				SchemaVersion: runAdmissionReceiptSchema, CommandID: request.CommandID,
+				RequestIdentityDigest: identityDigest, AcceptedRun: decision.Run,
+				OwnerRef: owner.OwnerRef, OwnerGeneration: owner.Generation,
+			}
+			receiptMutation, receiptErr := aggregateMutation(runAdmissionReceiptKey(request.CommandID), 0, receipt)
+			if receiptErr != nil {
+				return InvokeResult{}, receiptErr
+			}
+			receiptEvent, receiptErr := aggregateEvent(receiptMutation, "run-admission.received", request.CommandID, at, map[string]any{
+				"runId": request.RunID, "ownerRef": owner.OwnerRef, "requestIdentityDigest": identityDigest,
+			})
+			if receiptErr != nil {
+				return InvokeResult{}, receiptErr
+			}
+			expected = append(expected,
+				store.ExpectedRevision{Key: ownerMutation.Key, Revision: ownerExpected},
+				store.ExpectedRevision{Key: receiptMutation.Key, Revision: 0},
+			)
+			mutations = append(mutations, ownerMutation, receiptMutation)
+			events = append(events, ownerEvent, receiptEvent)
+		}
+		outcome, marshalErr := canonicaljson.Marshal(decision.Run)
+		if marshalErr != nil {
+			return InvokeResult{}, marshalErr
+		}
+		committed, commitErr := controller.store.Commit(ctx, store.Transaction{
+			CommandID: request.CommandID, IdentityDigest: identityDigest, Expected: expected,
+			Mutations: mutations, Events: events, Outcome: outcome, At: at,
+		})
+		if commitErr == nil {
+			var run contracts.Run
+			if err := canonicaljson.UnmarshalStrict(committed.Outcome, &run); err != nil {
+				return InvokeResult{}, err
+			}
+			return InvokeResult{Run: run, Replay: committed.Replay}, nil
+		}
+		if ingress.ownerKey == nil || (!errors.Is(commitErr, store.ErrRevisionConflict) && !errors.Is(commitErr, store.ErrIdentityConflict)) {
+			return InvokeResult{}, commitErr
+		}
+		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, request.CommandID); receiptErr != nil {
+			return InvokeResult{}, receiptErr
+		} else if found {
+			if receipt.RequestIdentityDigest != identityDigest {
+				return InvokeResult{}, store.ErrIdentityConflict
+			}
+			return InvokeResult{Run: receipt.AcceptedRun, Replay: true}, nil
+		}
+		if _, runErr := controller.store.GetAggregate(ctx, runKey(request.RunID)); runErr == nil {
+			return InvokeResult{}, commitErr
+		} else if !errors.Is(runErr, store.ErrNotFound) {
+			return InvokeResult{}, runErr
+		}
+		current, ownerErr := controller.GetActiveRunOwner(ctx, *ingress.ownerKey)
+		if ownerErr != nil {
+			return InvokeResult{}, ownerErr
+		}
+		if current.State == contracts.ActiveRunOwnerActive {
+			return InvokeResult{}, &ActiveOwnerConflictError{Owner: current}
+		}
+		if attempt == 3 {
+			return InvokeResult{}, commitErr
+		}
 	}
-	var run contracts.Run
-	if err := canonicaljson.UnmarshalStrict(committed.Outcome, &run); err != nil {
-		return InvokeResult{}, err
-	}
-	return InvokeResult{Run: run, Replay: committed.Replay}, nil
+	return InvokeResult{}, store.ErrRevisionConflict
 }
 
 func (controller *Controller) GetRun(ctx context.Context, runID string) (contracts.Run, error) {

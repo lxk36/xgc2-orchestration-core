@@ -14,6 +14,8 @@ The standard-library-only Go kernel currently provides:
 - bounded canonical JSON and `sha256:` content identities;
 - one Action admission path for manual, schedule, webhook, API, Panel, and
   product-builder triggers;
+- unforgeable in-memory reserved-ingress permits shared by the exact Action
+  catalog and Controller, plus canonical branch-scoped active Run ownership;
 - schema defaults, exact presets, controlled overrides, immutable inputs, and
   leaf provenance;
 - a typed structured expression AST with six explicit namespaces;
@@ -87,6 +89,7 @@ It compiles using only this repository.
 | Concern | Source |
 | --- | --- |
 | Action input and preset admission | `spec/action-input/v1`, `kernel/action` |
+| Reserved ingress and active Run ownership | `kernel/ingress`, `catalog/actioncatalog`, `controller/admission.go` |
 | Normalized ingress evidence | `spec/trigger-event/v1` |
 | Typed bindings and namespace rules | `spec/value-expression/v1`, `kernel/expression` |
 | Product-neutral DAG definition | `spec/workflow-definition/v1`, `kernel/workflow` |

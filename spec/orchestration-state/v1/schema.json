@@ -7,11 +7,12 @@
   "required": ["schemaVersion", "kind", "value"],
   "properties": {
     "schemaVersion": { "const": "xgc.orchestration-state/v1" },
-    "kind": { "enum": ["run", "invocation-ledger", "effect", "runtime-binding", "command-ledger", "ownership-graph", "domain-event"] },
+    "kind": { "enum": ["run", "active-run-owner", "invocation-ledger", "effect", "runtime-binding", "command-ledger", "ownership-graph", "domain-event"] },
     "value": true
   },
   "allOf": [
     { "if": { "properties": { "kind": { "const": "run" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/run" } } } },
+    { "if": { "properties": { "kind": { "const": "active-run-owner" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/activeRunOwner" } } } },
     { "if": { "properties": { "kind": { "const": "invocation-ledger" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/invocationLedger" } } } },
     { "if": { "properties": { "kind": { "const": "effect" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/effect" } } } },
     { "if": { "properties": { "kind": { "const": "runtime-binding" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/runtimeBinding" } } } },
@@ -54,6 +55,39 @@
         "callNodeId": { "$ref": "#/$defs/identifier" }, "mappingDigest": { "$ref": "#/$defs/digest" }
       }
     },
+    "activeOwnerKey": {
+      "type": "object", "additionalProperties": false,
+      "required": ["namespaceId", "kind", "identity"],
+      "properties": {
+        "namespaceId": { "$ref": "#/$defs/identifier" }, "kind": { "$ref": "#/$defs/identifier" },
+        "identity": {
+          "type": "object", "minProperties": 1, "maxProperties": 32,
+          "propertyNames": { "$ref": "#/$defs/identifier" },
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 1024 }
+        }
+      }
+    },
+    "activeRunOwner": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schemaVersion", "ownerRef", "keyDigest", "key", "policyRef", "policyDigest", "state", "runId", "generation", "acquiredAt", "revision"],
+      "properties": {
+        "schemaVersion": { "const": "xgc.active-run-owner/v1" }, "ownerRef": { "$ref": "#/$defs/identifier" },
+        "keyDigest": { "$ref": "#/$defs/digest" }, "key": { "$ref": "#/$defs/activeOwnerKey" },
+        "policyRef": { "$ref": "#/$defs/identifier" }, "policyDigest": { "$ref": "#/$defs/digest" },
+        "state": { "enum": ["active", "released"] }, "runId": { "$ref": "#/$defs/identifier" },
+        "generation": { "type": "integer", "minimum": 1 }, "acquiredAt": { "$ref": "#/$defs/timestamp" },
+        "releasedAt": { "$ref": "#/$defs/timestamp" },
+        "terminalStatus": { "enum": ["succeeded", "failed", "canceled", "stopped", "rejected"] },
+        "terminalRevision": { "type": "integer", "minimum": 1 }, "revision": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "const": "released" } }, "required": ["state"] },
+          "then": { "required": ["releasedAt", "terminalStatus", "terminalRevision"] },
+          "else": { "not": { "anyOf": [{ "required": ["releasedAt"] }, { "required": ["terminalStatus"] }, { "required": ["terminalRevision"] }] } }
+        }
+      ]
+    },
     "run": {
       "type": "object", "additionalProperties": false,
       "required": ["runId", "namespaceId", "actionRef", "executionPlanRef", "planDigest", "triggerRef", "triggerDigest", "inputDigest", "rootRunId", "actorRef", "sourceRef", "status", "acceptedAt", "updatedAt", "revision"],
@@ -64,13 +98,22 @@
         "provenanceArtifactRef": { "$ref": "#/$defs/identifier" }, "scopeRef": { "$ref": "#/$defs/identifier" }, "parent": { "$ref": "#/$defs/parentRun" },
         "rootRunId": { "$ref": "#/$defs/identifier" }, "actorRef": { "$ref": "#/$defs/identifier" }, "sourceRef": { "$ref": "#/$defs/identifier" },
         "correlationRef": { "$ref": "#/$defs/identifier" },
+        "admissionPolicyRef": { "$ref": "#/$defs/identifier" }, "admissionPolicyDigest": { "$ref": "#/$defs/digest" },
+        "activeOwnerRef": { "$ref": "#/$defs/identifier" }, "activeOwnerGeneration": { "type": "integer", "minimum": 1 },
         "status": { "enum": ["accepted", "queued", "running", "waiting", "stopping", "succeeded", "failed", "canceled", "stopped", "rejected"] },
         "termination": { "$ref": "#/$defs/termination" }, "terminationKind": { "enum": ["completed", "failed", "canceled", "stopped", "rejected"] },
         "resultRef": { "$ref": "#/$defs/identifier" }, "primaryFailure": { "$ref": "#/$defs/failure" },
         "cleanupFailures": { "type": "array", "items": { "$ref": "#/$defs/failure" } },
         "acceptedAt": { "$ref": "#/$defs/timestamp" }, "startedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" },
         "finishedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
-      }
+      },
+      "allOf": [
+        { "if": { "required": ["admissionPolicyRef"] }, "then": { "required": ["admissionPolicyDigest"] } },
+        { "if": { "required": ["admissionPolicyDigest"] }, "then": { "required": ["admissionPolicyRef"] } },
+        { "if": { "required": ["activeOwnerRef"] }, "then": { "required": ["activeOwnerGeneration", "admissionPolicyRef", "admissionPolicyDigest"] } },
+        { "if": { "required": ["activeOwnerGeneration"] }, "then": { "required": ["activeOwnerRef", "admissionPolicyRef", "admissionPolicyDigest"] } },
+        { "if": { "required": ["parent"] }, "then": { "not": { "anyOf": [{ "required": ["admissionPolicyRef"] }, { "required": ["activeOwnerRef"] }] } } }
+      ]
     },
     "invocation": {
       "type": "object", "additionalProperties": false,

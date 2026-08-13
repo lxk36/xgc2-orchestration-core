@@ -117,6 +117,10 @@ type Run struct {
 	ActorRef              string              `json:"actorRef"`
 	SourceRef             string              `json:"sourceRef"`
 	CorrelationRef        string              `json:"correlationRef,omitempty"`
+	AdmissionPolicyRef    string              `json:"admissionPolicyRef,omitempty"`
+	AdmissionPolicyDigest string              `json:"admissionPolicyDigest,omitempty"`
+	ActiveOwnerRef        string              `json:"activeOwnerRef,omitempty"`
+	ActiveOwnerGeneration uint64              `json:"activeOwnerGeneration,omitempty"`
 	Status                RunStatus           `json:"status"`
 	Termination           *TerminationIntent  `json:"termination,omitempty"`
 	TerminationKind       TerminationKind     `json:"terminationKind,omitempty"`

@@ -7,9 +7,83 @@ import (
 
 	"github.com/lxk36/xgc2-orchestration-core/durable/filestore"
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/ingress"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
+
+func TestReservedNamespaceInstallRequiresSameProductBuilderPermit(t *testing.T) {
+	durable, err := filestore.Open(t.TempDir() + "/reserved-actions.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = durable.Close() })
+	spec := ingress.ReservedIngressPolicySpec{
+		PolicyRef: "experiment-builder-v1", NamespaceID: "xgc2-experiments",
+		TriggerKind: contracts.TriggerProductBuilder, TriggerVersion: "v1", SourceRef: "xgc2-experiment-builder",
+		CandidateOrigin: contracts.OriginProductBuilder, RootOnly: true,
+	}
+	policy, permit, err := ingress.NewReservedIngressPolicy(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := NewWithConfig(Config{Store: durable, ReservedIngressPolicies: []*ingress.ReservedIngressPolicy{policy}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, version := namedFixture(t, "reserved-action")
+	version.AcceptedTriggerKinds = []contracts.TriggerKind{contracts.TriggerProductBuilder}
+	at := time.Date(2026, 8, 13, 7, 0, 0, 0, time.UTC)
+	request := InstallRequest{
+		NamespaceID: spec.NamespaceID, Action: version, Definition: definition,
+		CommandID: "install-reserved-action", At: at,
+	}
+	if _, err := catalog.Install(t.Context(), request); !errors.Is(err, ErrReservedNamespaceDenied) {
+		t.Fatalf("generic reserved install error = %v", err)
+	}
+	request.IngressPermit = &ingress.IngressPermit{}
+	if _, err := catalog.Install(t.Context(), request); !errors.Is(err, ErrReservedNamespaceDenied) {
+		t.Fatalf("zero reserved permit error = %v", err)
+	}
+	_, foreignPermit, err := ingress.NewReservedIngressPolicy(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.IngressPermit = foreignPermit
+	if _, err := catalog.Install(t.Context(), request); !errors.Is(err, ErrReservedNamespaceDenied) {
+		t.Fatalf("foreign reserved permit error = %v", err)
+	}
+	request.IngressPermit = permit
+	installed, err := catalog.Install(t.Context(), request)
+	if err != nil || installed.Replay || installed.Record.AdmissionPolicyRef != spec.PolicyRef ||
+		installed.Record.AdmissionPolicyDigest != policy.Digest() {
+		t.Fatalf("reserved install = %#v, err=%v", installed, err)
+	}
+	replayRequest := request
+	replayRequest.CommandID = "install-reserved-action-replay"
+	replayRequest.At = at.Add(time.Second)
+	replayed, err := catalog.Install(t.Context(), replayRequest)
+	if err != nil || !replayed.Replay || replayed.Record.AdmissionPolicyDigest != policy.Digest() {
+		t.Fatalf("reserved install replay = %#v, err=%v", replayed, err)
+	}
+	replayRequest.IngressPermit = nil
+	if _, err := catalog.Install(t.Context(), replayRequest); !errors.Is(err, ErrReservedNamespaceDenied) {
+		t.Fatalf("reserved replay bypassed permit: %v", err)
+	}
+	openDefinition, openVersion := namedFixture(t, "open-action")
+	if _, err := catalog.Install(t.Context(), InstallRequest{
+		NamespaceID: "open-team", Action: openVersion, Definition: openDefinition,
+		CommandID: "install-open-action", At: at,
+	}); err != nil {
+		t.Fatalf("ordinary install regressed: %v", err)
+	}
+	if _, err := catalog.Install(t.Context(), InstallRequest{
+		NamespaceID: "open-team", Action: openVersion, Definition: openDefinition,
+		IngressPermit: permit, CommandID: "install-open-with-reserved-permit", At: at,
+	}); !errors.Is(err, ErrReservedNamespaceDenied) {
+		t.Fatalf("reserved permit escaped its namespace: %v", err)
+	}
+}
 
 func TestCatalogPersistsAndResolvesOnlyExactNamespaceActionPin(t *testing.T) {
 	path := t.TempDir() + "/actions.db"

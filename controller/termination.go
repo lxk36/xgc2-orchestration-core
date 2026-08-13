@@ -34,6 +34,44 @@ type TerminateRunResult struct {
 // before any Invocation, child Run, or Effect is canceled. Replaying the same
 // command returns the first durable outcome; changing its bytes fails closed.
 func (controller *Controller) RequestRunTermination(ctx context.Context, request TerminateRunRequest) (TerminateRunResult, error) {
+	return controller.requestRunTermination(ctx, request, "")
+}
+
+// RequestActiveRunTermination requires the exact canonical owner key and Run
+// identity for owner-backed root ingress. Generic termination cannot be used
+// to stop an arbitrary reserved Run.
+func (controller *Controller) RequestActiveRunTermination(
+	ctx context.Context, key contracts.ActiveOwnerKey, request TerminateRunRequest,
+) (TerminateRunResult, error) {
+	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) {
+		return TerminateRunResult{}, errors.New("controller, context, and target Run are required")
+	}
+	_, _, ownerRef, err := normalizeActiveOwnerKey(key)
+	if err != nil {
+		return TerminateRunResult{}, err
+	}
+	run, err := controller.GetRun(ctx, request.RunID)
+	if err != nil {
+		return TerminateRunResult{}, err
+	}
+	if run.ActiveOwnerRef != ownerRef || run.ActiveOwnerGeneration == 0 || run.NamespaceID != key.NamespaceID {
+		return TerminateRunResult{}, fmt.Errorf("%w: key and Run ownership differ", ErrReservedIngressDenied)
+	}
+	if run.Termination == nil && !run.Status.Terminal() {
+		owner, ownerErr := controller.GetActiveRunOwner(ctx, key)
+		if ownerErr != nil {
+			return TerminateRunResult{}, ownerErr
+		}
+		if owner.State != contracts.ActiveRunOwnerActive || owner.RunID != run.RunID ||
+			owner.Generation != run.ActiveOwnerGeneration || owner.PolicyRef != run.AdmissionPolicyRef ||
+			owner.PolicyDigest != run.AdmissionPolicyDigest {
+			return TerminateRunResult{}, fmt.Errorf("%w: key is not owned by the target Run", ErrActiveOwnerConflict)
+		}
+	}
+	return controller.requestRunTermination(ctx, request, ownerRef)
+}
+
+func (controller *Controller) requestRunTermination(ctx context.Context, request TerminateRunRequest, activeOwnerRef string) (TerminateRunResult, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) ||
 		!contracts.ValidIdentifier(request.RequestedBy) || !contracts.ValidIdentifier(request.ReasonCode) ||
 		!contracts.ValidIdentifier(request.CommandID) || request.ExpectedRevision == 0 || !request.Kind.RequiresStopping() {
@@ -46,6 +84,11 @@ func (controller *Controller) RequestRunTermination(ctx context.Context, request
 	current, err := decodeRun(record)
 	if err != nil {
 		return TerminateRunResult{}, err
+	}
+	if current.ActiveOwnerRef != activeOwnerRef {
+		if current.ActiveOwnerRef != "" || activeOwnerRef != "" {
+			return TerminateRunResult{}, fmt.Errorf("%w: owner-backed Run requires its exact active owner key", ErrReservedIngressDenied)
+		}
 	}
 	if current.Termination != nil {
 		if terminationMatchesRequest(*current.Termination, request) {

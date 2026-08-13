@@ -30,6 +30,10 @@ type AdmitRunCommand struct {
 	ActorRef              string
 	SourceRef             string
 	CorrelationRef        string
+	AdmissionPolicyRef    string
+	AdmissionPolicyDigest string
+	ActiveOwnerRef        string
+	ActiveOwnerGeneration uint64
 	CommandID             string
 	At                    time.Time
 }
@@ -67,6 +71,8 @@ func AdmitRun(command AdmitRunCommand) (RunDecision, error) {
 		ProvenanceArtifactRef: command.ProvenanceArtifactRef, ScopeRef: command.ScopeRef,
 		Parent: cloneParent(command.Parent), RootRunID: rootRunID, ActorRef: command.ActorRef,
 		SourceRef: command.SourceRef, CorrelationRef: command.CorrelationRef, Status: contracts.RunAccepted,
+		AdmissionPolicyRef: command.AdmissionPolicyRef, AdmissionPolicyDigest: command.AdmissionPolicyDigest,
+		ActiveOwnerRef: command.ActiveOwnerRef, ActiveOwnerGeneration: command.ActiveOwnerGeneration,
 		AcceptedAt: command.At.UTC(), UpdatedAt: command.At.UTC(), Revision: 1,
 	}
 	if err := ValidateRun(run); err != nil {
@@ -198,7 +204,8 @@ func ValidateRun(run contracts.Run) error {
 	}
 	for label, value := range map[string]string{
 		"provenance artifact ref": run.ProvenanceArtifactRef, "scope ref": run.ScopeRef,
-		"correlation ref": run.CorrelationRef, "result ref": run.ResultRef,
+		"correlation ref": run.CorrelationRef, "admission policy ref": run.AdmissionPolicyRef,
+		"active owner ref": run.ActiveOwnerRef, "result ref": run.ResultRef,
 	} {
 		if err := validateOptionalIdentity(value, label); err != nil {
 			return err
@@ -246,6 +253,19 @@ func ValidateRun(run contracts.Run) error {
 			return err
 		}
 	}
+	if (run.AdmissionPolicyRef == "") != (run.AdmissionPolicyDigest == "") ||
+		(run.ActiveOwnerRef == "") != (run.ActiveOwnerGeneration == 0) {
+		return errors.New("run admission policy and active owner fences are incomplete")
+	}
+	if run.AdmissionPolicyDigest != "" && !contracts.ValidDigest(run.AdmissionPolicyDigest) {
+		return errors.New("run admission policy digest is invalid")
+	}
+	if run.Parent != nil && (run.AdmissionPolicyRef != "" || run.ActiveOwnerRef != "") {
+		return errors.New("child run cannot hold a root ingress policy or active owner")
+	}
+	if run.ActiveOwnerRef != "" && run.AdmissionPolicyRef == "" {
+		return errors.New("active owner requires an admission policy")
+	}
 	return nil
 }
 
@@ -270,6 +290,25 @@ func validateAdmitRun(command AdmitRunCommand) error {
 	if !contracts.ValidIdentifier(command.ActionRef.ActionID) || !contracts.ValidIdentifier(command.ActionRef.Version) ||
 		!contracts.ValidDigest(command.ActionRef.Digest) {
 		return errors.New("run admission action ref is invalid")
+	}
+	if err := validateOptionalIdentity(command.AdmissionPolicyRef, "run admission policy ref"); err != nil {
+		return err
+	}
+	if err := validateOptionalIdentity(command.ActiveOwnerRef, "run active owner ref"); err != nil {
+		return err
+	}
+	if (command.AdmissionPolicyRef == "") != (command.AdmissionPolicyDigest == "") ||
+		(command.ActiveOwnerRef == "") != (command.ActiveOwnerGeneration == 0) {
+		return errors.New("run admission policy and active owner fences are incomplete")
+	}
+	if command.AdmissionPolicyDigest != "" && !contracts.ValidDigest(command.AdmissionPolicyDigest) {
+		return errors.New("run admission policy digest is invalid")
+	}
+	if command.Parent != nil && (command.AdmissionPolicyRef != "" || command.ActiveOwnerRef != "") {
+		return errors.New("child run cannot acquire a root ingress policy or active owner")
+	}
+	if command.ActiveOwnerRef != "" && command.AdmissionPolicyRef == "" {
+		return errors.New("run active owner requires an admission policy")
 	}
 	return nil
 }

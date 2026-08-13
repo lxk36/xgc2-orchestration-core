@@ -187,9 +187,20 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if err != nil {
 		return contracts.Run{}, err
 	}
+	expected := []store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: 0}}
+	mutations := []store.AggregateRecord{runMutation, graphMutation}
+	events := append(append([]contracts.DomainEvent(nil), decision.Events...), graphEvent)
+	ownerExpected, ownerMutation, ownerEvent, owned, err := controller.releaseActiveOwner(ctx, run, decision.Run, commandID, at)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if owned {
+		expected = append(expected, ownerExpected)
+		mutations = append(mutations, ownerMutation)
+		events = append(events, ownerEvent)
+	}
 	if err := controller.commit(ctx, commandID, at,
-		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: 0}},
-		[]store.AggregateRecord{runMutation, graphMutation}, append(decision.Events, graphEvent), decision.Intents, decision.Run,
+		expected, mutations, events, decision.Intents, decision.Run,
 	); err != nil {
 		return contracts.Run{}, err
 	}
@@ -288,9 +299,20 @@ func (controller *Controller) succeedRun(
 	if err != nil {
 		return contracts.Run{}, err
 	}
+	expected := []store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}, {Key: graphMutation.Key, Revision: 0}}
+	mutations := []store.AggregateRecord{runMutation, snapshotMutation, graphMutation}
+	events := append(append(append([]contracts.DomainEvent(nil), decision.Events...), snapshotEvent), graphEvent)
+	ownerExpected, ownerMutation, ownerEvent, owned, err := controller.releaseActiveOwner(ctx, run, decision.Run, commandID, at)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if owned {
+		expected = append(expected, ownerExpected)
+		mutations = append(mutations, ownerMutation)
+		events = append(events, ownerEvent)
+	}
 	if err := controller.commit(ctx, commandID, at,
-		[]store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: snapshotMutation.Key, Revision: snapshotRevision}, {Key: graphMutation.Key, Revision: 0}},
-		[]store.AggregateRecord{runMutation, snapshotMutation, graphMutation}, append(append(decision.Events, snapshotEvent), graphEvent), decision.Intents, decision.Run,
+		expected, mutations, events, decision.Intents, decision.Run,
 	); err != nil {
 		return contracts.Run{}, err
 	}

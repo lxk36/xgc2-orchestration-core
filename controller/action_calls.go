@@ -98,7 +98,7 @@ func (controller *Controller) executeClaimedActionCall(
 		ParentRunID: run.RunID, ParentInvocationID: ledger.Invocation.InvocationID,
 		CallNodeID: workflowNode.NodeID, MappingDigest: mappingDigest,
 	}
-	child, err := controller.Invoke(ctx, InvokeRequest{
+	child, err := controller.invokeChild(ctx, InvokeRequest{
 		RunID: childRunID, NamespaceID: run.NamespaceID, Action: actionVersion, Definition: definition,
 		Trigger: contracts.TriggerEvent{
 			EventID: triggerEventID, Kind: contracts.TriggerActionCall, Version: "v1",

@@ -16,32 +16,52 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/kernel/action"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/ingress"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
 const aggregateType = "action-version"
 
-const eventSchemaDigest = "sha256:c0fd20e0354dd7882efd2366be0515388cd38386974808fb053147173ba7f86b"
+const eventSchemaDigest = "sha256:c4724a26a4e3afa089e6eedaff1f90614fd8ce01da78f036ad26bc26f55c4719"
 
-var ErrActionConflict = errors.New("exact Action catalog identity conflict")
+var (
+	ErrActionConflict          = errors.New("exact Action catalog identity conflict")
+	ErrReservedNamespaceDenied = errors.New("reserved Action namespace denied")
+)
 
-type Catalog struct{ store store.Store }
+type Catalog struct {
+	store    store.Store
+	reserved map[string][]reservedPolicy
+}
+
+type reservedPolicy struct {
+	policy *ingress.ReservedIngressPolicy
+	spec   ingress.ReservedIngressPolicySpec
+}
+
+type Config struct {
+	Store                   store.Store
+	ReservedIngressPolicies []*ingress.ReservedIngressPolicy
+}
 
 type Record struct {
-	NamespaceID string                       `json:"namespaceId"`
-	Action      contracts.ActionVersion      `json:"action"`
-	Definition  contracts.WorkflowDefinition `json:"definition"`
-	InstalledAt time.Time                    `json:"installedAt"`
-	Revision    uint64                       `json:"revision"`
+	NamespaceID           string                       `json:"namespaceId"`
+	Action                contracts.ActionVersion      `json:"action"`
+	Definition            contracts.WorkflowDefinition `json:"definition"`
+	AdmissionPolicyRef    string                       `json:"admissionPolicyRef,omitempty"`
+	AdmissionPolicyDigest string                       `json:"admissionPolicyDigest,omitempty"`
+	InstalledAt           time.Time                    `json:"installedAt"`
+	Revision              uint64                       `json:"revision"`
 }
 
 type InstallRequest struct {
-	NamespaceID string
-	Action      contracts.ActionVersion
-	Definition  contracts.WorkflowDefinition
-	CommandID   string
-	At          time.Time
+	NamespaceID   string
+	Action        contracts.ActionVersion
+	Definition    contracts.WorkflowDefinition
+	IngressPermit *ingress.IngressPermit
+	CommandID     string
+	At            time.Time
 }
 
 type InstallResult struct {
@@ -53,10 +73,12 @@ type InstallResult struct {
 // The immutable Workflow definition is returned only by Get so listing a
 // catalog never scales with the combined size of every installed graph.
 type Metadata struct {
-	NamespaceID string                  `json:"namespaceId"`
-	Action      contracts.ActionVersion `json:"action"`
-	InstalledAt time.Time               `json:"installedAt"`
-	Revision    uint64                  `json:"revision"`
+	NamespaceID           string                  `json:"namespaceId"`
+	Action                contracts.ActionVersion `json:"action"`
+	AdmissionPolicyRef    string                  `json:"admissionPolicyRef,omitempty"`
+	AdmissionPolicyDigest string                  `json:"admissionPolicyDigest,omitempty"`
+	InstalledAt           time.Time               `json:"installedAt"`
+	Revision              uint64                  `json:"revision"`
 }
 
 type ListRequest struct {
@@ -71,10 +93,32 @@ type Page struct {
 }
 
 func New(durable store.Store) (*Catalog, error) {
-	if durable == nil {
+	return NewWithConfig(Config{Store: durable})
+}
+
+func NewWithConfig(config Config) (*Catalog, error) {
+	if config.Store == nil {
 		return nil, errors.New("Action catalog durable store is required")
 	}
-	return &Catalog{store: durable}, nil
+	reserved := make(map[string][]reservedPolicy)
+	seenRefs := make(map[string]struct{}, len(config.ReservedIngressPolicies))
+	seenPolicies := make(map[*ingress.ReservedIngressPolicy]struct{}, len(config.ReservedIngressPolicies))
+	for _, policy := range config.ReservedIngressPolicies {
+		spec, valid := policy.Spec()
+		if !valid || !contracts.ValidDigest(policy.Digest()) {
+			return nil, errors.New("Action catalog reserved ingress policy is invalid")
+		}
+		if _, duplicate := seenPolicies[policy]; duplicate {
+			return nil, errors.New("Action catalog reserved ingress capability is duplicated")
+		}
+		if _, duplicate := seenRefs[spec.PolicyRef]; duplicate {
+			return nil, errors.New("Action catalog reserved ingress policy ref is duplicated")
+		}
+		reserved[spec.NamespaceID] = append(reserved[spec.NamespaceID], reservedPolicy{policy: policy, spec: spec})
+		seenPolicies[policy] = struct{}{}
+		seenRefs[spec.PolicyRef] = struct{}{}
+	}
+	return &Catalog{store: config.Store, reserved: reserved}, nil
 }
 
 func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (InstallResult, error) {
@@ -83,6 +127,10 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 	}
 	if !contracts.ValidIdentifier(request.NamespaceID) || !contracts.ValidIdentifier(request.CommandID) || request.At.IsZero() {
 		return InstallResult{}, errors.New("Action catalog namespace, command, and time are required")
+	}
+	policyRef, policyDigest, err := catalog.authorizeInstall(request.NamespaceID, request.Action, request.IngressPermit)
+	if err != nil {
+		return InstallResult{}, err
 	}
 	if err := validateExactAction(request.Action, request.Definition); err != nil {
 		return InstallResult{}, err
@@ -93,6 +141,7 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 	}
 	record := Record{
 		NamespaceID: request.NamespaceID, Action: request.Action, Definition: request.Definition,
+		AdmissionPolicyRef: policyRef, AdmissionPolicyDigest: policyDigest,
 		InstalledAt: request.At.UTC(), Revision: 1,
 	}
 	payload, err := canonicaljson.Marshal(record)
@@ -108,16 +157,8 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 		if decodeErr != nil {
 			return InstallResult{}, decodeErr
 		}
-		currentDigest, digestErr := canonicaljson.DigestValue(struct {
-			NamespaceID string                       `json:"namespaceId"`
-			Action      contracts.ActionVersion      `json:"action"`
-			Definition  contracts.WorkflowDefinition `json:"definition"`
-		}{current.NamespaceID, current.Action, current.Definition})
-		requestedDigest, requestDigestErr := canonicaljson.DigestValue(struct {
-			NamespaceID string                       `json:"namespaceId"`
-			Action      contracts.ActionVersion      `json:"action"`
-			Definition  contracts.WorkflowDefinition `json:"definition"`
-		}{record.NamespaceID, record.Action, record.Definition})
+		currentDigest, digestErr := recordContentDigest(current)
+		requestedDigest, requestDigestErr := recordContentDigest(record)
 		if digestErr != nil || requestDigestErr != nil || currentDigest != requestedDigest {
 			return InstallResult{}, ErrActionConflict
 		}
@@ -132,13 +173,15 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 	identityDigest, err := canonicaljson.DigestValue(map[string]any{
 		"operation": "action.install", "namespaceId": request.NamespaceID,
 		"actionRef": request.Action.Ref(), "payloadDigest": payloadDigest,
+		"admissionPolicyRef": policyRef, "admissionPolicyDigest": policyDigest,
 	})
 	if err != nil {
 		return InstallResult{}, err
 	}
 	eventPayload := map[string]any{
 		"namespaceId": request.NamespaceID, "actionRef": request.Action.Ref(),
-		"definitionDigest": request.Action.DefinitionDigest,
+		"definitionDigest":   request.Action.DefinitionDigest,
+		"admissionPolicyRef": policyRef, "admissionPolicyDigest": policyDigest,
 	}
 	eventPayloadDigest, err := canonicaljson.DigestValue(eventPayload)
 	if err != nil {
@@ -261,6 +304,7 @@ func (catalog *Catalog) List(ctx context.Context, request ListRequest) (Page, er
 			}
 			page.Items = append(page.Items, Metadata{
 				NamespaceID: decoded.NamespaceID, Action: decoded.Action,
+				AdmissionPolicyRef: decoded.AdmissionPolicyRef, AdmissionPolicyDigest: decoded.AdmissionPolicyDigest,
 				InstalledAt: decoded.InstalledAt, Revision: decoded.Revision,
 			})
 			if len(page.Items) == request.Limit {
@@ -302,6 +346,48 @@ func validateExactAction(version contracts.ActionVersion, definition contracts.W
 	return nil
 }
 
+func (catalog *Catalog) authorizeInstall(
+	namespaceID string, version contracts.ActionVersion, permit *ingress.IngressPermit,
+) (string, string, error) {
+	policies := catalog.reserved[namespaceID]
+	if len(policies) == 0 {
+		if permit != nil {
+			return "", "", fmt.Errorf("%w: permit does not target this namespace", ErrReservedNamespaceDenied)
+		}
+		return "", "", nil
+	}
+	for _, registered := range policies {
+		if !registered.policy.Authorizes(permit) {
+			continue
+		}
+		accepted := false
+		for _, kind := range version.AcceptedTriggerKinds {
+			if kind == registered.spec.TriggerKind {
+				accepted = true
+				break
+			}
+		}
+		if !accepted {
+			return "", "", fmt.Errorf("%w: Action does not accept the policy trigger", ErrReservedNamespaceDenied)
+		}
+		return registered.spec.PolicyRef, registered.policy.Digest(), nil
+	}
+	return "", "", fmt.Errorf("%w: a registered permit is required", ErrReservedNamespaceDenied)
+}
+
+func recordContentDigest(record Record) (string, error) {
+	return canonicaljson.DigestValue(struct {
+		NamespaceID           string                       `json:"namespaceId"`
+		Action                contracts.ActionVersion      `json:"action"`
+		Definition            contracts.WorkflowDefinition `json:"definition"`
+		AdmissionPolicyRef    string                       `json:"admissionPolicyRef,omitempty"`
+		AdmissionPolicyDigest string                       `json:"admissionPolicyDigest,omitempty"`
+	}{
+		NamespaceID: record.NamespaceID, Action: record.Action, Definition: record.Definition,
+		AdmissionPolicyRef: record.AdmissionPolicyRef, AdmissionPolicyDigest: record.AdmissionPolicyDigest,
+	})
+}
+
 func recordKey(namespaceID string, ref contracts.ActionRef) (store.AggregateKey, error) {
 	if !contracts.ValidIdentifier(namespaceID) || !contracts.ValidIdentifier(ref.ActionID) ||
 		!contracts.ValidIdentifier(ref.Version) || !contracts.ValidDigest(ref.Digest) {
@@ -323,6 +409,10 @@ func decodeRecord(stored store.AggregateRecord, namespaceID string, ref contract
 	}
 	if err := validateExactAction(record.Action, record.Definition); err != nil {
 		return Record{}, fmt.Errorf("durable exact Action: %w", err)
+	}
+	if (record.AdmissionPolicyRef == "") != (record.AdmissionPolicyDigest == "") ||
+		(record.AdmissionPolicyRef != "" && (!contracts.ValidIdentifier(record.AdmissionPolicyRef) || !contracts.ValidDigest(record.AdmissionPolicyDigest))) {
+		return Record{}, errors.New("durable exact Action admission policy is invalid")
 	}
 	return record, nil
 }
