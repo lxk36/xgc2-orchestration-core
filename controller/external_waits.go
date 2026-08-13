@@ -229,7 +229,19 @@ func (controller *Controller) ResolveExternalWait(ctx context.Context, request R
 		}
 		return contracts.Run{}, err
 	}
-	return controller.Drive(ctx, run.RunID)
+	driven, driveErr := controller.Drive(ctx, run.RunID)
+	if errors.Is(driveErr, store.ErrRevisionConflict) || errors.Is(driveErr, store.ErrIdentityConflict) {
+		// The external resolution above is already committed under its exact
+		// request identity. A concurrent coordinator may win the following
+		// internal phase command; return that durable Run so the caller can keep
+		// advancing instead of exposing an internal CAS race as an ingress error.
+		current, currentErr := controller.store.GetAggregate(ctx, runKey(run.RunID))
+		if currentErr != nil {
+			return contracts.Run{}, currentErr
+		}
+		return decodeRun(current)
+	}
+	return driven, driveErr
 }
 
 func (controller *Controller) replayExternalWait(
