@@ -132,7 +132,10 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			if attempt == nil || now.Before(attempt.LeaseExpiresAt) {
 				return run, ErrAttemptLeaseActive
 			}
-			retry := descriptor.Mode == contracts.NodePure && descriptor.Determinism == contracts.NodeDeterministic
+			// A child Action call is retryable because both its Run and trigger
+			// identities are derived from this immutable parent invocation.
+			retry := workflowNode.CallAction != nil ||
+				(descriptor.Mode == contracts.NodePure && descriptor.Determinism == contracts.NodeDeterministic)
 			failure := contracts.StructuredFailure{Class: contracts.FailureUncertain, Code: "worker.lease-expired", Message: "worker lease expired before a durable node result"}
 			expired, expireErr := execution.ExpireInvocationAttempt(ledger, execution.ExpireInvocationAttemptCommand{
 				InvocationID: invocationID, ExpectedRevision: ledger.Invocation.Revision,
@@ -155,6 +158,16 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 				return run, ErrRunWaiting
 			}
 			return contracts.Run{}, fmt.Errorf("node invocation %s is %s while run is active", nodeID, ledger.Invocation.Status)
+		}
+		if workflowNode.CallAction != nil {
+			executedRun, executeErr := controller.executeClaimedActionCall(
+				ctx, runRecord, run, snapshot, snapshotRevision, invocationRecord.Revision,
+				ledger, descriptor, workflowNode, leaseToken, now,
+			)
+			if errors.Is(executeErr, errContinueDrive) {
+				continue
+			}
+			return executedRun, executeErr
 		}
 		executedRun, executeErr := controller.executeClaimed(ctx, runRecord, run, snapshot, snapshotRevision, invocationRecord.Revision, ledger, descriptor, inputs, leaseToken, now)
 		if errors.Is(executeErr, errContinueDrive) {

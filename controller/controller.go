@@ -48,6 +48,13 @@ type GrantResolver interface {
 	ResolveGrants(context.Context, contracts.Run, contracts.NodeDescriptor, time.Time) ([]contracts.CapabilityGrant, error)
 }
 
+// ActionResolver resolves an exact child Action pin without exposing mutable
+// authoring heads to the controller. Implementations may read a product
+// catalog, a signed package index, or an immutable local registry.
+type ActionResolver interface {
+	ResolveAction(context.Context, string, contracts.ActionRef) (contracts.ActionVersion, contracts.WorkflowDefinition, error)
+}
+
 type TokenSource interface{ NewToken() (string, error) }
 
 type cryptoTokenSource struct{}
@@ -68,6 +75,7 @@ type Config struct {
 	InvocationTimeout time.Duration
 	Clock             Clock
 	Grants            GrantResolver
+	Actions           ActionResolver
 	Tokens            TokenSource
 }
 
@@ -80,6 +88,7 @@ type Controller struct {
 	invocationTimeout time.Duration
 	clock             Clock
 	grants            GrantResolver
+	actions           ActionResolver
 	tokens            TokenSource
 	afterClaim        func(contracts.InvocationLedger) error
 }
@@ -99,6 +108,8 @@ type InvokeRequest struct {
 	ScopeRef        string
 	CorrelationRef  string
 	CommandID       string
+	Parent          *contracts.ParentRunLink
+	RootRunID       string
 }
 
 type InvokeResult struct {
@@ -121,9 +132,23 @@ type RunSnapshot struct {
 	NodeOutputs   map[string]map[string]any        `json:"nodeOutputs"`
 	NextNode      int                              `json:"nextNode"`
 	Waiting       *contracts.NodeResult            `json:"waiting,omitempty"`
+	ActionCall    *ActionCallWait                  `json:"actionCall,omitempty"`
 	Failure       *contracts.StructuredFailure     `json:"failure,omitempty"`
 	Result        map[string]any                   `json:"result,omitempty"`
 	ResultDigest  string                           `json:"resultDigest,omitempty"`
+}
+
+// ActionCallWait is the exact durable join between one parent invocation and
+// one child Run. It contains no mutable catalog pointer or ambient context.
+type ActionCallWait struct {
+	InvocationID  string              `json:"invocationId"`
+	NodeID        string              `json:"nodeId"`
+	ChildRunID    string              `json:"childRunId"`
+	ActionRef     contracts.ActionRef `json:"actionRef"`
+	MappingDigest string              `json:"mappingDigest"`
+	InputDigest   string              `json:"inputDigest"`
+	TriggerDigest string              `json:"triggerDigest"`
+	ScopeDigest   string              `json:"scopeDigest"`
 }
 
 // Compile validates the complete product-neutral graph and every installed
@@ -174,7 +199,7 @@ func New(config Config) (*Controller, error) {
 	return &Controller{
 		store: config.Store, nodes: config.Nodes, descriptors: descriptors, ownerRef: config.OwnerRef,
 		leaseDuration: config.LeaseDuration, invocationTimeout: config.InvocationTimeout,
-		clock: config.Clock, grants: config.Grants, tokens: config.Tokens,
+		clock: config.Clock, grants: config.Grants, actions: config.Actions, tokens: config.Tokens,
 	}, nil
 }
 
@@ -185,6 +210,9 @@ func (controller *Controller) Invoke(ctx context.Context, request InvokeRequest)
 	if !contracts.ValidIdentifier(request.RunID) || !contracts.ValidIdentifier(request.NamespaceID) ||
 		!contracts.ValidIdentifier(request.CommandID) {
 		return InvokeResult{}, errors.New("invoke run, namespace, or command identity is invalid")
+	}
+	if err := controller.validateInvokeLineage(ctx, request); err != nil {
+		return InvokeResult{}, err
 	}
 	plan, err := workflowkernel.Compile(request.Definition)
 	if err != nil {
@@ -218,6 +246,7 @@ func (controller *Controller) Invoke(ctx context.Context, request InvokeRequest)
 		ExecutionPlanRef: digestRef("plan", plan.PlanDigest), PlanDigest: plan.PlanDigest,
 		TriggerRef: request.Trigger.EventID, TriggerDigest: admission.TriggerDigest, InputDigest: admission.InputDigest,
 		ProvenanceArtifactRef: digestRef("provenance", admission.InputDigest), ScopeRef: request.ScopeRef,
+		Parent: request.Parent, RootRunID: request.RootRunID,
 		ActorRef: request.Trigger.ActorRef, SourceRef: request.Trigger.SourceRef, CorrelationRef: request.CorrelationRef,
 		CommandID: request.CommandID, At: at,
 	})
@@ -248,6 +277,7 @@ func (controller *Controller) Invoke(ctx context.Context, request InvokeRequest)
 	identityDigest, err := canonicaljson.DigestValue(map[string]any{
 		"runId": request.RunID, "actionRef": request.Action.Ref(), "planDigest": plan.PlanDigest,
 		"triggerDigest": admission.TriggerDigest, "inputDigest": admission.InputDigest,
+		"parent": request.Parent, "rootRunId": request.RootRunID,
 	})
 	if err != nil {
 		return InvokeResult{}, err
@@ -356,6 +386,11 @@ func (controller *Controller) validateNodePins(definition contracts.WorkflowDefi
 		descriptorOutputDigest, err := canonicaljson.DigestValue(descriptor.OutputSchema)
 		if err != nil || outputDigest != descriptorOutputDigest {
 			return fmt.Errorf("workflow node %q output schema differs from its descriptor", workflowNode.NodeID)
+		}
+		if workflowNode.CallAction != nil &&
+			(descriptor.Mode != contracts.NodeWaiting || descriptor.Determinism != contracts.NodeRecorded ||
+				len(descriptor.AllowedEffectKinds) != 0 || descriptor.CompensationTypeRef != "") {
+			return fmt.Errorf("workflow node %q child Action call requires a recorded waiting descriptor without effects or compensation", workflowNode.NodeID)
 		}
 	}
 	return nil

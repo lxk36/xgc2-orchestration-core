@@ -563,7 +563,7 @@ func validateIntentSeed(seed store.IntentSeed, transactionAt time.Time) error {
 
 func validIntentKind(kind contracts.DurableIntentKind) bool {
 	switch kind {
-	case contracts.IntentOutbox, contracts.IntentReconcile, contracts.IntentCleanup, contracts.IntentWaitResolution:
+	case contracts.IntentOutbox, contracts.IntentReconcile, contracts.IntentCleanup, contracts.IntentWaitResolution, contracts.IntentChildResolution:
 		return true
 	default:
 		return false

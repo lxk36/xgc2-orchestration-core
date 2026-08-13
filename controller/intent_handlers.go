@@ -239,3 +239,27 @@ func deadIntent(code, message string) worker.Result {
 
 var _ worker.Handler = (*EffectOutboxHandler)(nil)
 var _ worker.Handler = (*WaitResolutionHandler)(nil)
+
+type ChildResolutionHandler struct{ controller *Controller }
+
+func NewChildResolutionHandler(controller *Controller) (*ChildResolutionHandler, error) {
+	if controller == nil {
+		return nil, errors.New("child resolution controller is required")
+	}
+	return &ChildResolutionHandler{controller: controller}, nil
+}
+
+func (handler *ChildResolutionHandler) Handle(ctx context.Context, claimed store.ClaimedIntent) worker.Result {
+	if claimed.Record.Intent.Kind != contracts.IntentChildResolution {
+		return deadIntent("child.kind", "claimed intent is not a child Action resolution")
+	}
+	if _, err := handler.controller.ResolveActionCall(ctx, claimed.Record.Intent.AggregateID); err != nil {
+		if errors.Is(err, ErrRunWaiting) || errors.Is(err, ErrAttemptLeaseActive) || errors.Is(err, ErrRunClosureOpen) {
+			return retryIntent(handler.controller.clock.Now(), "child.waiting", err)
+		}
+		return retryIntent(handler.controller.clock.Now(), "child.resolve", err)
+	}
+	return worker.Result{Disposition: worker.Complete}
+}
+
+var _ worker.Handler = (*ChildResolutionHandler)(nil)

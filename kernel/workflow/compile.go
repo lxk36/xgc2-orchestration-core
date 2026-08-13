@@ -417,16 +417,35 @@ func validateCallAction(call contracts.CallAction, nodeOutput contracts.Schema, 
 		!contracts.ValidDigest(call.TargetActionRef.Digest) {
 		return fmt.Errorf("node %q child action ref is invalid", nodeID)
 	}
-	if call.InputSchema.Type != contracts.TypeObject || call.ResultSchema.Type != contracts.TypeObject {
-		return fmt.Errorf("node %q child action input and result schemas must be objects", nodeID)
+	if call.InputSchema.Type != contracts.TypeObject || call.TriggerSchema.Type != contracts.TypeObject ||
+		call.ScopeSchema.Type != contracts.TypeObject || call.ResultSchema.Type != contracts.TypeObject {
+		return fmt.Errorf("node %q child action input, trigger, scope, and result schemas must be objects", nodeID)
 	}
-	if err := call.ResultSchema.ValidateDefinition(); err != nil {
-		return fmt.Errorf("node %q child result schema: %w", nodeID, err)
+	for _, field := range []struct {
+		label  string
+		schema contracts.Schema
+	}{
+		{label: "input", schema: call.InputSchema},
+		{label: "trigger", schema: call.TriggerSchema},
+		{label: "scope", schema: call.ScopeSchema},
+		{label: "result", schema: call.ResultSchema},
+	} {
+		if err := field.schema.ValidateDefinition(); err != nil {
+			return fmt.Errorf("node %q child %s schema: %w", nodeID, field.label, err)
+		}
 	}
-	if call.ResultSchema.ContainsFormat(contracts.FormatSecretHandle) {
-		return fmt.Errorf("node %q child result schema cannot expose secret handles", nodeID)
+	if call.TriggerSchema.ContainsFormat(contracts.FormatSecretHandle) ||
+		call.ScopeSchema.ContainsFormat(contracts.FormatSecretHandle) ||
+		call.ResultSchema.ContainsFormat(contracts.FormatSecretHandle) {
+		return fmt.Errorf("node %q child trigger, scope, and result schemas cannot expose secret handles", nodeID)
 	}
 	if err := validateInputAssembly(call.InputSchema, nil, call.InputMap, environment, "node "+nodeID+" child inputMap"); err != nil {
+		return err
+	}
+	if err := validateInputAssembly(call.TriggerSchema, nil, call.TriggerMap, environment, "node "+nodeID+" child triggerMap"); err != nil {
+		return err
+	}
+	if err := validateInputAssembly(call.ScopeSchema, nil, call.ScopeMap, environment, "node "+nodeID+" child scopeMap"); err != nil {
 		return err
 	}
 	resultBindings := make([]contracts.ValueBinding, len(call.ResultMap))

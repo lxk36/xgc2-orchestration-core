@@ -208,12 +208,16 @@
     "callAction": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["targetActionRef", "inputSchema", "resultSchema", "inputMap"],
+      "required": ["targetActionRef", "inputSchema", "triggerSchema", "scopeSchema", "resultSchema", "inputMap", "triggerMap", "scopeMap"],
       "properties": {
         "targetActionRef": { "$ref": "#/$defs/actionRef" },
         "inputSchema": { "$ref": "#/$defs/objectSchema" },
+        "triggerSchema": { "$ref": "#/$defs/objectSchema" },
+        "scopeSchema": { "$ref": "#/$defs/objectSchema" },
         "resultSchema": { "$ref": "#/$defs/objectSchema" },
         "inputMap": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
+        "triggerMap": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
+        "scopeMap": { "type": "array", "items": { "$ref": "#/$defs/binding" } },
         "resultMap": { "type": "array", "items": { "$ref": "#/$defs/resultBinding" } }
       }
     },

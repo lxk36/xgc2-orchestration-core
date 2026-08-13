@@ -48,6 +48,9 @@ The standard-library-only Go kernel currently provides:
   executes only the selected entrypoint, freezes node inputs/results, prepares
   that Effect atomically before waiting, and recovers expired pure-node attempts
   while failing effectful uncertainty closed;
+- exact child Action calls with explicit input, trigger, scope, and result maps,
+  stable parent/child Run lineage, durable child-resolution intents, and
+  ownership-closure proof before the parent can terminate;
 - atomic Effect begin, public CommandLedger persistence, leased outbox dispatch,
   private credential rehydration, immutable provider Receipt observation, and
   terminal wait-resolution intents;

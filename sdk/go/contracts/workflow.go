@@ -46,8 +46,12 @@ type WorkflowEdge struct {
 type CallAction struct {
 	TargetActionRef ActionRef       `json:"targetActionRef"`
 	InputSchema     Schema          `json:"inputSchema"`
+	TriggerSchema   Schema          `json:"triggerSchema"`
+	ScopeSchema     Schema          `json:"scopeSchema"`
 	ResultSchema    Schema          `json:"resultSchema"`
 	InputMap        []ValueBinding  `json:"inputMap"`
+	TriggerMap      []ValueBinding  `json:"triggerMap"`
+	ScopeMap        []ValueBinding  `json:"scopeMap"`
 	ResultMap       []ResultBinding `json:"resultMap,omitempty"`
 }
 

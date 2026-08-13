@@ -23,6 +23,21 @@ func StableInvocationID(runID, nodeID string) (string, error) {
 	return stableID("inv", "xgc.invocation/v1", runID, nodeID)
 }
 
+func StableChildRunID(parentInvocationID string, action contracts.ActionRef) (string, error) {
+	if !contracts.ValidIdentifier(parentInvocationID) || !contracts.ValidIdentifier(action.ActionID) ||
+		!contracts.ValidIdentifier(action.Version) || !contracts.ValidDigest(action.Digest) {
+		return "", fmt.Errorf("child Run parent invocation or Action ref is invalid")
+	}
+	return stableID("run", "xgc.child-run/v1", parentInvocationID, action)
+}
+
+func StableChildTriggerEventID(childRunID string) (string, error) {
+	if !contracts.ValidIdentifier(childRunID) {
+		return "", fmt.Errorf("child trigger Run identity is invalid")
+	}
+	return stableID("trg", "xgc.child-trigger/v1", childRunID)
+}
+
 func StableAttemptID(invocationID string, phase contracts.AttemptPhase, ordinal uint32) (string, error) {
 	return stableID("att", "xgc.attempt/v1", invocationID, string(phase), ordinal)
 }

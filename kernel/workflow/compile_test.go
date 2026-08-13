@@ -185,7 +185,11 @@ func TestCompileRejectsMissingChildInputAndAcceptsExplicitMap(t *testing.T) {
 	child := contracts.CallAction{
 		TargetActionRef: contracts.ActionRef{ActionID: "child.action", Version: "v1", Digest: workflowDigest},
 		InputSchema:     object(map[string]contracts.Schema{"message": {Type: contracts.TypeString}}, "message"),
+		TriggerSchema:   object(nil),
+		ScopeSchema:     object(nil),
 		ResultSchema:    object(map[string]contracts.Schema{"text": {Type: contracts.TypeString}}, "text"),
+		TriggerMap:      []contracts.ValueBinding{},
+		ScopeMap:        []contracts.ValueBinding{},
 		ResultMap:       []contracts.ResultBinding{{Source: "/text", Target: "/text"}},
 	}
 	definition.Nodes[1].CallAction = &child

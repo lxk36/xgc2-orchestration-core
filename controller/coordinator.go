@@ -75,6 +75,10 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	if err != nil {
 		return nil, err
 	}
+	children, err := NewChildResolutionHandler(config.Controller)
+	if err != nil {
+		return nil, err
+	}
 	if config.Clock == nil {
 		config.Clock = systemClock{}
 	}
@@ -97,6 +101,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 			Store: config.Store, OwnerRef: config.OwnerRef,
 			Handlers: map[contracts.DurableIntentKind]worker.Handler{
 				contracts.IntentOutbox: outbox, contracts.IntentWaitResolution: waits,
+				contracts.IntentChildResolution: children,
 			},
 		},
 		adapterKinds: kinds, leaseDuration: config.LeaseDuration,
@@ -121,6 +126,16 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 		}
 		if run.Status != contracts.RunWaiting {
 			return run, driveErr
+		}
+		snapshot, _, err := coordinator.controller.GetSnapshot(ctx, runID)
+		if err != nil {
+			return run, err
+		}
+		if snapshot.ActionCall != nil {
+			if _, err := coordinator.runBatch(ctx, contracts.IntentChildResolution, "child"); err != nil {
+				return run, err
+			}
+			continue
 		}
 
 		effectRecord, err := coordinator.waitedEffect(ctx, runID)

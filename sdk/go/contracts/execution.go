@@ -319,10 +319,11 @@ type DomainEvent struct {
 type DurableIntentKind string
 
 const (
-	IntentOutbox         DurableIntentKind = "outbox"
-	IntentReconcile      DurableIntentKind = "reconcile"
-	IntentCleanup        DurableIntentKind = "cleanup"
-	IntentWaitResolution DurableIntentKind = "wait-resolution"
+	IntentOutbox          DurableIntentKind = "outbox"
+	IntentReconcile       DurableIntentKind = "reconcile"
+	IntentCleanup         DurableIntentKind = "cleanup"
+	IntentWaitResolution  DurableIntentKind = "wait-resolution"
+	IntentChildResolution DurableIntentKind = "child-resolution"
 )
 
 type DurableIntent struct {
