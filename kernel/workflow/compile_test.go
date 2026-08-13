@@ -211,6 +211,29 @@ func TestCompileAcceptsSeveralDominatingDataInputsFromSerialControlChain(t *test
 	}
 }
 
+func TestCompileAcceptsReceiptBindingBeyondAnUpstreamDataJoin(t *testing.T) {
+	definition := baseDefinition()
+	definition.Nodes = []contracts.WorkflowNodeDefinition{
+		{NodeID: "source", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest, InputSchema: object(nil), OutputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value")},
+		{NodeID: "edge", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest, InputSchema: object(nil), OutputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value")},
+		{NodeID: "barrier", TypeRef: "xgc.node.noop/v1", DescriptorDigest: workflowDigest, InputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value"), OutputSchema: object(nil), Bindings: []contracts.ValueBinding{{Target: "/value", Value: contracts.ValueExpr{Ref: "nodes.source.output.value"}}}},
+		{NodeID: "join", TypeRef: "xgc.node.transform/v1", DescriptorDigest: workflowDigest, InputSchema: object(map[string]contracts.Schema{"value": {Type: contracts.TypeString}}, "value"), OutputSchema: object(nil), Bindings: []contracts.ValueBinding{{Target: "/value", Value: contracts.ValueExpr{Ref: "nodes.edge.output.value"}}}},
+	}
+	definition.Entrypoints = map[string]string{"main": "source"}
+	definition.Edges = []contracts.WorkflowEdge{
+		{From: "source", To: "edge", Kind: contracts.EdgeControl},
+		{From: "edge", To: "barrier", Kind: contracts.EdgeControl},
+		{From: "source", To: "barrier", Kind: contracts.EdgeData},
+		{From: "barrier", To: "join", Kind: contracts.EdgeControl},
+		{From: "edge", To: "join", Kind: contracts.EdgeData},
+	}
+	definition.ResultBindings = map[string][]contracts.ValueBinding{"main": {}}
+
+	if _, err := Compile(definition); err != nil {
+		t.Fatalf("Compile() error = %v", err)
+	}
+}
+
 func TestCompileRejectsMissingChildInputAndAcceptsExplicitMap(t *testing.T) {
 	definition := baseDefinition()
 	child := contracts.CallAction{

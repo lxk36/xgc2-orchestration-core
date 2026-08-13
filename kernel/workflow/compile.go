@@ -332,27 +332,19 @@ func reachable(graph dependencyGraph, starts []string, excluded string) map[stri
 }
 
 func visiblePredecessors(target string, dataEdges, controlEdges map[string]map[string]bool, graph dependencyGraph, entries []string) map[string]bool {
-	// A target may assemble one input from several earlier nodes in a serial
-	// control chain. Direct data edges are conjunctive dependencies, but if they
-	// remain in the reachability graph each earlier edge becomes a synthetic
-	// shortcut around later producers. Judge dominance with all of the target's
-	// incoming data-only edges removed, while retaining any parallel control
-	// edge between the same nodes.
+	// Data edges are conjunctive dependencies, not alternative execution paths.
+	// Including any of them in reachability manufactures shortcuts around later
+	// producers and even around downstream control barriers. Judge dominance on
+	// the pure control projection while still requiring a direct data edge for
+	// every referenced producer.
 	dominanceGraph := make(dependencyGraph, len(graph))
-	for nodeID, successors := range graph {
-		dominanceGraph[nodeID] = successors
+	for nodeID := range graph {
+		dominanceGraph[nodeID] = make(map[string]struct{})
 	}
-	for source := range dataEdges[target] {
-		if controlEdges[target][source] {
-			continue
+	for successor, predecessors := range controlEdges {
+		for predecessor := range predecessors {
+			dominanceGraph[predecessor][successor] = struct{}{}
 		}
-		successors := make(map[string]struct{}, len(graph[source]))
-		for successor := range graph[source] {
-			if successor != target {
-				successors[successor] = struct{}{}
-			}
-		}
-		dominanceGraph[source] = successors
 	}
 	visible := make(map[string]bool)
 	for source := range dataEdges[target] {
