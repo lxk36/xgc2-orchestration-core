@@ -371,6 +371,13 @@ func (controller *Controller) validateNodePins(definition contracts.WorkflowDefi
 		if !exists || descriptor.DescriptorDigest != workflowNode.DescriptorDigest {
 			return fmt.Errorf("workflow node %q does not pin an installed descriptor", workflowNode.NodeID)
 		}
+		if descriptor.SchemaMode == contracts.NodeSchemaCallAction {
+			if workflowNode.CallAction == nil || workflowNode.InputSchema.Type != contracts.TypeObject ||
+				len(workflowNode.InputSchema.Properties) != 0 || len(workflowNode.InputSchema.Required) != 0 {
+				return fmt.Errorf("workflow node %q call-action control descriptor requires an empty occurrence input and an explicit CallAction", workflowNode.NodeID)
+			}
+			continue
+		}
 		inputDigest, err := canonicaljson.DigestValue(workflowNode.InputSchema)
 		if err != nil {
 			return err

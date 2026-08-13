@@ -135,10 +135,6 @@ func TestCoordinatorAdvancesEffectfulChildActionBeforeJoiningParent(t *testing.T
 	effectDescriptor.DescriptorDigest, _ = node.DescriptorDigest(effectDescriptor)
 	effectExecutor := &effectExecutor{descriptor: effectDescriptor}
 	callDescriptor := fixture.callExecutor.descriptor
-	callDescriptor.OutputSchema = empty
-	callDescriptor.DescriptorDigest = ""
-	callDescriptor.DescriptorDigest, _ = node.DescriptorDigest(callDescriptor)
-	fixture.callExecutor.descriptor = callDescriptor
 
 	registry := node.NewRegistry()
 	for _, executor := range []nodesdk.Executor{effectExecutor, fixture.callExecutor} {
@@ -271,9 +267,10 @@ func newActionCallFixture(t *testing.T, catalogErr error) actionCallFixture {
 		AcceptedTriggerKinds: []contracts.TriggerKind{contracts.TriggerActionCall},
 	}
 
-	callDescriptor := descriptor(t, "xgc.test.action-call/v1", empty, textOutput)
+	callDescriptor := descriptor(t, "xgc.test.action-call/v1", empty, empty)
 	callDescriptor.Mode = contracts.NodeWaiting
 	callDescriptor.Determinism = contracts.NodeRecorded
+	callDescriptor.SchemaMode = contracts.NodeSchemaCallAction
 	callDescriptor.DescriptorDigest = ""
 	callDescriptor.DescriptorDigest, err = node.DescriptorDigest(callDescriptor)
 	if err != nil {

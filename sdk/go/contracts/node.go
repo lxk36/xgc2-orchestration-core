@@ -25,6 +25,21 @@ func (determinism NodeDeterminism) Valid() bool {
 	return determinism == NodeDeterministic || determinism == NodeRecorded
 }
 
+// NodeSchemaMode defines whether a descriptor owns one exact input/output
+// schema pair or is a kernel-recognized control descriptor whose concrete
+// result schema is frozen by each CallAction occurrence. Ordinary extension
+// nodes always use the default exact mode.
+type NodeSchemaMode string
+
+const (
+	NodeSchemaExact      NodeSchemaMode = "exact"
+	NodeSchemaCallAction NodeSchemaMode = "call-action"
+)
+
+func (mode NodeSchemaMode) Valid() bool {
+	return mode == "" || mode == NodeSchemaExact || mode == NodeSchemaCallAction
+}
+
 type CapabilityRequirement struct {
 	CapabilityRef string `json:"capabilityRef"`
 	Scope         string `json:"scope"`
@@ -42,6 +57,7 @@ type NodeDescriptor struct {
 	OutputSchema         Schema                  `json:"outputSchema"`
 	Mode                 NodeExecutionMode       `json:"mode"`
 	Determinism          NodeDeterminism         `json:"determinism"`
+	SchemaMode           NodeSchemaMode          `json:"schemaMode,omitempty"`
 	RequiredCapabilities []CapabilityRequirement `json:"requiredCapabilities,omitempty"`
 	AllowedEffectKinds   []string                `json:"allowedEffectKinds,omitempty"`
 	CompensationTypeRef  string                  `json:"compensationTypeRef,omitempty"`

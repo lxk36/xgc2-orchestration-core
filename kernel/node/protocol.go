@@ -41,7 +41,7 @@ func ValidateDescriptor(descriptor contracts.NodeDescriptor) error {
 	if descriptor.InputSchema.Type != contracts.TypeObject || descriptor.OutputSchema.Type != contracts.TypeObject {
 		return errors.New("node input and output schemas must be objects")
 	}
-	if !descriptor.Mode.Valid() || !descriptor.Determinism.Valid() || descriptor.MaxInputBytes <= 0 ||
+	if !descriptor.Mode.Valid() || !descriptor.Determinism.Valid() || !descriptor.SchemaMode.Valid() || descriptor.MaxInputBytes <= 0 ||
 		descriptor.MaxInputBytes > canonicaljson.DefaultMaxInputBytes || descriptor.MaxOutputBytes <= 0 ||
 		descriptor.MaxOutputBytes > canonicaljson.DefaultMaxCanonicalBytes {
 		return errors.New("node mode, determinism, or size bounds are invalid")
@@ -65,6 +65,14 @@ func ValidateDescriptor(descriptor contracts.NodeDescriptor) error {
 	}
 	if descriptor.Mode == contracts.NodeWaiting && len(descriptor.AllowedEffectKinds) != 0 {
 		return errors.New("waiting node cannot declare effects")
+	}
+	if descriptor.SchemaMode == contracts.NodeSchemaCallAction {
+		if descriptor.Mode != contracts.NodeWaiting || descriptor.Determinism != contracts.NodeRecorded ||
+			len(descriptor.InputSchema.Properties) != 0 || len(descriptor.InputSchema.Required) != 0 ||
+			len(descriptor.OutputSchema.Properties) != 0 || len(descriptor.OutputSchema.Required) != 0 ||
+			len(descriptor.AllowedEffectKinds) != 0 || descriptor.CompensationTypeRef != "" {
+			return errors.New("call-action schema mode requires an empty recorded waiting control descriptor")
+		}
 	}
 	if descriptor.CompensationTypeRef != "" && !contracts.ValidTypeRef(descriptor.CompensationTypeRef) {
 		return errors.New("node compensation type ref is invalid")

@@ -16,6 +16,7 @@
     "outputSchema": { "$ref": "https://xgc.dev/spec/workflow-definition/v1/schema.json#/$defs/objectSchema" },
     "mode": { "enum": ["pure", "effectful", "waiting"] },
     "determinism": { "enum": ["deterministic", "recorded"] },
+    "schemaMode": { "enum": ["exact", "call-action"] },
     "requiredCapabilities": {
       "type": "array",
       "items": {
