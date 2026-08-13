@@ -580,7 +580,7 @@ func validateKey(key store.AggregateKey) error {
 func keyString(key store.AggregateKey) string { return key.Type + "\x00" + key.ID }
 
 func (fileStore *Store) append(state diskState) error {
-	payload, err := canonicaljson.Marshal(state)
+	payload, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
 	if err != nil {
 		return err
 	}
@@ -648,7 +648,7 @@ func load(file *os.File) (diskState, int64, error) {
 			return diskState{}, offset, store.ErrCorrupt
 		}
 		var candidate diskState
-		if err := canonicaljson.UnmarshalStrict(payload, &candidate); err != nil {
+		if err := canonicaljson.UnmarshalStrictWithLimits(payload, &candidate, frameJSONLimits()); err != nil {
 			return diskState{}, offset, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
 		}
 		if err := validateState(candidate); err != nil {
@@ -742,15 +742,23 @@ func emptyState() diskState {
 }
 
 func cloneState(state diskState) (diskState, error) {
-	raw, err := canonicaljson.Marshal(state)
+	raw, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
 	if err != nil {
 		return diskState{}, err
 	}
 	var clone diskState
-	if err := canonicaljson.UnmarshalStrict(raw, &clone); err != nil {
+	if err := canonicaljson.UnmarshalStrictWithLimits(raw, &clone, frameJSONLimits()); err != nil {
 		return diskState{}, err
 	}
 	return clone, nil
+}
+
+func frameJSONLimits() canonicaljson.Limits {
+	limits := canonicaljson.DefaultLimits()
+	limits.MaxInputBytes = maxFrameBytes
+	limits.MaxCanonicalBytes = maxFrameBytes
+	limits.MaxNodes = 4_000_000
+	return limits
 }
 
 func normalizeRaw(raw json.RawMessage) (json.RawMessage, string, error) {

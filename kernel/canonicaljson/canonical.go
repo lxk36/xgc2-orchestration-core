@@ -87,7 +87,13 @@ func Decode(raw []byte, limits Limits) (any, error) {
 // UnmarshalStrict applies the canonical wire parser before decoding a typed
 // contract and rejects fields unknown to that contract version.
 func UnmarshalStrict(raw []byte, target any) error {
-	canonical, err := Canonicalize(raw)
+	return UnmarshalStrictWithLimits(raw, target, DefaultLimits())
+}
+
+// UnmarshalStrictWithLimits applies the same canonical and unknown-field
+// checks with an explicitly selected transport/storage envelope limit.
+func UnmarshalStrictWithLimits(raw []byte, target any, limits Limits) error {
+	canonical, err := CanonicalizeWithLimits(raw, limits)
 	if err != nil {
 		return err
 	}
@@ -215,11 +221,18 @@ func CanonicalizeWithLimits(raw []byte, limits Limits) ([]byte, error) {
 // Marshal converts a Go value through encoding/json before applying the same
 // strict canonical representation used for wire JSON.
 func Marshal(value any) ([]byte, error) {
+	return MarshalWithLimits(value, DefaultLimits())
+}
+
+// MarshalWithLimits encodes a value using the canonical profile with an
+// explicitly selected envelope limit. Public protocol values should continue
+// to use Marshal and its 1 MiB default.
+func MarshalWithLimits(value any, limits Limits) ([]byte, error) {
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return nil, err
 	}
-	return Canonicalize(raw)
+	return CanonicalizeWithLimits(raw, limits)
 }
 
 func Digest(raw []byte) (string, error) {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -292,6 +294,68 @@ func TestListAggregatesUsesStableTypeScopedCursor(t *testing.T) {
 	}
 	if _, err := durable.ListAggregates(ctx, "run", "", 0); err == nil {
 		t.Fatal("invalid list limit was accepted")
+	}
+}
+
+func TestDurableFrameExceedsSingleProtocolValueLimitAndRecovers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large-frame.wal")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Date(2026, 8, 13, 6, 30, 0, 0, time.UTC)
+	payload, err := canonicaljson.Marshal(map[string]any{"data": strings.Repeat("x", 2048)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDigest, err := canonicaljson.Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := store.Transaction{
+		CommandID: "large-frame-commit", IdentityDigest: fixtureDigest,
+		Outcome: json.RawMessage(`{"stored":true}`), At: t0,
+	}
+	for index := 0; index < 700; index++ {
+		key := store.AggregateKey{Type: "fixture", ID: fmt.Sprintf("item-%04d", index)}
+		transaction.Expected = append(transaction.Expected, store.ExpectedRevision{Key: key})
+		transaction.Mutations = append(transaction.Mutations, store.AggregateRecord{
+			Key: key, Revision: 1, PayloadDigest: payloadDigest, Payload: payload,
+		})
+		eventPayload := map[string]any{"itemId": key.ID}
+		eventPayloadDigest, digestErr := canonicaljson.DigestValue(eventPayload)
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		eventID, identityErr := execution.StableEventID(key.Type, key.ID, 1)
+		if identityErr != nil {
+			t.Fatal(identityErr)
+		}
+		transaction.Events = append(transaction.Events, contracts.DomainEvent{
+			EventID: eventID, AggregateType: key.Type, AggregateID: key.ID, AggregateRevision: 1,
+			Type: "fixture.created", CommandID: transaction.CommandID,
+			PayloadSchemaDigest: fixtureDigest, PayloadDigest: eventPayloadDigest,
+			Payload: eventPayload, OccurredAt: t0,
+		})
+	}
+	if _, err := durable.Commit(t.Context(), transaction); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Size() <= canonicaljson.DefaultMaxInputBytes {
+		t.Fatalf("durable frame size = %d, err=%v", info.Size(), err)
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	durable, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	recovered, err := durable.ListAggregates(t.Context(), "fixture", "", 1000)
+	if err != nil || len(recovered) != 700 {
+		t.Fatalf("recovered aggregates = %d, err=%v", len(recovered), err)
 	}
 }
 
