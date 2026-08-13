@@ -460,7 +460,7 @@ type staticEffectPlan struct {
 
 func (plan staticEffectPlan) PlanEffectDispatch(_ context.Context, current contracts.EffectRecord) (BeginEffectRequest, error) {
 	return BeginEffectRequest{
-		EffectID: current.EffectID, CommandID: "coordinate-effect",
+		EffectID: current.EffectID, CommandID: "coordinate-" + current.EffectID,
 		IdempotencyKey: "coordinate-idempotency", CapabilityToken: "coordinate-capability",
 		Action: "process.start", ActorRef: "operator", SourceRef: "coordinator-test",
 		ReasonCode: "experiment.launch", Risk: contracts.RiskModerate,
@@ -473,6 +473,15 @@ func (plan staticEffectPlan) PlanEffectDispatch(_ context.Context, current contr
 
 func TestCoordinatorOwnsCompleteEffectWaitLoop(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-coordinator")
+	second := fixture.request.Definition.Nodes[0]
+	second.NodeID = "launch-again"
+	fixture.request.Definition.Nodes = append(fixture.request.Definition.Nodes, second)
+	fixture.request.Definition.Edges = []contracts.WorkflowEdge{{From: "launch", To: "launch-again", Kind: contracts.EdgeControl}}
+	plan, err := workflowkernel.Compile(fixture.request.Definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Action.DefinitionDigest = plan.DefinitionDigest
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
 	if err != nil {
 		t.Fatal(err)
@@ -489,8 +498,19 @@ func TestCoordinatorOwnsCompleteEffectWaitLoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	run, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
-	if err != nil || run.Status != contracts.RunSucceeded || !adapter.seenPrivate || fixture.executor.Calls() != 1 {
+	if err != nil || run.Status != contracts.RunSucceeded || !adapter.seenPrivate || fixture.executor.Calls() != 2 {
 		t.Fatalf("coordinated run = %#v, private=%v calls=%d err=%v", run, adapter.seenPrivate, fixture.executor.Calls(), err)
+	}
+	firstInvocationID, _ := execution.StableInvocationID(run.RunID, "launch")
+	firstEffectID, _ := effect.StableEffectID(firstInvocationID, "start-process")
+	firstEffect, err := fixture.controller.GetEffect(t.Context(), firstEffectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstWaitIntentID, _ := execution.StableIntentID(contracts.IntentWaitResolution, firstEffectID, firstEffect.Revision)
+	firstWaitIntent, err := fixture.store.GetIntent(t.Context(), firstWaitIntentID)
+	if err != nil || firstWaitIntent.Status != store.IntentCompleted {
+		t.Fatalf("first wait intent = %#v, err=%v", firstWaitIntent, err)
 	}
 }
 

@@ -217,7 +217,8 @@ func (handler *WaitResolutionHandler) Handle(ctx context.Context, claimed store.
 	if claimed.Record.Intent.Kind != contracts.IntentWaitResolution {
 		return deadIntent("wait.kind", "claimed intent is not a wait resolution")
 	}
-	if _, err := handler.controller.ResolveEffectWait(ctx, claimed.Record.Intent.AggregateID); err != nil && !errors.Is(err, ErrRunClosureOpen) {
+	if _, err := handler.controller.ResolveEffectWait(ctx, claimed.Record.Intent.AggregateID); err != nil &&
+		!errors.Is(err, ErrRunWaiting) && !errors.Is(err, ErrRunClosureOpen) {
 		return retryIntent(handler.controller.clock.Now(), "wait.resolve", err)
 	}
 	return worker.Result{Disposition: worker.Complete}
