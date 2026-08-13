@@ -77,6 +77,7 @@ type EffectProposal struct {
 	Kind                   string             `json:"kind"`
 	TargetRef              string             `json:"targetRef"`
 	IntentSchemaDigest     string             `json:"intentSchemaDigest"`
+	Intent                 map[string]any     `json:"intent"`
 	IntentDigest           string             `json:"intentDigest"`
 	IntentArtifactRef      string             `json:"intentArtifactRef,omitempty"`
 	Ownership              EffectOwnership    `json:"ownership"`

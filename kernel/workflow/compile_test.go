@@ -63,6 +63,77 @@ func TestCompileReferenceWorkflowIsDeterministic(t *testing.T) {
 	if strings.Join(left.NodeOrder, ",") != "prepare,render" {
 		t.Fatalf("order = %#v", left.NodeOrder)
 	}
+	if strings.Join(left.EntrypointNodeOrder["main"], ",") != "prepare,render" {
+		t.Fatalf("main entrypoint order = %#v", left.EntrypointNodeOrder["main"])
+	}
+}
+
+func TestCompilePinsIndependentNodeOrderForEveryEntrypoint(t *testing.T) {
+	definition := baseDefinition()
+	definition.Nodes = append(definition.Nodes, contracts.WorkflowNodeDefinition{
+		NodeID: "diagnose", TypeRef: "xgc.node.noop/v1", DescriptorDigest: workflowDigest,
+		InputSchema: object(nil), OutputSchema: object(nil),
+	})
+	definition.Entrypoints["diagnostics"] = "diagnose"
+	plan, err := Compile(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(plan.EntrypointNodeOrder["main"], ","); got != "prepare,render" {
+		t.Fatalf("main order = %q", got)
+	}
+	if got := strings.Join(plan.EntrypointNodeOrder["diagnostics"], ","); got != "diagnose" {
+		t.Fatalf("diagnostics order = %q", got)
+	}
+}
+
+func TestResolveNodeInputsAndEntrypointResult(t *testing.T) {
+	definition := baseDefinition()
+	definition.ResultSchema = object(map[string]contracts.Schema{"text": {Type: contracts.TypeString}}, "text")
+	definition.ResultBindings = map[string][]contracts.ValueBinding{
+		"main": {{Target: "/text", Value: contracts.ValueExpr{Ref: "nodes.render.output.text"}}},
+	}
+	if _, err := Compile(definition); err != nil {
+		t.Fatal(err)
+	}
+	prepare, err := ResolveNodeInputs(
+		definition, "prepare", map[string]any{"name": "XGC"}, map[string]any{}, map[string]any{}, nil, nil,
+	)
+	if err != nil || prepare["name"] != "XGC" {
+		t.Fatalf("prepare inputs = %#v, err = %v", prepare, err)
+	}
+	outputs := map[string]map[string]any{
+		"prepare": {"greeting": "hello XGC"},
+		"render":  {"text": "HELLO XGC"},
+	}
+	render, err := ResolveNodeInputs(
+		definition, "render", map[string]any{"name": "XGC"}, map[string]any{}, map[string]any{}, outputs, nil,
+	)
+	if err != nil || render["message"] != "hello XGC" {
+		t.Fatalf("render inputs = %#v, err = %v", render, err)
+	}
+	result, err := ResolveResult(
+		definition, "main", map[string]any{"name": "XGC"}, map[string]any{}, map[string]any{}, outputs,
+	)
+	if err != nil || result["text"] != "HELLO XGC" {
+		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+func TestCompileRejectsResultFromOneOfMultipleTerminalBranches(t *testing.T) {
+	definition := baseDefinition()
+	definition.Nodes = append(definition.Nodes, contracts.WorkflowNodeDefinition{
+		NodeID: "side", TypeRef: "xgc.node.noop/v1", DescriptorDigest: workflowDigest,
+		InputSchema: object(nil), OutputSchema: object(nil),
+	})
+	definition.Edges = append(definition.Edges, contracts.WorkflowEdge{From: "prepare", To: "side", Kind: contracts.EdgeControl})
+	definition.ResultSchema = object(map[string]contracts.Schema{"text": {Type: contracts.TypeString}}, "text")
+	definition.ResultBindings = map[string][]contracts.ValueBinding{
+		"main": {{Target: "/text", Value: contracts.ValueExpr{Ref: "nodes.render.output.text"}}},
+	}
+	if _, err := Compile(definition); err == nil || !strings.Contains(err.Error(), "not visible") {
+		t.Fatalf("branch-specific result error = %v", err)
+	}
 }
 
 func TestCompileRejectsCycleDanglingAndUnreachableNodes(t *testing.T) {

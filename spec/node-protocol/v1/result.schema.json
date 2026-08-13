@@ -22,10 +22,10 @@
     },
     "effect": {
       "type": "object", "additionalProperties": false,
-      "required": ["effectKey", "kind", "targetRef", "intentSchemaDigest", "intentDigest", "ownership", "compensationPolicy", "policyDigest", "deadline"],
+      "required": ["effectKey", "kind", "targetRef", "intentSchemaDigest", "intent", "intentDigest", "ownership", "compensationPolicy", "policyDigest", "deadline"],
       "properties": {
         "effectKey": { "$ref": "#/$defs/identifier" }, "kind": { "$ref": "#/$defs/typeRef" }, "targetRef": { "$ref": "#/$defs/identifier" },
-        "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
+        "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intent": { "type": "object" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
         "ownership": { "enum": ["owned", "attached", "shared"] }, "compensationPolicy": { "enum": ["none", "required", "best-effort"] },
         "requiredCapabilityRefs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }, "policyDigest": { "$ref": "#/$defs/digest" }, "deadline": { "$ref": "#/$defs/timestamp" }
       }

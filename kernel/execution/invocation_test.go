@@ -111,6 +111,67 @@ func TestInvocationRetryFreezesInputsAndRejectsExpiredLease(t *testing.T) {
 	}
 }
 
+func TestExpiredAttemptMustBeExplicitlyRecoveredAndStaleWorkerIsFenced(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 13, 30, 0, 0, time.UTC)
+	ledger := activateTestInvocation(t, "run-expired", "pure-node", t0)
+	claimed, err := ClaimInvocation(ledger, ClaimInvocationCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		Phase: contracts.AttemptExecution, OwnerRef: "worker-old", LeaseToken: "lease-old",
+		LeaseExpiresAt: t0.Add(5 * time.Second), CommandID: "claim-expiring", At: t0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger = claimed.Ledger
+	attempt := ledger.Attempts[0]
+	failure := contracts.StructuredFailure{Class: contracts.FailureUncertain, Code: "worker.lease-expired", Message: "worker lease expired before a durable result"}
+	_, err = ExpireInvocationAttempt(ledger, ExpireInvocationAttemptCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision, Retry: true,
+		Failure: failure, CommandID: "expire-too-early", At: t0.Add(4 * time.Second),
+	})
+	if !errors.Is(err, ErrLeaseConflict) {
+		t.Fatalf("early expiry error = %v", err)
+	}
+
+	recovered, err := ExpireInvocationAttempt(ledger, ExpireInvocationAttemptCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision, Retry: true,
+		Failure: failure, CommandID: "expire-after-lease", At: attempt.LeaseExpiresAt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Ledger.Invocation.Status != contracts.InvocationReady || recovered.Ledger.Invocation.ActiveAttemptID != "" ||
+		recovered.Ledger.Attempts[0].Status != contracts.AttemptAbandoned || !recovered.Ledger.Attempts[0].LeaseExpiresAt.IsZero() {
+		t.Fatalf("recovered ledger = %#v", recovered.Ledger)
+	}
+
+	staleFence := AttemptFence{
+		InvocationID: ledger.Invocation.InvocationID, InvocationRevision: ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, AttemptRevision: attempt.Revision, LeaseToken: "lease-old", At: t0.Add(6 * time.Second),
+	}
+	_, err = TransitionInvocation(recovered.Ledger, TransitionInvocationCommand{
+		Fence: staleFence, To: contracts.InvocationSucceeded, AttemptTo: contracts.AttemptSucceeded,
+		OutputRefsDigest: testDigest, CommandID: "stale-success",
+	})
+	if !errors.Is(err, ErrRevisionConflict) && !errors.Is(err, ErrLeaseConflict) {
+		t.Fatalf("stale worker transition error = %v", err)
+	}
+
+	second, err := ClaimInvocation(recovered.Ledger, ClaimInvocationCommand{
+		InvocationID: recovered.Ledger.Invocation.InvocationID, ExpectedRevision: recovered.Ledger.Invocation.Revision,
+		Phase: contracts.AttemptExecution, OwnerRef: "worker-new", LeaseToken: "lease-new",
+		LeaseExpiresAt: t0.Add(time.Minute), CommandID: "claim-after-expiry", At: t0.Add(7 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Ledger.Attempts) != 2 || second.Ledger.Attempts[1].Ordinal != 2 {
+		t.Fatalf("second attempt ledger = %#v", second.Ledger)
+	}
+}
+
 func TestInvocationCompensationUsesSeparateAttemptsAndRetryClock(t *testing.T) {
 	t0 := time.Date(2026, 8, 12, 14, 0, 0, 0, time.UTC)
 	ledger := activateTestInvocation(t, "run-compensation", "allocate", t0)

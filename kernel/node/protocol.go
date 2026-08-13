@@ -217,6 +217,17 @@ func validateEffects(descriptor contracts.NodeDescriptor, request contracts.Node
 				return fmt.Errorf("node effect proposal %d digest is invalid", index)
 			}
 		}
+		if proposal.Intent == nil {
+			return fmt.Errorf("node effect proposal %d intent is missing", index)
+		}
+		intentBytes, err := canonicaljson.Marshal(proposal.Intent)
+		if err != nil || len(intentBytes) > descriptor.MaxOutputBytes {
+			return fmt.Errorf("node effect proposal %d intent is invalid or exceeds descriptor bound", index)
+		}
+		intentDigest, err := canonicaljson.Digest(intentBytes)
+		if err != nil || intentDigest != proposal.IntentDigest {
+			return fmt.Errorf("node effect proposal %d intent digest is invalid", index)
+		}
 		if proposal.IntentArtifactRef != "" && !contracts.ValidIdentifier(proposal.IntentArtifactRef) {
 			return fmt.Errorf("node effect proposal %d artifact ref is invalid", index)
 		}

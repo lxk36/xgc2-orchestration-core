@@ -41,6 +41,10 @@ The standard-library-only Go kernel currently provides:
 - a sealed Node registry, descriptor/request/result protocol, declarative
   Effect proposal boundary, explicit capability grants, structured output, and
   reusable node-pack conformance suite.
+- a durable single-controller runtime that admits exact Action/Workflow pins,
+  executes only the selected entrypoint, freezes node inputs/results, prepares
+  Effects atomically before waiting, and recovers expired pure-node attempts
+  while failing effectful uncertainty closed.
 
 The repository does not yet provide remote execution, a Studio, HTTP APIs, or
 container deployment. The file store and local-process provider are for a
@@ -74,6 +78,7 @@ It compiles using only this repository.
 | Managed process provider port/reference | `provider/process`, `provider/processlocal` |
 | User-extensible Node protocol and SDK | `spec/node-protocol/v1`, `kernel/node`, `sdk/go/node` |
 | Independent pack acceptance | `conformance/nodepack` |
+| Durable Action-to-Node controller | `controller` |
 | Language-facing contract types | `sdk/go/contracts` |
 | Cross-cutting acceptance gates | `conformance/architecture`, `conformance/fixtures` |
 

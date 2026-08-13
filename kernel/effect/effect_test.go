@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
@@ -150,11 +151,16 @@ func prepareTestEffect(t *testing.T, at time.Time, policy contracts.Compensation
 	if err != nil {
 		t.Fatal(err)
 	}
+	intentPayload := map[string]any{"runtimeRef": "simulator-1"}
+	intentDigest, err := canonicaljson.DigestValue(intentPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	decision, err := Prepare(PrepareCommand{
 		Intent: contracts.EffectIntent{
 			EffectID: effectID, NamespaceID: "lab", RunID: "run-1", InvocationID: "invocation-1", PreparedAttemptID: "attempt-1",
 			EffectKey: "start-simulator", Kind: "xgc.process-start/v1", TargetRef: "simulator-1",
-			IntentSchemaDigest: digest, IntentDigest: digest, Ownership: contracts.EffectOwned, CompensationPolicy: policy,
+			IntentSchemaDigest: digest, Intent: intentPayload, IntentDigest: intentDigest, Ownership: contracts.EffectOwned, CompensationPolicy: policy,
 			RequiredCapabilityRefs: []string{"process.control"}, PolicyDigest: digest, DescriptorDigest: digest, Deadline: at.Add(10 * time.Minute),
 		},
 		CommandID: "prepare-1", At: at,

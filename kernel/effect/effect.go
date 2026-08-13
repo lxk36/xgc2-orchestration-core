@@ -378,6 +378,13 @@ func ValidateIntent(intent contracts.EffectIntent, at time.Time) error {
 	if err := validateOptionalIdentity(intent.IntentArtifactRef, "intent artifact ref"); err != nil {
 		return err
 	}
+	if intent.Intent == nil {
+		return errors.New("effect intent payload is required")
+	}
+	intentDigest, err := canonicaljson.DigestValue(intent.Intent)
+	if err != nil || intentDigest != intent.IntentDigest {
+		return errors.New("effect intent payload digest is invalid")
+	}
 	if !intent.Ownership.Valid() || !intent.CompensationPolicy.Valid() {
 		return errors.New("effect ownership or compensation policy is invalid")
 	}
@@ -841,6 +848,7 @@ func validateFailure(failure *contracts.StructuredFailure, uncertain bool) error
 
 func cloneIntent(intent contracts.EffectIntent) contracts.EffectIntent {
 	intent.RequiredCapabilityRefs = append([]string(nil), intent.RequiredCapabilityRefs...)
+	intent.Intent, _ = contracts.CloneObject(intent.Intent)
 	return intent
 }
 

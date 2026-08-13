@@ -105,11 +105,11 @@
     },
     "effectIntent": {
       "type": "object", "additionalProperties": false,
-      "required": ["effectId", "namespaceId", "runId", "invocationId", "preparedAttemptId", "effectKey", "kind", "targetRef", "intentSchemaDigest", "intentDigest", "ownership", "compensationPolicy", "policyDigest", "descriptorDigest", "deadline"],
+      "required": ["effectId", "namespaceId", "runId", "invocationId", "preparedAttemptId", "effectKey", "kind", "targetRef", "intentSchemaDigest", "intent", "intentDigest", "ownership", "compensationPolicy", "policyDigest", "descriptorDigest", "deadline"],
       "properties": {
         "effectId": { "$ref": "#/$defs/identifier" }, "namespaceId": { "$ref": "#/$defs/identifier" }, "runId": { "$ref": "#/$defs/identifier" }, "invocationId": { "$ref": "#/$defs/identifier" },
         "preparedAttemptId": { "$ref": "#/$defs/identifier" }, "effectKey": { "$ref": "#/$defs/identifier" }, "kind": { "$ref": "#/$defs/typeRef" }, "targetRef": { "$ref": "#/$defs/identifier" },
-        "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
+        "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intent": { "type": "object" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
         "ownership": { "enum": ["owned", "attached", "shared"] }, "compensationPolicy": { "enum": ["none", "required", "best-effort"] },
         "requiredCapabilityRefs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
         "policyDigest": { "$ref": "#/$defs/digest" }, "descriptorDigest": { "$ref": "#/$defs/digest" }, "deadline": { "$ref": "#/$defs/timestamp" }

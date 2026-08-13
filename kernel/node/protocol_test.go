@@ -76,15 +76,17 @@ func TestCapabilitiesAndEffectsFailClosed(t *testing.T) {
 	if err := ValidateRequest(descriptor, request); err != nil {
 		t.Fatal(err)
 	}
+	intent := map[string]any{"tool": "issue.create"}
+	intentDigest, _ := canonicaljson.DigestValue(intent)
 	result := contracts.NodeResult{
 		Status: contracts.NodeResultWaiting, EvidenceDigest: digest,
 		Effects: []contracts.EffectProposal{{
 			EffectKey: "invoke-tool", Kind: "xgc.mcp-call/v1", TargetRef: "mcp-server-1",
-			IntentSchemaDigest: digest, IntentDigest: digest, Ownership: contracts.EffectAttached,
+			IntentSchemaDigest: digest, Intent: intent, IntentDigest: intentDigest, Ownership: contracts.EffectAttached,
 			CompensationPolicy: contracts.CompensationNone, RequiredCapabilityRefs: []string{"mcp.invoke"},
 			PolicyDigest: digest, Deadline: request.Deadline,
 		}},
-		Wait: &contracts.NodeWait{Kind: contracts.NodeWaitEffect, SubjectRef: "invoke-tool", ConditionDigest: digest},
+		Wait: &contracts.NodeWait{Kind: contracts.NodeWaitEffect, SubjectRef: "invoke-tool", ConditionDigest: intentDigest},
 	}
 	if err := ValidateResult(descriptor, request, result); err != nil {
 		t.Fatal(err)

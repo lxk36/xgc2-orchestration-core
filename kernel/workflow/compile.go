@@ -61,24 +61,73 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 			}
 		}
 	}
+	for name := range definition.ResultBindings {
+		if _, exists := definition.Entrypoints[name]; !exists {
+			return contracts.CompiledWorkflowPlan{}, fmt.Errorf("workflow result binding targets unknown entrypoint %q", name)
+		}
+	}
+	for name, entryNodeID := range definition.Entrypoints {
+		resultEnvironment := baseEnvironment
+		resultEnvironment.VisibleNodes = resultVisibleNodes(graph, []string{entryNodeID})
+		if err := validateInputAssembly(definition.ResultSchema, nil, definition.ResultBindings[name], resultEnvironment, "workflow result "+name); err != nil {
+			return contracts.CompiledWorkflowPlan{}, err
+		}
+	}
 	definitionDigest, err := canonicaljson.DigestValue(definition)
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, fmt.Errorf("definition digest: %w", err)
 	}
+	entrypointOrders := make(map[string][]string, len(definition.Entrypoints))
+	for name, nodeID := range definition.Entrypoints {
+		reachableNodes := reachable(graph, []string{nodeID}, "")
+		entryOrder := make([]string, 0, len(reachableNodes))
+		for _, candidate := range order {
+			if reachableNodes[candidate] {
+				entryOrder = append(entryOrder, candidate)
+			}
+		}
+		entrypointOrders[name] = entryOrder
+	}
 	unsigned := struct {
-		WorkflowID       string   `json:"workflowId"`
-		Version          string   `json:"version"`
-		DefinitionDigest string   `json:"definitionDigest"`
-		NodeOrder        []string `json:"nodeOrder"`
-	}{definition.WorkflowID, definition.Version, definitionDigest, order}
+		WorkflowID          string              `json:"workflowId"`
+		Version             string              `json:"version"`
+		DefinitionDigest    string              `json:"definitionDigest"`
+		NodeOrder           []string            `json:"nodeOrder"`
+		EntrypointNodeOrder map[string][]string `json:"entrypointNodeOrder"`
+	}{definition.WorkflowID, definition.Version, definitionDigest, order, entrypointOrders}
 	planDigest, err := canonicaljson.DigestValue(unsigned)
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, fmt.Errorf("plan digest: %w", err)
 	}
 	return contracts.CompiledWorkflowPlan{
 		WorkflowID: definition.WorkflowID, Version: definition.Version, DefinitionDigest: definitionDigest,
-		NodeOrder: order, PlanDigest: planDigest,
+		NodeOrder: order, EntrypointNodeOrder: entrypointOrders, PlanDigest: planDigest,
 	}, nil
+}
+
+func resultVisibleNodes(graph dependencyGraph, entries []string) map[string]bool {
+	reached := reachable(graph, entries, "")
+	terminals := make([]string, 0)
+	for nodeID, successors := range graph {
+		if reached[nodeID] && len(successors) == 0 {
+			terminals = append(terminals, nodeID)
+		}
+	}
+	visible := make(map[string]bool)
+	for candidate := range graph {
+		if !reached[candidate] {
+			continue
+		}
+		dominatesEveryTerminal := true
+		for _, terminal := range terminals {
+			if candidate != terminal && !dominates(candidate, terminal, graph, entries) {
+				dominatesEveryTerminal = false
+				break
+			}
+		}
+		visible[candidate] = dominatesEveryTerminal
+	}
+	return visible
 }
 
 func validateIdentityAndSchemas(definition contracts.WorkflowDefinition) error {

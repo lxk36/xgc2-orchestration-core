@@ -63,6 +63,22 @@ type HeartbeatAttemptCommand struct {
 	CommandID      string
 }
 
+// ExpireInvocationAttemptCommand resolves an execution attempt whose lease is
+// no longer live. Retry must only be selected by a caller that can prove the
+// node has not performed an unrecorded external mutation (for example, a pure
+// deterministic node). Effectful or otherwise uncertain attempts must fail
+// closed and reconcile their prepared Effect records instead.
+type ExpireInvocationAttemptCommand struct {
+	InvocationID            string
+	ExpectedRevision        uint64
+	AttemptID               string
+	ExpectedAttemptRevision uint64
+	Retry                   bool
+	Failure                 contracts.StructuredFailure
+	CommandID               string
+	At                      time.Time
+}
+
 type ResolveUnleasedInvocationCommand struct {
 	InvocationID     string
 	ExpectedRevision uint64
@@ -308,6 +324,76 @@ func HeartbeatAttempt(current contracts.InvocationLedger, command HeartbeatAttem
 	event, err := newEvent("invocation", next.Invocation.InvocationID, next.Invocation.Revision, "attempt.heartbeat", command.CommandID, command.Fence.At, map[string]any{
 		"attemptId": next.Attempts[index].AttemptID, "attemptRevision": next.Attempts[index].Revision,
 		"leaseExpiresAt": next.Attempts[index].LeaseExpiresAt,
+	})
+	if err != nil {
+		return InvocationDecision{}, err
+	}
+	return InvocationDecision{Ledger: next, Events: []contracts.DomainEvent{event}}, nil
+}
+
+func ExpireInvocationAttempt(current contracts.InvocationLedger, command ExpireInvocationAttemptCommand) (InvocationDecision, error) {
+	if err := ValidateInvocationLedger(current); err != nil {
+		return InvocationDecision{}, err
+	}
+	invocation := current.Invocation
+	if command.InvocationID != invocation.InvocationID || command.ExpectedRevision != invocation.Revision {
+		return InvocationDecision{}, ErrRevisionConflict
+	}
+	if invocation.Status != contracts.InvocationRunning && invocation.Status != contracts.InvocationWaiting {
+		return InvocationDecision{}, fmt.Errorf("%w: invocation %s has no expirable execution attempt", ErrInvalidTransition, invocation.Status)
+	}
+	if command.AttemptID != invocation.ActiveAttemptID || command.At.IsZero() || command.At.Before(invocation.UpdatedAt) {
+		return InvocationDecision{}, ErrLeaseConflict
+	}
+	if err := validateIdentity(command.CommandID, "attempt expiry command id"); err != nil {
+		return InvocationDecision{}, err
+	}
+	if err := validateFailure(&command.Failure, true, "expired attempt failure"); err != nil {
+		return InvocationDecision{}, err
+	}
+	index := -1
+	for candidate := range current.Attempts {
+		attempt := current.Attempts[candidate]
+		if attempt.AttemptID == command.AttemptID {
+			if attempt.Phase != contracts.AttemptExecution || attempt.Revision != command.ExpectedAttemptRevision ||
+				attempt.Status.Terminal() || command.At.Before(attempt.LeaseExpiresAt) {
+				return InvocationDecision{}, ErrLeaseConflict
+			}
+			index = candidate
+			break
+		}
+	}
+	if index < 0 {
+		return InvocationDecision{}, ErrLeaseConflict
+	}
+
+	next := cloneLedger(current)
+	attempt := &next.Attempts[index]
+	attempt.Status = contracts.AttemptAbandoned
+	attempt.Failure = cloneFailure(&command.Failure)
+	attempt.LeaseExpiresAt = time.Time{}
+	attempt.UpdatedAt = command.At.UTC()
+	attempt.Revision++
+	finished := command.At.UTC()
+	attempt.FinishedAt = &finished
+
+	next.Invocation.ActiveAttemptID = ""
+	next.Invocation.CurrentWaitRef = ""
+	next.Invocation.WaitGeneration = 0
+	next.Invocation.UpdatedAt = command.At.UTC()
+	next.Invocation.Revision++
+	if command.Retry {
+		next.Invocation.Status = contracts.InvocationReady
+	} else {
+		next.Invocation.Status = contracts.InvocationFailed
+		next.Invocation.PrimaryFailure = cloneFailure(&command.Failure)
+		next.Invocation.FinishedAt = &finished
+	}
+	if err := ValidateInvocationLedger(next); err != nil {
+		return InvocationDecision{}, err
+	}
+	event, err := newEvent("invocation", next.Invocation.InvocationID, next.Invocation.Revision, "invocation.attempt-expired", command.CommandID, command.At, map[string]any{
+		"attemptId": attempt.AttemptID, "attemptRevision": attempt.Revision, "retry": command.Retry,
 	})
 	if err != nil {
 		return InvocationDecision{}, err

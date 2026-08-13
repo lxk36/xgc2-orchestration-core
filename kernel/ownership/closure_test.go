@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/effect"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/runtime"
@@ -28,11 +29,16 @@ func TestClosureFactsAreDerivedFromExactOwnershipGraph(t *testing.T) {
 		ParentRunID: run.RunID, ParentInvocationID: invocationID, CallNodeID: "node-1", MappingDigest: digest,
 	}, run.RunID, t0)
 	effectID, _ := effect.StableEffectID(invocationID, "external-call")
+	intentPayload := map[string]any{"target": "target-1"}
+	intentDigest, err := canonicaljson.DigestValue(intentPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	effectDecision, err := effect.Prepare(effect.PrepareCommand{
 		Intent: contracts.EffectIntent{
 			EffectID: effectID, NamespaceID: "lab", RunID: run.RunID, InvocationID: invocationID,
 			PreparedAttemptID: "attempt-1", EffectKey: "external-call", Kind: "xgc.test-effect/v1", TargetRef: "target-1",
-			IntentSchemaDigest: digest, IntentDigest: digest, Ownership: contracts.EffectOwned,
+			IntentSchemaDigest: digest, Intent: intentPayload, IntentDigest: intentDigest, Ownership: contracts.EffectOwned,
 			CompensationPolicy: contracts.CompensationRequired, PolicyDigest: digest, DescriptorDigest: digest, Deadline: t0.Add(time.Hour),
 		},
 		CommandID: "prepare-effect", At: t0,
