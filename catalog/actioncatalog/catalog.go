@@ -49,6 +49,27 @@ type InstallResult struct {
 	Replay bool   `json:"replay"`
 }
 
+// Metadata is the bounded discovery projection used by editors and agents.
+// The immutable Workflow definition is returned only by Get so listing a
+// catalog never scales with the combined size of every installed graph.
+type Metadata struct {
+	NamespaceID string                  `json:"namespaceId"`
+	Action      contracts.ActionVersion `json:"action"`
+	InstalledAt time.Time               `json:"installedAt"`
+	Revision    uint64                  `json:"revision"`
+}
+
+type ListRequest struct {
+	NamespaceID string
+	After       string
+	Limit       int
+}
+
+type Page struct {
+	Items      []Metadata `json:"items"`
+	NextCursor string     `json:"nextCursor,omitempty"`
+}
+
 func New(durable store.Store) (*Catalog, error) {
 	if durable == nil {
 		return nil, errors.New("Action catalog durable store is required")
@@ -175,6 +196,84 @@ func (catalog *Catalog) ResolveAction(ctx context.Context, namespaceID string, r
 		return contracts.ActionVersion{}, contracts.WorkflowDefinition{}, err
 	}
 	return record.Action, record.Definition, nil
+}
+
+// Get returns one exact immutable catalog record. There are deliberately no
+// latest-version, branch, alias, or partial-identity lookup semantics.
+func (catalog *Catalog) Get(ctx context.Context, namespaceID string, ref contracts.ActionRef) (Record, error) {
+	if catalog == nil || catalog.store == nil || ctx == nil {
+		return Record{}, errors.New("Action catalog is unavailable")
+	}
+	key, err := recordKey(namespaceID, ref)
+	if err != nil {
+		return Record{}, err
+	}
+	stored, err := catalog.store.GetAggregate(ctx, key)
+	if err != nil {
+		return Record{}, err
+	}
+	return decodeRecord(stored, namespaceID, ref)
+}
+
+// List exposes a stable, bounded namespace projection. The durable cursor is
+// opaque to callers and advances across every scanned catalog aggregate, not
+// merely returned matches, so interleaved namespaces cannot duplicate or skip
+// records between pages.
+func (catalog *Catalog) List(ctx context.Context, request ListRequest) (Page, error) {
+	if catalog == nil || catalog.store == nil || ctx == nil {
+		return Page{}, errors.New("Action catalog is unavailable")
+	}
+	if !contracts.ValidIdentifier(request.NamespaceID) || request.Limit <= 0 || request.Limit > 1000 ||
+		(request.After != "" && !contracts.ValidIdentifier(request.After)) {
+		return Page{}, errors.New("Action catalog namespace, cursor, or limit is invalid")
+	}
+	page := Page{Items: make([]Metadata, 0, request.Limit)}
+	cursor := request.After
+	for len(page.Items) < request.Limit {
+		remaining := request.Limit - len(page.Items)
+		scanLimit := remaining * 4
+		if scanLimit < 100 {
+			scanLimit = 100
+		}
+		if scanLimit > 1000 {
+			scanLimit = 1000
+		}
+		records, err := catalog.store.ListAggregates(ctx, aggregateType, cursor, scanLimit)
+		if err != nil {
+			return Page{}, err
+		}
+		if len(records) == 0 {
+			page.NextCursor = ""
+			break
+		}
+		for _, stored := range records {
+			cursor = stored.Key.ID
+			var candidate Record
+			if canonicaljson.UnmarshalStrict(stored.Payload, &candidate) != nil {
+				return Page{}, errors.New("durable exact Action record is invalid")
+			}
+			if candidate.NamespaceID != request.NamespaceID {
+				continue
+			}
+			decoded, decodeErr := decodeRecord(stored, candidate.NamespaceID, candidate.Action.Ref())
+			if decodeErr != nil {
+				return Page{}, decodeErr
+			}
+			page.Items = append(page.Items, Metadata{
+				NamespaceID: decoded.NamespaceID, Action: decoded.Action,
+				InstalledAt: decoded.InstalledAt, Revision: decoded.Revision,
+			})
+			if len(page.Items) == request.Limit {
+				page.NextCursor = cursor
+				return page, nil
+			}
+		}
+		if len(records) < scanLimit {
+			page.NextCursor = ""
+			break
+		}
+	}
+	return page, nil
 }
 
 func validateExactAction(version contracts.ActionVersion, definition contracts.WorkflowDefinition) error {
