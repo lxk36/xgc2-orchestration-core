@@ -28,10 +28,15 @@ The standard-library-only Go kernel currently provides:
 - prepare-before-mutate Effect state, fenced Command envelopes, immutable
   Receipt ledgers, explicit uncertainty, and independent compensation;
 - durable outbox/reconcile/cleanup intents as reducer output, without doing I/O.
+- a durability port plus a locked, checksummed, fsynced local file adapter with
+  command replay, revision CAS, inbox dedupe, expiring intent leases, and crash
+  tail recovery;
+- an intent worker that requires explicit complete/retry/dead/leave results and
+  never treats uncertain external effects as automatically retryable.
 
-The kernel is not a Controller or worker runtime. It does not yet provide persistence,
-durable queues, process supervision, remote execution, a Studio, HTTP APIs, or
-container deployment.
+The repository does not yet provide process supervision, remote execution, a
+Studio, HTTP APIs, or container deployment. The file store is for a single
+local controller; public-server HA storage is a separate adapter.
 
 ## Verify
 
@@ -55,6 +60,8 @@ It compiles using only this repository.
 | Typed bindings and namespace rules | `spec/value-expression/v1`, `kernel/expression` |
 | Product-neutral DAG definition | `spec/workflow-definition/v1`, `kernel/workflow` |
 | Run, Invocation, Attempt, Effect, Command, Receipt | `spec/orchestration-state/v1`, `kernel/execution`, `kernel/effect` |
+| Atomic state/event/intent persistence | `durable/store`, `durable/filestore` |
+| Fenced intent draining | `durable/worker` |
 | Language-facing contract types | `sdk/go/contracts` |
 | Cross-cutting acceptance gates | `conformance/architecture`, `conformance/fixtures` |
 
