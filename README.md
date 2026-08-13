@@ -37,7 +37,10 @@ The standard-library-only Go kernel currently provides:
   provider observation, and exact ownership-graph closure facts;
 - a Linux local-process provider with process groups, PID/start-time reuse
   protection, TERM/KILL/reap control, generation high-water fencing, and
-  immutable receipts.
+  immutable receipts;
+- a sealed Node registry, descriptor/request/result protocol, declarative
+  Effect proposal boundary, explicit capability grants, structured output, and
+  reusable node-pack conformance suite.
 
 The repository does not yet provide remote execution, a Studio, HTTP APIs, or
 container deployment. The file store and local-process provider are for a
@@ -69,6 +72,8 @@ It compiles using only this repository.
 | Fenced intent draining | `durable/worker` |
 | Runtime ownership and Run closure | `kernel/runtime`, `kernel/ownership` |
 | Managed process provider port/reference | `provider/process`, `provider/processlocal` |
+| User-extensible Node protocol and SDK | `spec/node-protocol/v1`, `kernel/node`, `sdk/go/node` |
+| Independent pack acceptance | `conformance/nodepack` |
 | Language-facing contract types | `sdk/go/contracts` |
 | Cross-cutting acceptance gates | `conformance/architecture`, `conformance/fixtures` |
 

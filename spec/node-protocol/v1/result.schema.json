@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/node-protocol/v1/result.schema.json",
+  "title": "XGC NodeResult v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "evidenceDigest"],
+  "properties": {
+    "status": { "enum": ["succeeded", "waiting", "failed"] }, "output": { "type": "object" }, "outputDigest": { "$ref": "#/$defs/digest" },
+    "outputArtifactRef": { "$ref": "#/$defs/identifier" },
+    "effects": { "type": "array", "items": { "$ref": "#/$defs/effect" } },
+    "wait": { "$ref": "#/$defs/wait" }, "failure": { "$ref": "#/$defs/failure" }, "evidenceDigest": { "$ref": "#/$defs/digest" }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "typeRef": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*/v[1-9][0-9]*$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "failure": {
+      "type": "object", "additionalProperties": false, "required": ["class", "code", "message"],
+      "properties": { "class": { "enum": ["transient", "permanent", "canceled", "uncertain"] }, "code": { "$ref": "#/$defs/identifier" }, "message": { "type": "string", "minLength": 1, "maxLength": 4096 }, "evidenceRef": { "$ref": "#/$defs/identifier" } }
+    },
+    "effect": {
+      "type": "object", "additionalProperties": false,
+      "required": ["effectKey", "kind", "targetRef", "intentSchemaDigest", "intentDigest", "ownership", "compensationPolicy", "policyDigest", "deadline"],
+      "properties": {
+        "effectKey": { "$ref": "#/$defs/identifier" }, "kind": { "$ref": "#/$defs/typeRef" }, "targetRef": { "$ref": "#/$defs/identifier" },
+        "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
+        "ownership": { "enum": ["owned", "attached", "shared"] }, "compensationPolicy": { "enum": ["none", "required", "best-effort"] },
+        "requiredCapabilityRefs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } }, "policyDigest": { "$ref": "#/$defs/digest" }, "deadline": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "wait": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "subjectRef", "conditionDigest"],
+      "properties": { "kind": { "enum": ["timer", "event", "approval", "effect"] }, "subjectRef": { "$ref": "#/$defs/identifier" }, "conditionDigest": { "$ref": "#/$defs/digest" }, "expiresAt": { "$ref": "#/$defs/timestamp" } }
+    }
+  }
+}

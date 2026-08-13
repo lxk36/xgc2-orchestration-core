@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/node-protocol/v1/invocation.schema.json",
+  "title": "XGC NodeInvocationRequest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["invocationId", "runId", "nodeId", "typeRef", "descriptorDigest", "attemptId", "attemptOrdinal", "input", "inputDigest", "deadline", "requestedAt"],
+  "properties": {
+    "invocationId": { "$ref": "#/$defs/identifier" }, "runId": { "$ref": "#/$defs/identifier" }, "nodeId": { "$ref": "#/$defs/identifier" },
+    "typeRef": { "$ref": "#/$defs/typeRef" }, "descriptorDigest": { "$ref": "#/$defs/digest" }, "attemptId": { "$ref": "#/$defs/identifier" },
+    "attemptOrdinal": { "type": "integer", "minimum": 1 }, "input": { "type": "object" }, "inputDigest": { "$ref": "#/$defs/digest" },
+    "capabilityGrants": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["capabilityRef", "scope", "handleRef", "authorizationDigest", "expiresAt"],
+        "properties": {
+          "capabilityRef": { "$ref": "#/$defs/identifier" }, "scope": { "$ref": "#/$defs/identifier" }, "handleRef": { "$ref": "#/$defs/identifier" },
+          "authorizationDigest": { "$ref": "#/$defs/digest" }, "expiresAt": { "$ref": "#/$defs/timestamp" }
+        }
+      }
+    },
+    "deadline": { "$ref": "#/$defs/timestamp" }, "requestedAt": { "$ref": "#/$defs/timestamp" }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "typeRef": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*/v[1-9][0-9]*$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time" }
+  }
+}

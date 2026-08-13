@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://xgc.dev/spec/node-protocol/v1/descriptor.schema.json",
+  "title": "XGC NodeDescriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "typeRef", "displayName", "packageRef", "packageDigest", "descriptorDigest", "inputSchema", "outputSchema", "mode", "determinism", "maxInputBytes", "maxOutputBytes"],
+  "properties": {
+    "schemaVersion": { "const": "xgc.node-descriptor/v1" },
+    "typeRef": { "$ref": "#/$defs/typeRef" },
+    "displayName": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "packageRef": { "$ref": "#/$defs/identifier" },
+    "packageDigest": { "$ref": "#/$defs/digest" },
+    "descriptorDigest": { "$ref": "#/$defs/digest" },
+    "inputSchema": { "$ref": "https://xgc.dev/spec/workflow-definition/v1/schema.json#/$defs/objectSchema" },
+    "outputSchema": { "$ref": "https://xgc.dev/spec/workflow-definition/v1/schema.json#/$defs/objectSchema" },
+    "mode": { "enum": ["pure", "effectful", "waiting"] },
+    "determinism": { "enum": ["deterministic", "recorded"] },
+    "requiredCapabilities": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["capabilityRef", "scope"],
+        "properties": { "capabilityRef": { "$ref": "#/$defs/identifier" }, "scope": { "$ref": "#/$defs/identifier" }, "optional": { "type": "boolean" } }
+      }
+    },
+    "allowedEffectKinds": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/typeRef" } },
+    "compensationTypeRef": { "$ref": "#/$defs/typeRef" },
+    "maxInputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 },
+    "maxOutputBytes": { "type": "integer", "minimum": 1, "maximum": 1048576 }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z][A-Za-z0-9._-]*$" },
+    "typeRef": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]*/v[1-9][0-9]*$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

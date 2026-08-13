@@ -212,6 +212,9 @@ func TestPublishedSchemasAreStrictJSON(t *testing.T) {
 		{"spec", "value-expression", "v1", "schema.json"},
 		{"spec", "workflow-definition", "v1", "schema.json"},
 		{"spec", "orchestration-state", "v1", "schema.json"},
+		{"spec", "node-protocol", "v1", "descriptor.schema.json"},
+		{"spec", "node-protocol", "v1", "invocation.schema.json"},
+		{"spec", "node-protocol", "v1", "result.schema.json"},
 	}
 	for _, segments := range paths {
 		if _, err := canonicaljson.Canonicalize(readFixture(t, segments...)); err != nil {
