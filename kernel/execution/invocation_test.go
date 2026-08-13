@@ -106,6 +106,58 @@ func TestInvocationWaitResolvesAfterOriginalWorkerLeaseExpires(t *testing.T) {
 	}
 }
 
+func TestRunTerminationCancelsWaitingInvocationWithoutPrivateLease(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 12, 45, 0, 0, time.UTC)
+	ledger := activateTestInvocation(t, "run-stop-wait", "launch", t0)
+	claimed, err := ClaimInvocation(ledger, ClaimInvocationCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		Phase: contracts.AttemptExecution, OwnerRef: "worker-1", LeaseToken: "private-worker-token",
+		LeaseExpiresAt: t0.Add(time.Hour), CommandID: "claim-stop-wait", At: t0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := claimed.Ledger.Attempts[0]
+	waiting, err := TransitionInvocation(claimed.Ledger, TransitionInvocationCommand{
+		Fence: AttemptFence{
+			InvocationID: claimed.Ledger.Invocation.InvocationID, InvocationRevision: claimed.Ledger.Invocation.Revision,
+			AttemptID: attempt.AttemptID, AttemptRevision: attempt.Revision,
+			LeaseToken: "private-worker-token", At: t0.Add(2 * time.Second),
+		},
+		To: contracts.InvocationWaiting, AttemptTo: contracts.AttemptWaiting,
+		WaitRef: "process-start", WaitGeneration: 1, CommandID: "wait-process-start",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := CancelInvocation(waiting.Ledger, CancelInvocationCommand{
+		InvocationID:     waiting.Ledger.Invocation.InvocationID,
+		ExpectedRevision: waiting.Ledger.Invocation.Revision,
+		RunID:            "run-stop-wait", RunRevision: 4, TerminationCommandID: "stop-run-command",
+		CommandID: "cancel-waiting-invocation", At: t0.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.Ledger.Invocation.Status != contracts.InvocationCanceled ||
+		canceled.Ledger.Invocation.ActiveAttemptID != "" || canceled.Ledger.Invocation.CurrentWaitRef != "" ||
+		canceled.Ledger.Attempts[0].Status != contracts.AttemptCanceled ||
+		!canceled.Ledger.Attempts[0].LeaseExpiresAt.IsZero() {
+		t.Fatalf("canceled waiting ledger = %#v", canceled.Ledger)
+	}
+	staleFence := AttemptFence{
+		InvocationID: waiting.Ledger.Invocation.InvocationID, InvocationRevision: waiting.Ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, AttemptRevision: waiting.Ledger.Attempts[0].Revision,
+		LeaseToken: "private-worker-token", At: t0.Add(4 * time.Second),
+	}
+	if _, err := TransitionInvocation(canceled.Ledger, TransitionInvocationCommand{
+		Fence: staleFence, To: contracts.InvocationSucceeded, AttemptTo: contracts.AttemptSucceeded,
+		OutputRefsDigest: testDigest, CommandID: "late-worker-success",
+	}); !errors.Is(err, ErrRevisionConflict) && !errors.Is(err, ErrLeaseConflict) {
+		t.Fatalf("late worker result error = %v", err)
+	}
+}
+
 func TestInvocationRetryFreezesInputsAndRejectsExpiredLease(t *testing.T) {
 	t0 := time.Date(2026, 8, 12, 13, 0, 0, 0, time.UTC)
 	ledger := activateTestInvocation(t, "run-retry", "launch", t0)

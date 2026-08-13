@@ -106,6 +106,19 @@ type ResolveUnleasedInvocationCommand struct {
 	At               time.Time
 }
 
+// CancelInvocationCommand is fenced by the already-persisted Run termination
+// intent rather than by a worker's private attempt lease. Aggregate CAS makes
+// a late worker result lose to cancellation without exposing the lease token.
+type CancelInvocationCommand struct {
+	InvocationID         string
+	ExpectedRevision     uint64
+	RunID                string
+	RunRevision          uint64
+	TerminationCommandID string
+	CommandID            string
+	At                   time.Time
+}
+
 type ScheduleInvocationCompensationCommand struct {
 	InvocationID     string
 	ExpectedRevision uint64
@@ -556,6 +569,78 @@ func ResolveUnleasedInvocation(current contracts.InvocationLedger, command Resol
 	}
 	event, err := newEvent("invocation", next.Invocation.InvocationID, next.Invocation.Revision, "invocation."+string(command.To), command.CommandID, command.At, map[string]any{
 		"from": invocation.Status, "to": command.To, "leased": false,
+	})
+	if err != nil {
+		return InvocationDecision{}, err
+	}
+	return InvocationDecision{Ledger: next, Events: []contracts.DomainEvent{event}}, nil
+}
+
+func CancelInvocation(current contracts.InvocationLedger, command CancelInvocationCommand) (InvocationDecision, error) {
+	if err := ValidateInvocationLedger(current); err != nil {
+		return InvocationDecision{}, err
+	}
+	invocation := current.Invocation
+	if command.InvocationID != invocation.InvocationID || command.ExpectedRevision != invocation.Revision ||
+		command.RunID != invocation.RunID {
+		return InvocationDecision{}, ErrRevisionConflict
+	}
+	if invocation.Status.Terminal() {
+		return InvocationDecision{}, fmt.Errorf("%w: terminal invocation cannot be canceled", ErrInvalidTransition)
+	}
+	if command.RunRevision == 0 || command.At.IsZero() || command.At.Before(invocation.UpdatedAt) {
+		return InvocationDecision{}, errors.New("invocation cancellation fence or time is invalid")
+	}
+	if err := validateIdentity(command.TerminationCommandID, "run termination command id"); err != nil {
+		return InvocationDecision{}, err
+	}
+	if err := validateIdentity(command.CommandID, "invocation cancellation command id"); err != nil {
+		return InvocationDecision{}, err
+	}
+
+	next := cloneLedger(current)
+	if next.Invocation.ActiveAttemptID != "" {
+		found := false
+		for index := range next.Attempts {
+			attempt := &next.Attempts[index]
+			if attempt.AttemptID != next.Invocation.ActiveAttemptID {
+				continue
+			}
+			if attempt.Status.Terminal() {
+				return InvocationDecision{}, ErrLeaseConflict
+			}
+			attempt.Status = contracts.AttemptCanceled
+			attempt.LeaseExpiresAt = time.Time{}
+			attempt.UpdatedAt = command.At.UTC()
+			attempt.Revision++
+			finished := command.At.UTC()
+			attempt.FinishedAt = &finished
+			found = true
+			break
+		}
+		if !found {
+			return InvocationDecision{}, ErrLeaseConflict
+		}
+	}
+	next.Invocation.Status = contracts.InvocationCanceled
+	next.Invocation.ActiveAttemptID = ""
+	next.Invocation.CurrentWaitRef = ""
+	next.Invocation.WaitGeneration = 0
+	next.Invocation.NextAttemptAt = nil
+	next.Invocation.PrimaryFailure = nil
+	if next.Invocation.CompensationStatus == contracts.CompensationUnscheduled {
+		next.Invocation.CompensationStatus = contracts.CompensationCanceled
+	}
+	next.Invocation.UpdatedAt = command.At.UTC()
+	next.Invocation.Revision++
+	finished := command.At.UTC()
+	next.Invocation.FinishedAt = &finished
+	if err := ValidateInvocationLedger(next); err != nil {
+		return InvocationDecision{}, err
+	}
+	event, err := newEvent("invocation", next.Invocation.InvocationID, next.Invocation.Revision, "invocation.canceled", command.CommandID, command.At, map[string]any{
+		"runId": command.RunID, "runRevision": command.RunRevision,
+		"terminationCommandId": command.TerminationCommandID,
 	})
 	if err != nil {
 		return InvocationDecision{}, err

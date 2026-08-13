@@ -25,6 +25,9 @@ The standard-library-only Go kernel currently provides:
 - deterministic Run, Invocation, and append-only Attempt reducers;
 - mandatory stopping and ownership-closure proof before failed, canceled, or
   stopped Run termination;
+- exact durable Run termination with revision CAS and command replay, including
+  pre-dispatch Effect cancellation, late worker/result fencing, child
+  propagation, and restart-resumable reverse compensation;
 - prepare-before-mutate Effect state, fenced Command envelopes, immutable
   Receipt ledgers, explicit uncertainty, and independent compensation;
 - durable outbox/reconcile/cleanup intents as reducer output, without doing I/O;
@@ -85,7 +88,7 @@ It compiles using only this repository.
 | Normalized ingress evidence | `spec/trigger-event/v1` |
 | Typed bindings and namespace rules | `spec/value-expression/v1`, `kernel/expression` |
 | Product-neutral DAG definition | `spec/workflow-definition/v1`, `kernel/workflow` |
-| Run, Invocation, Attempt, Effect, Command, Receipt | `spec/orchestration-state/v1`, `kernel/execution`, `kernel/effect` |
+| Run, Invocation, Attempt, Effect, Command, Receipt, exact termination | `spec/orchestration-state/v1`, `kernel/execution`, `kernel/effect`, `controller/termination.go` |
 | Atomic state/event/intent persistence | `durable/store`, `durable/filestore` |
 | Fenced intent draining | `durable/worker` |
 | Runtime ownership and Run closure | `kernel/runtime`, `kernel/ownership` |

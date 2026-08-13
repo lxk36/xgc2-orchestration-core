@@ -158,6 +158,31 @@ func TestDetachedEffectCannotClaimCompensation(t *testing.T) {
 	}
 }
 
+func TestCancelPreparedEffectNeverInventsProviderOutcome(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 10, 30, 0, 0, time.UTC)
+	prepared := prepareTestEffect(t, t0, contracts.CompensationRequired)
+	canceled, err := CancelPrepared(prepared, CancelPreparedCommand{
+		EffectID: prepared.EffectID, ExpectedRevision: prepared.Revision,
+		CommandID: "cancel-before-outbox", At: t0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canceled.Effect.State != contracts.EffectCanceled ||
+		canceled.Effect.CompensationState != contracts.EffectCompensationCanceled ||
+		canceled.Effect.CommandID != "" || canceled.Effect.ApplyingAt != nil ||
+		canceled.Effect.PrimaryTerminalAt == nil || len(canceled.Intents) != 0 {
+		t.Fatalf("canceled prepared effect = %#v", canceled.Effect)
+	}
+	envelope := testEnvelope(t, prepared.Intent, "late-begin", "late-key", "late-token", t0.Add(time.Minute))
+	if _, err := Begin(canceled.Effect, BeginCommand{
+		EffectID: canceled.Effect.EffectID, ExpectedRevision: canceled.Effect.Revision,
+		Envelope: envelope, CommandID: envelope.CommandID, At: t0.Add(2 * time.Second),
+	}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("late begin after cancellation error = %v", err)
+	}
+}
+
 func prepareTestEffect(t *testing.T, at time.Time, policy contracts.CompensationPolicy) contracts.EffectRecord {
 	t.Helper()
 	effectID, err := StableEffectID("invocation-1", "start-simulator")

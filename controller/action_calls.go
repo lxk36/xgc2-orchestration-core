@@ -242,6 +242,11 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 	if err != nil || parent.Status.Terminal() {
 		return parent, err
 	}
+	// A child result arriving after the parent froze a termination intent cannot
+	// resume or fail the canceled parent Invocation.
+	if parent.Status == contracts.RunStopping {
+		return parent, nil
+	}
 	if parent.Status != contracts.RunWaiting || parent.RootRunID != child.RootRunID ||
 		parent.NamespaceID != child.NamespaceID {
 		return contracts.Run{}, errors.New("child Action parent is not the matching waiting Run")

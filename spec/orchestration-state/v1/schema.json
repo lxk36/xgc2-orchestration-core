@@ -110,7 +110,7 @@
         "effectId": { "$ref": "#/$defs/identifier" }, "namespaceId": { "$ref": "#/$defs/identifier" }, "runId": { "$ref": "#/$defs/identifier" }, "invocationId": { "$ref": "#/$defs/identifier" },
         "preparedAttemptId": { "$ref": "#/$defs/identifier" }, "effectKey": { "$ref": "#/$defs/identifier" }, "kind": { "$ref": "#/$defs/typeRef" }, "targetRef": { "$ref": "#/$defs/identifier" },
         "intentSchemaDigest": { "$ref": "#/$defs/digest" }, "intent": { "type": "object" }, "intentDigest": { "$ref": "#/$defs/digest" }, "intentArtifactRef": { "$ref": "#/$defs/identifier" },
-        "ownership": { "enum": ["owned", "attached", "shared"] }, "compensationPolicy": { "enum": ["none", "required", "best-effort"] },
+        "ownership": { "enum": ["owned", "attached", "shared", "detached"] }, "compensationPolicy": { "enum": ["none", "required", "best-effort"] },
         "requiredCapabilityRefs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/identifier" } },
         "policyDigest": { "$ref": "#/$defs/digest" }, "descriptorDigest": { "$ref": "#/$defs/digest" }, "deadline": { "$ref": "#/$defs/timestamp" }
       }
@@ -120,11 +120,11 @@
       "required": ["effectId", "intent", "preparationDigest", "state", "compensationState", "compensationAttemptCount", "preparedAt", "updatedAt", "revision"],
       "properties": {
         "effectId": { "$ref": "#/$defs/identifier" }, "intent": { "$ref": "#/$defs/effectIntent" }, "preparationDigest": { "$ref": "#/$defs/digest" },
-        "state": { "enum": ["prepared", "applying", "applied", "failed", "uncertain"] }, "commandId": { "$ref": "#/$defs/identifier" }, "commandIdentityDigest": { "$ref": "#/$defs/digest" },
+        "state": { "enum": ["prepared", "applying", "applied", "failed", "uncertain", "canceled"] }, "commandId": { "$ref": "#/$defs/identifier" }, "commandIdentityDigest": { "$ref": "#/$defs/digest" },
         "externalIdentity": { "$ref": "#/$defs/identifier" }, "resultDigest": { "$ref": "#/$defs/digest" }, "resultArtifactRef": { "$ref": "#/$defs/identifier" }, "primaryFailure": { "$ref": "#/$defs/failure" },
         "compensationState": { "enum": ["not-required", "unscheduled", "pending", "running", "retry-wait", "succeeded", "failed", "canceled"] },
         "compensationAttemptCount": { "type": "integer", "minimum": 0 }, "compensationCommandId": { "$ref": "#/$defs/identifier" }, "compensationFailure": { "$ref": "#/$defs/failure" }, "compensationNextAttemptAt": { "$ref": "#/$defs/timestamp" },
-        "preparedAt": { "$ref": "#/$defs/timestamp" }, "applyingAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalAt": { "$ref": "#/$defs/timestamp" },
+        "preparedAt": { "$ref": "#/$defs/timestamp" }, "applyingAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalRevision": { "type": "integer", "minimum": 1 },
         "compensationStartedAt": { "$ref": "#/$defs/timestamp" }, "compensationFinishedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
       }
     },

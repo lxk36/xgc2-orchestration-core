@@ -90,6 +90,7 @@ func NewCoordinator(config CoordinatorConfig) (*Coordinator, error) {
 	kinds := make(map[string]struct{}, len(config.Adapters))
 	handlers := map[contracts.DurableIntentKind]worker.Handler{
 		contracts.IntentChildResolution: children,
+		contracts.IntentCleanup:         InternalCleanupHandler{},
 	}
 	if len(config.Adapters) != 0 {
 		if config.Planner == nil || config.Credentials == nil {
@@ -154,11 +155,23 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 			return run, nil
 		}
 		if errors.Is(driveErr, ErrRunClosureOpen) {
-			batch, cleanupErr := coordinator.runBatch(ctx, contracts.IntentCleanup, "cleanup")
-			if cleanupErr != nil {
-				return run, cleanupErr
+			progress := 0
+			for _, item := range []struct {
+				kind  contracts.DurableIntentKind
+				phase string
+			}{
+				{contracts.IntentOutbox, "stopping-outbox"},
+				{contracts.IntentWaitResolution, "stopping-wait"},
+				{contracts.IntentChildResolution, "stopping-child"},
+				{contracts.IntentCleanup, "cleanup"},
+			} {
+				batch, batchErr := coordinator.runBatch(ctx, item.kind, item.phase)
+				if batchErr != nil {
+					return run, batchErr
+				}
+				progress += batch.Claimed
 			}
-			if batch.Claimed == 0 {
+			if progress == 0 {
 				return run, driveErr
 			}
 			continue

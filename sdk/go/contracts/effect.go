@@ -39,11 +39,15 @@ const (
 	EffectApplied   EffectState = "applied"
 	EffectFailed    EffectState = "failed"
 	EffectUncertain EffectState = "uncertain"
+	// EffectCanceled is a prepared intent that was durably canceled before a
+	// provider command entered the outbox. It is terminal and therefore cannot
+	// be confused with an applying command whose outcome requires observation.
+	EffectCanceled EffectState = "canceled"
 )
 
 func (state EffectState) Valid() bool {
 	switch state {
-	case EffectPrepared, EffectApplying, EffectApplied, EffectFailed, EffectUncertain:
+	case EffectPrepared, EffectApplying, EffectApplied, EffectFailed, EffectUncertain, EffectCanceled:
 		return true
 	default:
 		return false
@@ -51,7 +55,7 @@ func (state EffectState) Valid() bool {
 }
 
 func (state EffectState) Terminal() bool {
-	return state == EffectApplied || state == EffectFailed || state == EffectUncertain
+	return state == EffectApplied || state == EffectFailed || state == EffectUncertain || state == EffectCanceled
 }
 
 type EffectCompensationState string
@@ -123,10 +127,13 @@ type EffectRecord struct {
 	PreparedAt               time.Time               `json:"preparedAt"`
 	ApplyingAt               *time.Time              `json:"applyingAt,omitempty"`
 	PrimaryTerminalAt        *time.Time              `json:"primaryTerminalAt,omitempty"`
-	CompensationStartedAt    *time.Time              `json:"compensationStartedAt,omitempty"`
-	CompensationFinishedAt   *time.Time              `json:"compensationFinishedAt,omitempty"`
-	UpdatedAt                time.Time               `json:"updatedAt"`
-	Revision                 uint64                  `json:"revision"`
+	// PrimaryTerminalRevision pins the Effect revision that emitted its wait
+	// resolution intent. Zero remains readable for older compatible v1 records.
+	PrimaryTerminalRevision uint64     `json:"primaryTerminalRevision,omitempty"`
+	CompensationStartedAt   *time.Time `json:"compensationStartedAt,omitempty"`
+	CompensationFinishedAt  *time.Time `json:"compensationFinishedAt,omitempty"`
+	UpdatedAt               time.Time  `json:"updatedAt"`
+	Revision                uint64     `json:"revision"`
 }
 
 type FenceKind string

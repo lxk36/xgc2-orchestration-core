@@ -240,6 +240,24 @@ func deadIntent(code, message string) worker.Result {
 var _ worker.Handler = (*EffectOutboxHandler)(nil)
 var _ worker.Handler = (*WaitResolutionHandler)(nil)
 
+// InternalCleanupHandler acknowledges Run/Invocation cleanup scheduling
+// signals that contain no provider Effect. It never consumes Effect cleanup;
+// a coordinator without a conforming compensator must leave that work for a
+// capable host.
+type InternalCleanupHandler struct{}
+
+func (InternalCleanupHandler) Handle(_ context.Context, claimed store.ClaimedIntent) worker.Result {
+	if claimed.Record.Intent.Kind != contracts.IntentCleanup {
+		return deadIntent("cleanup.kind", "claimed intent is not cleanup work")
+	}
+	if effectID, _ := claimed.Record.Intent.Payload["effectId"].(string); effectID != "" {
+		return worker.Result{Disposition: worker.Leave}
+	}
+	return worker.Result{Disposition: worker.Complete}
+}
+
+var _ worker.Handler = InternalCleanupHandler{}
+
 type EffectCleanupHandler struct {
 	controller *Controller
 	planner    EffectCompensationPlanner
@@ -320,7 +338,7 @@ func (handler *EffectCleanupHandler) Handle(ctx context.Context, claimed store.C
 	envelope.IdempotencyKey = credentials.IdempotencyKey
 	envelope.CapabilityToken = credentials.CapabilityToken
 	now := handler.controller.clock.Now().UTC()
-	if err := effect.ValidateEnvelope(envelope); err != nil || !envelope.Deadline.After(now) {
+	if err := effect.ValidatePrivateEnvelopeTokens(envelope); err != nil || !envelope.Deadline.After(now) {
 		if err == nil {
 			err = errors.New("compensation command deadline has elapsed")
 		}

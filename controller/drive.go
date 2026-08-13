@@ -50,7 +50,7 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 		case contracts.RunWaiting:
 			return run, ErrRunWaiting
 		case contracts.RunStopping:
-			return controller.finalizeFailedRun(ctx, runRecord, run, now)
+			return controller.finalizeStoppingRun(ctx, runRecord, run, now)
 		case contracts.RunRunning:
 		default:
 			return contracts.Run{}, fmt.Errorf("unsupported run status %q", run.Status)

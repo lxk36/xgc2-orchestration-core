@@ -51,6 +51,16 @@ type ReconcileCommand struct {
 	At               time.Time
 }
 
+// CancelPreparedCommand closes an Effect that has not crossed the provider
+// boundary. Applying Effects deliberately cannot use this transition: their
+// outcome must still be observed or reconciled before ownership can close.
+type CancelPreparedCommand struct {
+	EffectID         string
+	ExpectedRevision uint64
+	CommandID        string
+	At               time.Time
+}
+
 type CompensationCommand struct {
 	EffectID              string
 	ExpectedRevision      uint64
@@ -139,6 +149,46 @@ func ReplayPrepare(existing contracts.EffectRecord, command PrepareCommand) (Dec
 	return Decision{Effect: cloneRecord(existing)}, nil
 }
 
+func CancelPrepared(current contracts.EffectRecord, command CancelPreparedCommand) (Decision, error) {
+	if err := ValidateRecord(current); err != nil {
+		return Decision{}, fmt.Errorf("current effect: %w", err)
+	}
+	if command.EffectID != current.EffectID || command.ExpectedRevision != current.Revision {
+		return Decision{}, ErrRevisionConflict
+	}
+	if current.State != contracts.EffectPrepared {
+		return Decision{}, fmt.Errorf("%w: only a prepared effect can be canceled without provider evidence", ErrInvalidTransition)
+	}
+	if err := validateIdentity(command.CommandID, "effect cancellation command id"); err != nil {
+		return Decision{}, err
+	}
+	if command.At.IsZero() || command.At.Before(current.UpdatedAt) {
+		return Decision{}, errors.New("effect cancellation time is missing or moves backwards")
+	}
+	next := cloneRecord(current)
+	next.State = contracts.EffectCanceled
+	if next.Intent.CompensationPolicy != contracts.CompensationNone {
+		next.CompensationState = contracts.EffectCompensationCanceled
+		finished := command.At.UTC()
+		next.CompensationFinishedAt = &finished
+	}
+	terminal := command.At.UTC()
+	next.PrimaryTerminalAt = &terminal
+	next.UpdatedAt = terminal
+	next.Revision++
+	next.PrimaryTerminalRevision = next.Revision
+	if err := ValidateRecord(next); err != nil {
+		return Decision{}, err
+	}
+	event, err := newEvent(next, "effect.canceled", command.CommandID, command.At, map[string]any{
+		"from": current.State, "to": next.State,
+	})
+	if err != nil {
+		return Decision{}, err
+	}
+	return Decision{Effect: next, Events: []contracts.DomainEvent{event}}, nil
+}
+
 // Begin moves a prepared or explicitly retryable failed effect to applying and
 // emits its command into a durable outbox. It never invokes an adapter.
 func Begin(current contracts.EffectRecord, command BeginCommand) (Decision, error) {
@@ -175,6 +225,7 @@ func Begin(current contracts.EffectRecord, command BeginCommand) (Decision, erro
 	next.ResultArtifactRef = ""
 	next.PrimaryFailure = nil
 	next.PrimaryTerminalAt = nil
+	next.PrimaryTerminalRevision = 0
 	applying := command.At.UTC()
 	next.ApplyingAt = &applying
 	next.UpdatedAt = applying
@@ -254,6 +305,9 @@ func Observe(current contracts.EffectRecord, ledger contracts.CommandLedger, com
 		next.PrimaryTerminalAt = &terminal
 	default:
 		return Decision{}, ErrReceiptConflict
+	}
+	if receipt.Status.Terminal() {
+		next.PrimaryTerminalRevision = next.Revision
 	}
 	if err := ValidateRecord(next); err != nil {
 		return Decision{}, err
@@ -481,8 +535,12 @@ func ValidateRecord(record contracts.EffectRecord) error {
 		return errors.New("effect timestamps are invalid")
 	}
 	if record.State == contracts.EffectPrepared {
-		if record.CommandID != "" || record.CommandIdentityDigest != "" || record.ApplyingAt != nil || record.PrimaryTerminalAt != nil {
+		if record.CommandID != "" || record.CommandIdentityDigest != "" || record.ApplyingAt != nil || record.PrimaryTerminalAt != nil || record.PrimaryTerminalRevision != 0 {
 			return errors.New("prepared effect contains application state")
+		}
+	} else if record.State == contracts.EffectCanceled {
+		if record.CommandID != "" || record.CommandIdentityDigest != "" || record.ApplyingAt != nil || record.PrimaryTerminalAt == nil {
+			return errors.New("pre-dispatch canceled effect contains provider application state or lacks its terminal time")
 		}
 	} else {
 		if err := validateIdentity(record.CommandID, "effect command id"); err != nil {
@@ -501,6 +559,9 @@ func ValidateRecord(record contracts.EffectRecord) error {
 	if record.PrimaryTerminalAt != nil && (record.PrimaryTerminalAt.Before(record.PreparedAt) || record.PrimaryTerminalAt.After(record.UpdatedAt)) {
 		return errors.New("effect terminal time is outside its lifecycle")
 	}
+	if record.PrimaryTerminalRevision > record.Revision || (record.PrimaryTerminalRevision != 0 && !record.State.Terminal()) {
+		return errors.New("effect primary terminal revision is outside its lifecycle")
+	}
 	switch record.State {
 	case contracts.EffectApplied:
 		if !contracts.ValidDigest(record.ResultDigest) || record.PrimaryFailure != nil {
@@ -513,6 +574,10 @@ func ValidateRecord(record contracts.EffectRecord) error {
 	case contracts.EffectUncertain:
 		if err := validateFailure(record.PrimaryFailure, true); err != nil || record.PrimaryFailure.Class != contracts.FailureUncertain {
 			return errors.New("uncertain effect requires an uncertain failure")
+		}
+	case contracts.EffectCanceled:
+		if record.ResultDigest != "" || record.ResultArtifactRef != "" || record.ExternalIdentity != "" || record.PrimaryFailure != nil {
+			return errors.New("pre-dispatch canceled effect contains a provider observation")
 		}
 	default:
 		if record.ResultDigest != "" || record.ResultArtifactRef != "" || record.ExternalIdentity != "" || record.PrimaryFailure != nil {
@@ -537,19 +602,37 @@ func ValidateEnvelopeForIntent(envelope contracts.CommandEnvelope, intent contra
 	if envelope.Deadline.After(intent.Deadline) || !envelope.Deadline.After(at) {
 		return errors.New("command deadline exceeds the prepared effect deadline or has elapsed")
 	}
-	keyHash, err := execution.PrivateTokenDigest(envelope.IdempotencyKey)
-	if requirePrivate && (err != nil || keyHash != envelope.IdempotencyKeyHash) {
-		return errors.New("command idempotency key does not match its public hash")
-	}
 	if len(intent.RequiredCapabilityRefs) == 0 {
 		if envelope.CapabilityToken != "" || envelope.CapabilityTokenHash != "" {
 			return errors.New("command without capabilities carries a capability token")
 		}
-	} else if requirePrivate {
-		tokenHash, err := execution.PrivateTokenDigest(envelope.CapabilityToken)
-		if err != nil || tokenHash != envelope.CapabilityTokenHash {
-			return errors.New("command capability token does not match its public hash")
+	}
+	if requirePrivate {
+		return ValidatePrivateEnvelopeTokens(envelope)
+	}
+	return nil
+}
+
+// ValidatePrivateEnvelopeTokens proves that host-side credential rehydration
+// matches the immutable public hashes. It is used for both primary dispatch
+// and compensation; providers never receive substituted ambient credentials.
+func ValidatePrivateEnvelopeTokens(envelope contracts.CommandEnvelope) error {
+	if err := ValidateEnvelope(envelope); err != nil {
+		return err
+	}
+	keyHash, err := execution.PrivateTokenDigest(envelope.IdempotencyKey)
+	if err != nil || keyHash != envelope.IdempotencyKeyHash {
+		return errors.New("command idempotency key does not match its public hash")
+	}
+	if len(envelope.RequiredCapabilityRefs) == 0 {
+		if envelope.CapabilityToken != "" || envelope.CapabilityTokenHash != "" {
+			return errors.New("command without capabilities carries a capability token")
 		}
+		return nil
+	}
+	tokenHash, err := execution.PrivateTokenDigest(envelope.CapabilityToken)
+	if err != nil || tokenHash != envelope.CapabilityTokenHash {
+		return errors.New("command capability token does not match its public hash")
 	}
 	return nil
 }

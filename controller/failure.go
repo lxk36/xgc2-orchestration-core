@@ -112,9 +112,18 @@ func (controller *Controller) beginFailure(
 	return controller.Drive(ctx, run.RunID)
 }
 
-func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord store.AggregateRecord, run contracts.Run, at time.Time) (contracts.Run, error) {
-	if run.Termination == nil || run.Termination.PrimaryFailure == nil {
-		return contracts.Run{}, errors.New("stopping failed run lacks its termination failure")
+func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord store.AggregateRecord, run contracts.Run, at time.Time) (contracts.Run, error) {
+	if run.Termination == nil {
+		return contracts.Run{}, errors.New("stopping run lacks its durable termination intent")
+	}
+	if err := controller.terminateOpenChildren(ctx, run); err != nil {
+		return run, err
+	}
+	if err := controller.cancelOpenInvocations(ctx, run, at); err != nil {
+		return contracts.Run{}, err
+	}
+	if err := controller.cancelPreparedEffects(ctx, run, at); err != nil {
+		return contracts.Run{}, err
 	}
 	snapshot, _, err := controller.GetSnapshot(ctx, run.RunID)
 	if err != nil {
@@ -127,6 +136,15 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 	if scheduled {
 		return run, ErrRunClosureOpen
 	}
+	if run.Termination.Kind != contracts.TerminationFailed {
+		settled, settleErr := controller.terminationIntentsSettled(ctx, run, snapshot)
+		if settleErr != nil {
+			return contracts.Run{}, settleErr
+		}
+		if !settled {
+			return run, ErrRunClosureOpen
+		}
+	}
 	graph, closure, graphExpected, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
 		return contracts.Run{}, err
@@ -134,9 +152,10 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 	if !closure.Satisfied() {
 		return run, openClosureError(closure)
 	}
-	commandID := phaseCommand(run.RunID, "failed", run.Revision)
+	terminalStatus := terminalRunStatus(run.Termination.Kind)
+	commandID := phaseCommand(run.RunID, "terminal-"+string(terminalStatus), run.Revision)
 	decision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
-		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunFailed,
+		RunID: run.RunID, ExpectedRevision: run.Revision, To: terminalStatus,
 		Closure: closure, CleanupFailures: cleanupFailures,
 		CommandID: commandID, At: at,
 	})
@@ -162,6 +181,19 @@ func (controller *Controller) finalizeFailedRun(ctx context.Context, runRecord s
 		return contracts.Run{}, err
 	}
 	return decision.Run, nil
+}
+
+func terminalRunStatus(kind contracts.TerminationKind) contracts.RunStatus {
+	switch kind {
+	case contracts.TerminationFailed:
+		return contracts.RunFailed
+	case contracts.TerminationCanceled:
+		return contracts.RunCanceled
+	case contracts.TerminationStopped:
+		return contracts.RunStopped
+	default:
+		return ""
+	}
 }
 
 func (controller *Controller) succeedRun(

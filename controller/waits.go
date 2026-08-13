@@ -42,6 +42,12 @@ func (controller *Controller) ResolveEffectWait(ctx context.Context, effectID st
 	if run.Status.Terminal() {
 		return run, nil
 	}
+	// A durable Run termination owns the lifecycle now. The Invocation wait is
+	// canceled by the stopping driver; a late terminal provider Receipt remains
+	// evidence for compensation but must not resume the node or revive the Run.
+	if run.Status == contracts.RunStopping {
+		return run, nil
+	}
 	if run.Status != contracts.RunWaiting {
 		return contracts.Run{}, fmt.Errorf("run %s is %s instead of waiting", run.RunID, run.Status)
 	}
