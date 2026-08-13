@@ -155,6 +155,99 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 	return nil
 }
 
+func ValidateResumeRequest(descriptor contracts.NodeDescriptor, request contracts.NodeResumeRequest) error {
+	for label, value := range map[string]string{
+		"invocation id": request.InvocationID, "run id": request.RunID, "node id": request.NodeID,
+		"attempt id": request.AttemptID,
+	} {
+		if !contracts.ValidIdentifier(value) {
+			return fmt.Errorf("resume %s is invalid", label)
+		}
+	}
+	if request.TypeRef != descriptor.TypeRef || request.DescriptorDigest != descriptor.DescriptorDigest || request.AttemptOrdinal == 0 || request.RequestedAt.IsZero() {
+		return errors.New("node resume descriptor, ordinal, or time is invalid")
+	}
+	canonical, err := canonicaljson.Marshal(request.Input)
+	if err != nil || len(canonical) > descriptor.MaxInputBytes {
+		return errors.New("node resume input is invalid or exceeds descriptor bound")
+	}
+	digest, err := canonicaljson.Digest(canonical)
+	if err != nil || digest != request.InputDigest {
+		return errors.New("node resume input digest is invalid")
+	}
+	if err := descriptor.InputSchema.ValidateValue(request.Input); err != nil {
+		return fmt.Errorf("node resume input schema: %w", err)
+	}
+	resolution := request.Resolution
+	if !request.Wait.Kind.Valid() || !resolution.Kind.Valid() || request.Wait.Kind != resolution.Kind ||
+		request.Wait.SubjectRef != resolution.SubjectRef || request.Wait.ConditionDigest != resolution.ConditionDigest ||
+		!contracts.ValidIdentifier(resolution.SubjectRef) || !contracts.ValidDigest(resolution.ConditionDigest) ||
+		!resolution.Status.Valid() || resolution.ObservedAt.IsZero() {
+		return errors.New("node resume wait resolution does not match its durable wait")
+	}
+	if resolution.PayloadArtifactRef != "" && !contracts.ValidIdentifier(resolution.PayloadArtifactRef) {
+		return errors.New("node resume payload artifact ref is invalid")
+	}
+	switch resolution.Status {
+	case contracts.NodeWaitResolvedSucceeded:
+		if resolution.Payload == nil || resolution.Failure != nil {
+			return errors.New("successful wait resolution requires payload and no failure")
+		}
+		payloadDigest, err := canonicaljson.DigestValue(resolution.Payload)
+		if err != nil || payloadDigest != resolution.PayloadDigest {
+			return errors.New("wait resolution payload digest is invalid")
+		}
+	case contracts.NodeWaitResolvedFailed:
+		if resolution.Payload != nil || resolution.PayloadDigest != "" || resolution.PayloadArtifactRef != "" || resolution.Failure == nil {
+			return errors.New("failed wait resolution requires only a failure")
+		}
+		if !resolution.Failure.Class.Valid() || !contracts.ValidIdentifier(resolution.Failure.Code) || resolution.Failure.Message == "" {
+			return errors.New("wait resolution failure is invalid")
+		}
+	case contracts.NodeWaitResolvedCanceled:
+		if resolution.Payload != nil || resolution.PayloadDigest != "" || resolution.PayloadArtifactRef != "" || resolution.Failure != nil {
+			return errors.New("canceled wait resolution carries data")
+		}
+	}
+	return nil
+}
+
+func ValidateResumeResult(descriptor contracts.NodeDescriptor, result contracts.NodeResult) error {
+	if !result.Status.Valid() || !contracts.ValidDigest(result.EvidenceDigest) || len(result.Effects) != 0 || result.Wait != nil {
+		return errors.New("resumed node result status, evidence, effects, or wait is invalid")
+	}
+	switch result.Status {
+	case contracts.NodeResultSucceeded:
+		if result.Output == nil || result.Failure != nil {
+			return errors.New("successful resumed node requires output and no failure")
+		}
+		canonical, err := canonicaljson.Marshal(result.Output)
+		if err != nil || len(canonical) > descriptor.MaxOutputBytes {
+			return errors.New("resumed node output is invalid or exceeds descriptor bound")
+		}
+		digest, err := canonicaljson.Digest(canonical)
+		if err != nil || digest != result.OutputDigest {
+			return errors.New("resumed node output digest is invalid")
+		}
+		if err := descriptor.OutputSchema.ValidateValue(result.Output); err != nil {
+			return fmt.Errorf("resumed node output schema: %w", err)
+		}
+		if result.OutputArtifactRef != "" && !contracts.ValidIdentifier(result.OutputArtifactRef) {
+			return errors.New("resumed node output artifact ref is invalid")
+		}
+	case contracts.NodeResultFailed:
+		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" {
+			return errors.New("failed resumed node requires only a failure")
+		}
+		if !result.Failure.Class.Valid() || !contracts.ValidIdentifier(result.Failure.Code) || result.Failure.Message == "" {
+			return errors.New("resumed node failure is invalid")
+		}
+	default:
+		return errors.New("node resumer must terminate instead of waiting again")
+	}
+	return nil
+}
+
 func validateRequirements(requirements []contracts.CapabilityRequirement) error {
 	previous := ""
 	capabilities := make(map[string]bool, len(requirements))

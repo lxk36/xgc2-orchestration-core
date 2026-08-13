@@ -31,6 +31,9 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			return contracts.Run{}, err
 		}
 		now := controller.clock.Now().UTC()
+		if now.Before(run.UpdatedAt) {
+			now = run.UpdatedAt
+		}
 		switch run.Status {
 		case contracts.RunAccepted, contracts.RunQueued:
 			decision, transitionErr := execution.TransitionRun(run, execution.RunTransitionCommand{

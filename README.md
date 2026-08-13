@@ -40,11 +40,19 @@ The standard-library-only Go kernel currently provides:
   immutable receipts;
 - a sealed Node registry, descriptor/request/result protocol, declarative
   Effect proposal boundary, explicit capability grants, structured output, and
-  reusable node-pack conformance suite.
+  reusable node-pack conformance suite;
 - a durable single-controller runtime that admits exact Action/Workflow pins,
   executes only the selected entrypoint, freezes node inputs/results, prepares
   Effects atomically before waiting, and recovers expired pure-node attempts
-  while failing effectful uncertainty closed.
+  while failing effectful uncertainty closed;
+- atomic Effect begin, public CommandLedger persistence, leased outbox dispatch,
+  private credential rehydration, immutable provider Receipt observation, and
+  terminal wait-resolution intents;
+- a lease-free but revision-and-generation-fenced wait resolver plus optional
+  pure Node `Resume`, so an asynchronous node is never re-executed to consume
+  an external result; and
+- a product-neutral Effect adapter port and process adapter that resolves
+  public `ProcessSpec` references into private local-provider dispatch data.
 
 The repository does not yet provide remote execution, a Studio, HTTP APIs, or
 container deployment. The file store and local-process provider are for a
@@ -75,7 +83,8 @@ It compiles using only this repository.
 | Atomic state/event/intent persistence | `durable/store`, `durable/filestore` |
 | Fenced intent draining | `durable/worker` |
 | Runtime ownership and Run closure | `kernel/runtime`, `kernel/ownership` |
-| Managed process provider port/reference | `provider/process`, `provider/processlocal` |
+| Effect/provider dispatch boundary | `provider/effect`, `controller/intent_handlers.go` |
+| Managed process provider port/reference | `provider/process`, `provider/processadapter`, `provider/processlocal` |
 | User-extensible Node protocol and SDK | `spec/node-protocol/v1`, `kernel/node`, `sdk/go/node` |
 | Independent pack acceptance | `conformance/nodepack` |
 | Durable Action-to-Node controller | `controller` |

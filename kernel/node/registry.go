@@ -12,9 +12,10 @@ import (
 )
 
 var (
-	ErrRegistrySealed = errors.New("node registry is sealed")
-	ErrNodeConflict   = errors.New("node type registration conflict")
-	ErrNodeNotFound   = errors.New("node type is not registered")
+	ErrRegistrySealed   = errors.New("node registry is sealed")
+	ErrNodeConflict     = errors.New("node type registration conflict")
+	ErrNodeNotFound     = errors.New("node type is not registered")
+	ErrNodeNotResumable = errors.New("node type does not implement pure wait resumption")
 )
 
 type registration struct {
@@ -125,6 +126,37 @@ func (registry *Registry) Execute(ctx context.Context, request contracts.NodeInv
 		return contracts.NodeResult{}, err
 	}
 	if err := ValidateResult(registered.descriptor, request, result); err != nil {
+		return contracts.NodeResult{}, err
+	}
+	return result, nil
+}
+
+func (registry *Registry) Resume(ctx context.Context, request contracts.NodeResumeRequest) (contracts.NodeResult, error) {
+	if ctx == nil {
+		return contracts.NodeResult{}, errors.New("node resume context is required")
+	}
+	registry.mu.RLock()
+	if !registry.sealed {
+		registry.mu.RUnlock()
+		return contracts.NodeResult{}, errors.New("node registry must be sealed before resumption")
+	}
+	registered, exists := registry.registrations[request.TypeRef]
+	registry.mu.RUnlock()
+	if !exists {
+		return contracts.NodeResult{}, ErrNodeNotFound
+	}
+	resumer, ok := registered.executor.(nodesdk.Resumer)
+	if !ok {
+		return contracts.NodeResult{}, ErrNodeNotResumable
+	}
+	if err := ValidateResumeRequest(registered.descriptor, request); err != nil {
+		return contracts.NodeResult{}, err
+	}
+	result, err := resumer.Resume(ctx, request)
+	if err != nil {
+		return contracts.NodeResult{}, err
+	}
+	if err := ValidateResumeResult(registered.descriptor, result); err != nil {
 		return contracts.NodeResult{}, err
 	}
 	return result, nil

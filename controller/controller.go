@@ -32,6 +32,7 @@ const (
 	snapshotAggregateType = "run-snapshot"
 	invocationType        = "invocation"
 	effectAggregateType   = "effect"
+	commandLedgerType     = "command-ledger"
 	eventSchemaDigest     = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
 )
 
@@ -257,6 +258,22 @@ func (controller *Controller) GetRun(ctx context.Context, runID string) (contrac
 		return contracts.Run{}, err
 	}
 	return decodeRun(record)
+}
+
+func (controller *Controller) ListRuns(ctx context.Context, afterRunID string, limit int) ([]contracts.Run, error) {
+	records, err := controller.store.ListAggregates(ctx, runAggregateType, afterRunID, limit)
+	if err != nil {
+		return nil, err
+	}
+	runs := make([]contracts.Run, 0, len(records))
+	for _, record := range records {
+		run, decodeErr := decodeRun(record)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		runs = append(runs, run)
+	}
+	return runs, nil
 }
 
 func (controller *Controller) GetSnapshot(ctx context.Context, runID string) (RunSnapshot, uint64, error) {

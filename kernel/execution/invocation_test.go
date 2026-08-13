@@ -53,6 +53,59 @@ func TestInvocationWaitResumeAndSucceedUnderLeaseFence(t *testing.T) {
 	}
 }
 
+func TestInvocationWaitResolvesAfterOriginalWorkerLeaseExpires(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 12, 30, 0, 0, time.UTC)
+	ledger := activateTestInvocation(t, "run-durable-wait", "launch", t0)
+	claimed, err := ClaimInvocation(ledger, ClaimInvocationCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		Phase: contracts.AttemptExecution, OwnerRef: "worker-1", LeaseToken: "secret-wait-lease",
+		LeaseExpiresAt: t0.Add(5 * time.Second), CommandID: "claim-durable-wait", At: t0.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger = claimed.Ledger
+	attempt := ledger.Attempts[0]
+	waiting, err := TransitionInvocation(ledger, TransitionInvocationCommand{
+		Fence: AttemptFence{
+			InvocationID: ledger.Invocation.InvocationID, InvocationRevision: ledger.Invocation.Revision,
+			AttemptID: attempt.AttemptID, AttemptRevision: attempt.Revision,
+			LeaseToken: "secret-wait-lease", At: t0.Add(2 * time.Second),
+		},
+		To: contracts.InvocationWaiting, AttemptTo: contracts.AttemptWaiting,
+		WaitRef: "effect-start", WaitGeneration: 3, CommandID: "wait-durable-effect",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger = waiting.Ledger
+	attempt = ledger.Attempts[0]
+	resolved, err := ResolveInvocationWait(ledger, ResolveInvocationWaitCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision,
+		WaitRef: "effect-start", WaitGeneration: 3, To: contracts.InvocationSucceeded,
+		OutputRefsDigest: testDigest, CommandID: "resolve-durable-effect", At: t0.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Ledger.Invocation.Status != contracts.InvocationSucceeded ||
+		resolved.Ledger.Invocation.CurrentWaitRef != "" || resolved.Ledger.Invocation.WaitGeneration != 0 ||
+		resolved.Ledger.Attempts[0].Status != contracts.AttemptSucceeded ||
+		!resolved.Ledger.Attempts[0].LeaseExpiresAt.IsZero() {
+		t.Fatalf("resolved ledger = %#v", resolved.Ledger)
+	}
+	_, err = ResolveInvocationWait(waiting.Ledger, ResolveInvocationWaitCommand{
+		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
+		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision,
+		WaitRef: "effect-start", WaitGeneration: 2, To: contracts.InvocationSucceeded,
+		OutputRefsDigest: testDigest, CommandID: "resolve-stale-effect", At: t0.Add(time.Minute),
+	})
+	if !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("stale wait resolution error = %v", err)
+	}
+}
+
 func TestInvocationRetryFreezesInputsAndRejectsExpiredLease(t *testing.T) {
 	t0 := time.Date(2026, 8, 12, 13, 0, 0, 0, time.UTC)
 	ledger := activateTestInvocation(t, "run-retry", "launch", t0)

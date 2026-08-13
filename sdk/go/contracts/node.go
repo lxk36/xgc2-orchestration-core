@@ -134,3 +134,47 @@ type NodeResult struct {
 	Failure           *StructuredFailure `json:"failure,omitempty"`
 	EvidenceDigest    string             `json:"evidenceDigest"`
 }
+
+type NodeWaitResolutionStatus string
+
+const (
+	NodeWaitResolvedSucceeded NodeWaitResolutionStatus = "succeeded"
+	NodeWaitResolvedFailed    NodeWaitResolutionStatus = "failed"
+	NodeWaitResolvedCanceled  NodeWaitResolutionStatus = "canceled"
+)
+
+func (status NodeWaitResolutionStatus) Valid() bool {
+	return status == NodeWaitResolvedSucceeded || status == NodeWaitResolvedFailed || status == NodeWaitResolvedCanceled
+}
+
+// NodeWaitResolution is public durable data. Provider credentials and raw
+// external payloads are never exposed to a node resumer.
+type NodeWaitResolution struct {
+	Kind               NodeWaitKind             `json:"kind"`
+	SubjectRef         string                   `json:"subjectRef"`
+	ConditionDigest    string                   `json:"conditionDigest"`
+	Status             NodeWaitResolutionStatus `json:"status"`
+	Payload            map[string]any           `json:"payload,omitempty"`
+	PayloadDigest      string                   `json:"payloadDigest,omitempty"`
+	PayloadArtifactRef string                   `json:"payloadArtifactRef,omitempty"`
+	Failure            *StructuredFailure       `json:"failure,omitempty"`
+	ObservedAt         time.Time                `json:"observedAt"`
+}
+
+// NodeResumeRequest lets an optional pure Resumer fold a persisted wait
+// resolution into a normal node result. It deliberately carries no grants,
+// provider handles, store access, or mutable orchestration context.
+type NodeResumeRequest struct {
+	InvocationID     string             `json:"invocationId"`
+	RunID            string             `json:"runId"`
+	NodeID           string             `json:"nodeId"`
+	TypeRef          string             `json:"typeRef"`
+	DescriptorDigest string             `json:"descriptorDigest"`
+	AttemptID        string             `json:"attemptId"`
+	AttemptOrdinal   uint32             `json:"attemptOrdinal"`
+	Input            map[string]any     `json:"input"`
+	InputDigest      string             `json:"inputDigest"`
+	Wait             NodeWait           `json:"wait"`
+	Resolution       NodeWaitResolution `json:"resolution"`
+	RequestedAt      time.Time          `json:"requestedAt"`
+}

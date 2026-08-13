@@ -10,6 +10,7 @@ import (
 
 	"github.com/lxk36/xgc2-orchestration-core/durable/filestore"
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
+	"github.com/lxk36/xgc2-orchestration-core/durable/worker"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/effect"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
@@ -81,6 +82,10 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 	}
 	if fixture.prepare.Calls() != 1 || fixture.render.Calls() != 1 || fixture.diagnostics.Calls() != 0 {
 		t.Fatalf("calls prepare=%d render=%d diagnostics=%d", fixture.prepare.Calls(), fixture.render.Calls(), fixture.diagnostics.Calls())
+	}
+	runs, err := fixture.controller.ListRuns(t.Context(), "", 10)
+	if err != nil || len(runs) != 1 || runs[0].RunID != run.RunID {
+		t.Fatalf("listed runs = %#v, err = %v", runs, err)
 	}
 	path := fixture.path
 	if err := fixture.store.Close(); err != nil {
@@ -165,6 +170,199 @@ func TestControllerPreparesEffectBeforeLeavingRunWaiting(t *testing.T) {
 	}
 }
 
+func TestControllerDurablyDispatchesAndObservesEffectReceipts(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-effect-dispatch")
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || run.Status != contracts.RunWaiting {
+		t.Fatalf("waiting run = %#v, err = %v", run, err)
+	}
+	invocationID, _ := execution.StableInvocationID(run.RunID, "launch")
+	effectID, _ := effect.StableEffectID(invocationID, "start-process")
+	beginRequest := BeginEffectRequest{
+		EffectID: effectID, CommandID: "dispatch-process", RequestID: "request-process",
+		IdempotencyKey: "private-idempotency-key", Action: "process.start",
+		ActorRef: "operator", SourceRef: "test-suite", ReasonCode: "experiment.launch",
+		Risk: contracts.RiskModerate,
+		Fence: contracts.TargetFence{Kind: contracts.FenceGeneration, Generation: &contracts.GenerationFence{
+			BindingID: "simulator", Generation: 1, FencingToken: 7,
+		}},
+		Deadline: fixture.clock.Now().Add(5 * time.Second), CancellationID: "cancel-process",
+		CapabilityToken: "private-capability-token",
+	}
+	begun, err := fixture.controller.BeginEffect(t.Context(), beginRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if begun.Replay || begun.Effect.State != contracts.EffectApplying || begun.IntentID == "" ||
+		begun.Ledger.Envelope.IdempotencyKey != "" || begun.Ledger.Envelope.CapabilityToken != "" {
+		t.Fatalf("begun effect = %#v", begun)
+	}
+	intent, err := fixture.store.GetIntent(t.Context(), begun.IntentID)
+	if err != nil || intent.Status != store.IntentPending || intent.Intent.Kind != contracts.IntentOutbox {
+		t.Fatalf("outbox intent = %#v, err = %v", intent, err)
+	}
+	replayed, err := fixture.controller.BeginEffect(t.Context(), beginRequest)
+	if err != nil || !replayed.Replay || replayed.Effect.State != contracts.EffectApplying {
+		t.Fatalf("begin replay = %#v, err = %v", replayed, err)
+	}
+	fenceDigest, _ := effect.FenceDigest(begun.Ledger.Envelope.Fence)
+	acceptedAt := fixture.clock.Now().Add(time.Second)
+	acceptedID, _ := effect.StableReceiptID(beginRequest.CommandID, 1)
+	accepted := contracts.CommandReceipt{
+		ReceiptID: acceptedID, CommandID: beginRequest.CommandID, Sequence: 1,
+		Status: contracts.ReceiptAccepted, IdentityDigest: begun.Ledger.Envelope.IdentityDigest,
+		FenceDigest: fenceDigest, ProviderRef: "provider-local", ProviderDigest: testPackageDigest,
+		PolicyDigest: begun.Ledger.Envelope.PolicyDigest, AuthorizationDigest: testPackageDigest,
+		ExternalIdentity: "pid-123", ObservedAt: acceptedAt,
+	}
+	observed, err := fixture.controller.ObserveEffect(t.Context(), ObserveEffectRequest{
+		EffectID: effectID, Receipt: accepted, CommandID: "observe-process-accepted",
+	})
+	if err != nil || observed.Effect.State != contracts.EffectApplying || len(observed.Ledger.Receipts) != 1 {
+		t.Fatalf("accepted observation = %#v, err = %v", observed, err)
+	}
+	resultDigest, _ := canonicaljson.DigestValue(map[string]any{"pid": 123})
+	succeededID, _ := effect.StableReceiptID(beginRequest.CommandID, 2)
+	succeeded := accepted
+	succeeded.ReceiptID = succeededID
+	succeeded.Sequence = 2
+	succeeded.Status = contracts.ReceiptSucceeded
+	succeeded.ResultDigest = resultDigest
+	succeeded.ResultArtifactRef = "artifact-process-result"
+	succeeded.ObservedAt = acceptedAt.Add(time.Second)
+	observed, err = fixture.controller.ObserveEffect(t.Context(), ObserveEffectRequest{
+		EffectID: effectID, Receipt: succeeded, CommandID: "observe-process-succeeded",
+	})
+	if err != nil || observed.Effect.State != contracts.EffectApplied || len(observed.Ledger.Receipts) != 2 ||
+		observed.Effect.ResultDigest != resultDigest {
+		t.Fatalf("succeeded observation = %#v, err = %v", observed, err)
+	}
+	resolutionIntentID, _ := execution.StableIntentID(contracts.IntentWaitResolution, effectID, observed.Effect.Revision)
+	resolutionIntent, err := fixture.store.GetIntent(t.Context(), resolutionIntentID)
+	if err != nil || resolutionIntent.Status != store.IntentPending {
+		t.Fatalf("wait resolution intent = %#v, err = %v", resolutionIntent, err)
+	}
+	replayedObservation, err := fixture.controller.ObserveEffect(t.Context(), ObserveEffectRequest{
+		EffectID: effectID, Receipt: succeeded, CommandID: "observe-process-succeeded",
+	})
+	if err != nil || !replayedObservation.Replay {
+		t.Fatalf("observation replay = %#v, err = %v", replayedObservation, err)
+	}
+	effects, err := fixture.controller.ListEffects(t.Context(), "", 10)
+	if err != nil || len(effects) != 1 || effects[0].State != contracts.EffectApplied {
+		t.Fatalf("listed effects = %#v, err = %v", effects, err)
+	}
+	resolvedRun, err := fixture.controller.ResolveEffectWait(t.Context(), effectID)
+	if err != nil || resolvedRun.Status != contracts.RunSucceeded {
+		t.Fatalf("resolved run = %#v, err = %v", resolvedRun, err)
+	}
+}
+
+type staticEffectCredentials struct {
+	idempotency string
+	capability  string
+}
+
+func (credentials staticEffectCredentials) ResolveEffectCredentials(context.Context, contracts.EffectRecord, contracts.CommandLedger) (DispatchCredentials, error) {
+	return DispatchCredentials{
+		IdempotencyKey: credentials.idempotency, CapabilityToken: credentials.capability,
+		AuthorizationDigest: testPackageDigest,
+	}, nil
+}
+
+type successfulEffectAdapter struct {
+	clock       *fakeClock
+	seenPrivate bool
+}
+
+func (adapter *successfulEffectAdapter) Descriptor() EffectAdapterDescriptor {
+	return EffectAdapterDescriptor{Kind: "xgc.process-start/v1", ProviderRef: "provider-test", ProviderDigest: testPackageDigest}
+}
+
+func (adapter *successfulEffectAdapter) Dispatch(_ context.Context, _ contracts.EffectIntent, envelope contracts.CommandEnvelope, authorizationDigest string) (contracts.CommandLedger, error) {
+	adapter.seenPrivate = envelope.IdempotencyKey != "" && envelope.CapabilityToken != ""
+	descriptor := adapter.Descriptor()
+	accepted, err := syntheticReceipt(envelope, descriptor, authorizationDigest, 1, contracts.ReceiptAccepted, nil, adapter.clock.Now())
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	succeeded, err := syntheticReceipt(envelope, descriptor, authorizationDigest, 2, contracts.ReceiptSucceeded, nil, adapter.clock.Now())
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	succeeded.ResultDigest, _ = canonicaljson.DigestValue(map[string]any{"pid": 321})
+	succeeded.ExternalIdentity = "pid-321"
+	envelope.IdempotencyKey, envelope.CapabilityToken = "", ""
+	return contracts.CommandLedger{Envelope: envelope, Receipts: []contracts.CommandReceipt{accepted, succeeded}}, nil
+}
+
+func TestDurableWorkersDispatchOutboxThenResumeRun(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-effect-workers")
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || run.Status != contracts.RunWaiting {
+		t.Fatalf("waiting run = %#v, err = %v", run, err)
+	}
+	invocationID, _ := execution.StableInvocationID(run.RunID, "launch")
+	effectID, _ := effect.StableEffectID(invocationID, "start-process")
+	begin := BeginEffectRequest{
+		EffectID: effectID, CommandID: "dispatch-worker-process", IdempotencyKey: "worker-idempotency-key",
+		Action: "process.start", ActorRef: "operator", SourceRef: "worker-test", ReasonCode: "experiment.launch",
+		Risk: contracts.RiskModerate,
+		Fence: contracts.TargetFence{Kind: contracts.FenceGeneration, Generation: &contracts.GenerationFence{
+			BindingID: "simulator", Generation: 1, FencingToken: 11,
+		}},
+		Deadline: fixture.clock.Now().Add(5 * time.Second), CancellationID: "cancel-worker-process",
+		CapabilityToken: "worker-capability-token",
+	}
+	if _, err := fixture.controller.BeginEffect(t.Context(), begin); err != nil {
+		t.Fatal(err)
+	}
+	adapter := &successfulEffectAdapter{clock: fixture.clock}
+	outbox, err := NewEffectOutboxHandler(fixture.controller, staticEffectCredentials{
+		idempotency: begin.IdempotencyKey, capability: begin.CapabilityToken,
+	}, adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitHandler, err := NewWaitResolutionHandler(fixture.controller)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durableWorker := worker.Worker{
+		Store: fixture.store, OwnerRef: "effect-worker",
+		Handlers: map[contracts.DurableIntentKind]worker.Handler{
+			contracts.IntentOutbox: outbox, contracts.IntentWaitResolution: waitHandler,
+		},
+	}
+	now := fixture.clock.Now()
+	outboxBatch, err := durableWorker.RunOnce(t.Context(), worker.Batch{
+		Kinds: []contracts.DurableIntentKind{contracts.IntentOutbox}, LeaseToken: "outbox-worker-lease",
+		Now: now, LeaseExpiresAt: now.Add(time.Minute), Limit: 10,
+	})
+	if err != nil || outboxBatch.Completed != 1 || !adapter.seenPrivate {
+		t.Fatalf("outbox batch = %#v, private=%v, err=%v", outboxBatch, adapter.seenPrivate, err)
+	}
+	waitBatch, err := durableWorker.RunOnce(t.Context(), worker.Batch{
+		Kinds: []contracts.DurableIntentKind{contracts.IntentWaitResolution}, LeaseToken: "wait-worker-lease",
+		Now: now, LeaseExpiresAt: now.Add(time.Minute), Limit: 10,
+	})
+	if err != nil || waitBatch.Completed != 1 {
+		t.Fatalf("wait batch = %#v, err=%v", waitBatch, err)
+	}
+	run, err = fixture.controller.GetRun(t.Context(), run.RunID)
+	if err != nil || run.Status != contracts.RunSucceeded {
+		t.Fatalf("worker-resolved run = %#v, err=%v", run, err)
+	}
+}
+
 func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-expired")
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
@@ -230,6 +428,19 @@ func (executor *effectExecutor) Execute(_ context.Context, request contracts.Nod
 		Status: contracts.NodeResultWaiting, Effects: []contracts.EffectProposal{proposal},
 		Wait:           &contracts.NodeWait{Kind: contracts.NodeWaitEffect, SubjectRef: proposal.EffectKey, ConditionDigest: intentDigest},
 		EvidenceDigest: evidence,
+	}, nil
+}
+
+func (executor *effectExecutor) Resume(_ context.Context, request contracts.NodeResumeRequest) (contracts.NodeResult, error) {
+	output := map[string]any{}
+	digest, _ := canonicaljson.DigestValue(output)
+	evidence, _ := canonicaljson.DigestValue(map[string]any{
+		"resolutionDigest": request.Resolution.PayloadDigest,
+		"subjectRef":       request.Resolution.SubjectRef,
+	})
+	return contracts.NodeResult{
+		Status: contracts.NodeResultSucceeded, Output: output,
+		OutputDigest: digest, EvidenceDigest: evidence,
 	}, nil
 }
 

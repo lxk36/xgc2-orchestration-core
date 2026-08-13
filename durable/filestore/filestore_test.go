@@ -261,6 +261,40 @@ func TestFileLockAndIncompleteTailRecovery(t *testing.T) {
 	}
 }
 
+func TestListAggregatesUsesStableTypeScopedCursor(t *testing.T) {
+	ctx := context.Background()
+	durable, err := Open(t.TempDir() + "/list.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	t0 := time.Date(2026, 8, 12, 20, 0, 0, 0, time.UTC)
+	for index, runID := range []string{"run-c", "run-a", "run-b"} {
+		decision, err := execution.AdmitRun(execution.AdmitRunCommand{
+			RunID: runID, NamespaceID: "lab", ActionRef: contracts.ActionRef{ActionID: "workflow", Version: "v1", Digest: fixtureDigest},
+			ExecutionPlanRef: "plan-1", PlanDigest: fixtureDigest, TriggerRef: "trigger-1", TriggerDigest: fixtureDigest,
+			InputDigest: fixtureDigest, ActorRef: "operator", SourceRef: "api", CommandID: "admit-" + runID, At: t0.Add(time.Duration(index) * time.Second),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := durable.Commit(ctx, runTransaction(t, decision, 0, "admit-"+runID, t0.Add(time.Duration(index)*time.Second))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := durable.ListAggregates(ctx, "run", "", 2)
+	if err != nil || len(first) != 2 || first[0].Key.ID != "run-a" || first[1].Key.ID != "run-b" {
+		t.Fatalf("first page = %#v, err = %v", first, err)
+	}
+	second, err := durable.ListAggregates(ctx, "run", first[1].Key.ID, 2)
+	if err != nil || len(second) != 1 || second[0].Key.ID != "run-c" {
+		t.Fatalf("second page = %#v, err = %v", second, err)
+	}
+	if _, err := durable.ListAggregates(ctx, "run", "", 0); err == nil {
+		t.Fatal("invalid list limit was accepted")
+	}
+}
+
 func runTransaction(t *testing.T, decision execution.RunDecision, expected uint64, commandID string, at time.Time) store.Transaction {
 	t.Helper()
 	payload, err := canonicaljson.Marshal(decision.Run)

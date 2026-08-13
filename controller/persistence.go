@@ -11,6 +11,7 @@ import (
 
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/effect"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
@@ -21,6 +22,14 @@ func runKey(runID string) store.AggregateKey {
 
 func snapshotKey(runID string) store.AggregateKey {
 	return store.AggregateKey{Type: snapshotAggregateType, ID: runID}
+}
+
+func effectKey(effectID string) store.AggregateKey {
+	return store.AggregateKey{Type: effectAggregateType, ID: effectID}
+}
+
+func commandLedgerKey(commandID string) store.AggregateKey {
+	return store.AggregateKey{Type: commandLedgerType, ID: commandID}
 }
 
 func aggregateMutation(key store.AggregateKey, currentRevision uint64, payload any) (store.AggregateRecord, error) {
@@ -69,6 +78,28 @@ func decodeLedger(record store.AggregateRecord) (contracts.InvocationLedger, err
 	}
 	if err := execution.ValidateInvocationLedger(ledger); err != nil {
 		return contracts.InvocationLedger{}, err
+	}
+	return ledger, nil
+}
+
+func decodeEffect(record store.AggregateRecord) (contracts.EffectRecord, error) {
+	var current contracts.EffectRecord
+	if err := canonicaljson.UnmarshalStrict(record.Payload, &current); err != nil {
+		return contracts.EffectRecord{}, err
+	}
+	if err := effect.ValidateRecord(current); err != nil {
+		return contracts.EffectRecord{}, err
+	}
+	return current, nil
+}
+
+func decodeCommandLedger(record store.AggregateRecord) (contracts.CommandLedger, error) {
+	var ledger contracts.CommandLedger
+	if err := canonicaljson.UnmarshalStrict(record.Payload, &ledger); err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	if err := effect.ValidateLedger(ledger); err != nil {
+		return contracts.CommandLedger{}, err
 	}
 	return ledger, nil
 }

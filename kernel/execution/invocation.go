@@ -56,6 +56,24 @@ type TransitionInvocationCommand struct {
 	CommandID        string
 }
 
+// ResolveInvocationWaitCommand closes an externally resolved wait without
+// relying on the worker lease that originally produced it. The durable wait
+// reference, generation, invocation revision, and attempt revision form the
+// fence; stale events cannot resolve a newer wait.
+type ResolveInvocationWaitCommand struct {
+	InvocationID            string
+	ExpectedRevision        uint64
+	AttemptID               string
+	ExpectedAttemptRevision uint64
+	WaitRef                 string
+	WaitGeneration          uint32
+	To                      contracts.InvocationStatus
+	OutputRefsDigest        string
+	Failure                 *contracts.StructuredFailure
+	CommandID               string
+	At                      time.Time
+}
+
 type HeartbeatAttemptCommand struct {
 	Fence          AttemptFence
 	OwnerRef       string
@@ -265,6 +283,7 @@ func TransitionInvocation(current contracts.InvocationLedger, command Transition
 	nextInvocation.Revision++
 	nextInvocation.UpdatedAt = command.Fence.At.UTC()
 	nextInvocation.CurrentWaitRef = ""
+	nextInvocation.WaitGeneration = 0
 	nextInvocation.NextAttemptAt = nil
 	if command.To == contracts.InvocationWaiting {
 		nextInvocation.CurrentWaitRef = command.WaitRef
@@ -291,6 +310,98 @@ func TransitionInvocation(current contracts.InvocationLedger, command Transition
 	event, err := newEvent("invocation", invocation.InvocationID, nextInvocation.Revision, "invocation."+string(command.To), command.CommandID, command.Fence.At, map[string]any{
 		"from": invocation.Status, "to": command.To, "attemptId": attempt.AttemptID,
 		"attemptFrom": attempt.Status, "attemptTo": command.AttemptTo,
+	})
+	if err != nil {
+		return InvocationDecision{}, err
+	}
+	return InvocationDecision{Ledger: next, Events: []contracts.DomainEvent{event}}, nil
+}
+
+// ResolveInvocationWait is the only lease-free execution transition. It is
+// safe because it can only consume the exact persisted wait generation and
+// exact waiting attempt revision.
+func ResolveInvocationWait(current contracts.InvocationLedger, command ResolveInvocationWaitCommand) (InvocationDecision, error) {
+	if err := ValidateInvocationLedger(current); err != nil {
+		return InvocationDecision{}, fmt.Errorf("current invocation ledger: %w", err)
+	}
+	invocation := current.Invocation
+	if command.InvocationID != invocation.InvocationID || command.ExpectedRevision != invocation.Revision {
+		return InvocationDecision{}, ErrRevisionConflict
+	}
+	if invocation.Status != contracts.InvocationWaiting || command.WaitRef != invocation.CurrentWaitRef ||
+		command.WaitGeneration != invocation.WaitGeneration || command.WaitGeneration == 0 {
+		return InvocationDecision{}, fmt.Errorf("%w: durable wait fence does not match", ErrInvalidTransition)
+	}
+	if command.At.IsZero() || command.At.Before(invocation.UpdatedAt) {
+		return InvocationDecision{}, errors.New("wait resolution time is missing or moves backwards")
+	}
+	if err := validateIdentity(command.CommandID, "wait resolution command id"); err != nil {
+		return InvocationDecision{}, err
+	}
+	index := -1
+	for candidate := range current.Attempts {
+		attempt := current.Attempts[candidate]
+		if attempt.AttemptID == command.AttemptID {
+			if attempt.AttemptID != invocation.ActiveAttemptID || attempt.Phase != contracts.AttemptExecution ||
+				attempt.Status != contracts.AttemptWaiting || attempt.Revision != command.ExpectedAttemptRevision {
+				return InvocationDecision{}, ErrRevisionConflict
+			}
+			index = candidate
+			break
+		}
+	}
+	if index < 0 {
+		return InvocationDecision{}, ErrRevisionConflict
+	}
+	attemptTo := contracts.AttemptSucceeded
+	switch command.To {
+	case contracts.InvocationSucceeded:
+		if !contracts.ValidDigest(command.OutputRefsDigest) || command.Failure != nil {
+			return InvocationDecision{}, errors.New("successful wait resolution requires output digest and no failure")
+		}
+	case contracts.InvocationFailed:
+		attemptTo = contracts.AttemptFailed
+		if err := validateFailure(command.Failure, true, "wait resolution failure"); err != nil {
+			return InvocationDecision{}, err
+		}
+	case contracts.InvocationCanceled:
+		attemptTo = contracts.AttemptCanceled
+		if command.Failure != nil || command.OutputRefsDigest != "" {
+			return InvocationDecision{}, errors.New("canceled wait resolution cannot carry output or failure")
+		}
+	default:
+		return InvocationDecision{}, fmt.Errorf("%w: wait cannot resolve to %s", ErrInvalidTransition, command.To)
+	}
+	if command.To != contracts.InvocationSucceeded && command.OutputRefsDigest != "" {
+		return InvocationDecision{}, errors.New("non-successful wait resolution cannot carry output")
+	}
+
+	next := cloneLedger(current)
+	nextAttempt := &next.Attempts[index]
+	nextAttempt.Status = attemptTo
+	nextAttempt.Failure = cloneFailure(command.Failure)
+	nextAttempt.LeaseExpiresAt = time.Time{}
+	nextAttempt.UpdatedAt = command.At.UTC()
+	nextAttempt.Revision++
+	finished := command.At.UTC()
+	nextAttempt.FinishedAt = &finished
+
+	nextInvocation := &next.Invocation
+	nextInvocation.Status = command.To
+	nextInvocation.ActiveAttemptID = ""
+	nextInvocation.CurrentWaitRef = ""
+	nextInvocation.WaitGeneration = 0
+	nextInvocation.OutputRefsDigest = command.OutputRefsDigest
+	nextInvocation.PrimaryFailure = cloneFailure(command.Failure)
+	nextInvocation.UpdatedAt = command.At.UTC()
+	nextInvocation.FinishedAt = &finished
+	nextInvocation.Revision++
+	if err := ValidateInvocationLedger(next); err != nil {
+		return InvocationDecision{}, err
+	}
+	event, err := newEvent("invocation", nextInvocation.InvocationID, nextInvocation.Revision, "invocation.wait-resolved."+string(command.To), command.CommandID, command.At, map[string]any{
+		"waitRef": command.WaitRef, "waitGeneration": command.WaitGeneration,
+		"attemptId": nextAttempt.AttemptID, "attemptRevision": nextAttempt.Revision,
 	})
 	if err != nil {
 		return InvocationDecision{}, err

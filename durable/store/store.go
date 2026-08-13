@@ -122,6 +122,7 @@ type InboxRecord struct {
 type Store interface {
 	Commit(context.Context, Transaction) (CommitResult, error)
 	GetAggregate(context.Context, AggregateKey) (AggregateRecord, error)
+	ListAggregates(context.Context, string, string, int) ([]AggregateRecord, error)
 	EventsAfter(context.Context, AggregateKey, uint64, int) ([]contracts.DomainEvent, error)
 	ClaimIntents(context.Context, ClaimRequest) ([]ClaimedIntent, error)
 	CompleteIntent(context.Context, IntentFence) (IntentRecord, error)

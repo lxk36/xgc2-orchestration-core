@@ -14,6 +14,12 @@ type Executor interface {
 	Execute(context.Context, contracts.NodeInvocationRequest) (contracts.NodeResult, error)
 }
 
+// Resumer is optional and must be a pure fold over immutable request data. It
+// cannot propose another Effect or another wait.
+type Resumer interface {
+	Resume(context.Context, contracts.NodeResumeRequest) (contracts.NodeResult, error)
+}
+
 type ExecutorFunc struct {
 	NodeDescriptor contracts.NodeDescriptor
 	Function       func(context.Context, contracts.NodeInvocationRequest) (contracts.NodeResult, error)

@@ -179,6 +179,39 @@ func (fileStore *Store) GetAggregate(ctx context.Context, key store.AggregateKey
 	return cloneAggregate(record), nil
 }
 
+// ListAggregates returns one stable type-scoped page ordered by aggregate ID.
+// afterID is exclusive, so callers can resume without offsets drifting while
+// other aggregate types are appended.
+func (fileStore *Store) ListAggregates(ctx context.Context, aggregateType, afterID string, limit int) ([]store.AggregateRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !contracts.ValidIdentifier(aggregateType) || (afterID != "" && !contracts.ValidIdentifier(afterID)) || limit <= 0 || limit > 1000 {
+		return nil, errors.New("aggregate list type, cursor, or limit is invalid")
+	}
+	fileStore.mu.RLock()
+	defer fileStore.mu.RUnlock()
+	if err := fileStore.ensureOpen(); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0)
+	for _, record := range fileStore.state.Aggregates {
+		if record.Key.Type == aggregateType && record.Key.ID > afterID {
+			ids = append(ids, record.Key.ID)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) > limit {
+		ids = ids[:limit]
+	}
+	result := make([]store.AggregateRecord, 0, len(ids))
+	for _, id := range ids {
+		key := store.AggregateKey{Type: aggregateType, ID: id}
+		result = append(result, cloneAggregate(fileStore.state.Aggregates[keyString(key)]))
+	}
+	return result, nil
+}
+
 func (fileStore *Store) EventsAfter(ctx context.Context, key store.AggregateKey, revision uint64, limit int) ([]contracts.DomainEvent, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
