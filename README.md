@@ -31,9 +31,9 @@ The standard-library-only Go kernel currently provides:
 - prepare-before-mutate Effect state, fenced Command envelopes, immutable
   Receipt ledgers, explicit uncertainty, and independent compensation;
 - durable outbox/reconcile/cleanup intents as reducer output, without doing I/O;
-- a durability port plus a locked, checksummed, fsynced local file adapter with
-  command replay, revision CAS, inbox dedupe, expiring intent leases, and crash
-  tail recovery;
+- a durability port plus a stable-sidecar-locked, committed-v2, checksummed and
+  fsynced local file adapter with command replay, revision CAS, inbox dedupe,
+  expiring intent leases, and bounded crash-tail recovery;
 - an intent worker that requires explicit complete/retry/dead/leave results and
   never treats uncertain external effects as automatically retryable;
 - independent RuntimeBinding ownership, generation fencing, lease takeover,

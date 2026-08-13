@@ -3,12 +3,15 @@ package filestore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,6 +37,13 @@ func TestAtomicCommitReplayLeaseAndRestart(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("store permissions = %o", info.Mode().Perm())
+	}
+	lockInfo, err := os.Stat(path + lockSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lockInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("sidecar permissions = %o", lockInfo.Mode().Perm())
 	}
 
 	t0 := time.Date(2026, 8, 12, 17, 0, 0, 0, time.UTC)
@@ -264,7 +274,764 @@ func TestFileLockAndIncompleteTailRecovery(t *testing.T) {
 	}
 }
 
-func TestOpenSeeksPastSupersededSnapshotsAndCompactsJournal(t *testing.T) {
+func TestOpenRejectsNonCanonicalAndAliasedAuthorities(t *testing.T) {
+	t.Run("relative", func(t *testing.T) {
+		if _, err := Open("relative.db"); err == nil {
+			t.Fatal("relative store path was accepted")
+		}
+	})
+	t.Run("unclean", func(t *testing.T) {
+		path := t.TempDir() + "/nested/../data.db"
+		if _, err := Open(path); err == nil {
+			t.Fatal("unclean store path was accepted")
+		}
+	})
+	t.Run("symlink-parent", func(t *testing.T) {
+		root := t.TempDir()
+		realParent := filepath.Join(root, "real")
+		if err := os.Mkdir(realParent, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		aliasParent := filepath.Join(root, "alias")
+		if err := os.Symlink(realParent, aliasParent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(filepath.Join(aliasParent, "data.db")); !errors.Is(err, errUnsafePath) {
+			t.Fatalf("symlink parent error = %v", err)
+		}
+	})
+	for _, name := range []string{"data-symlink", "lock-symlink"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "data.db")
+			target := filepath.Join(root, "target")
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			link := path
+			if name == "lock-symlink" {
+				link += lockSuffix
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); !errors.Is(err, errUnsafePath) {
+				t.Fatalf("symlink error = %v", err)
+			}
+		})
+	}
+	for _, name := range []string{"data-hardlink", "lock-hardlink"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "data.db")
+			target := filepath.Join(root, "target")
+			if err := os.WriteFile(target, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			link := path
+			if name == "lock-hardlink" {
+				link += lockSuffix
+			}
+			if err := os.Link(target, link); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); !errors.Is(err, errUnsafePath) {
+				t.Fatalf("hardlink error = %v", err)
+			}
+		})
+	}
+	t.Run("non-regular", func(t *testing.T) {
+		root := t.TempDir()
+		path := filepath.Join(root, "data.db")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(path); !errors.Is(err, errUnsafePath) {
+			t.Fatalf("directory error = %v", err)
+		}
+	})
+	t.Run("non-regular-lock", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "data.db")
+		if err := os.Mkdir(path+lockSuffix, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(path); !errors.Is(err, errUnsafePath) {
+			t.Fatalf("lock directory error = %v", err)
+		}
+	})
+	t.Run("data-lock-inode-collision", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "data.db")
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(path, path+lockSuffix); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(path); !errors.Is(err, errUnsafePath) {
+			t.Fatalf("data/lock inode collision error = %v", err)
+		}
+	})
+}
+
+func TestStableSidecarLockRejectsStaleAndReplacementOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authority.db")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+
+	// Replacing the data path cannot shed the independent lifecycle lock.
+	if err := os.Rename(path, path+".stale"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, store.ErrLocked) {
+		t.Fatalf("data replacement bypassed sidecar lock: %v", err)
+	}
+	if err := durable.append(emptyState()); !errors.Is(err, errUnsafePath) {
+		t.Fatalf("data replacement did not poison owner: %v", err)
+	}
+	if err := durable.append(emptyState()); !errors.Is(err, errUnsafePath) {
+		t.Fatalf("replaced authority became usable again: %v", err)
+	}
+}
+
+func TestOpenAcquiresSidecarBeforeRecoveringData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "locked-corrupt.db")
+	if err := os.WriteFile(path, []byte("committed-looking corruption"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(path+lockSuffix, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockFile.Close()
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	if _, err := Open(path); !errors.Is(err, store.ErrLocked) {
+		t.Fatalf("Open recovered data before acquiring sidecar: %v", err)
+	}
+}
+
+func TestStableSidecarDetectsLockAndParentReplacement(t *testing.T) {
+	for _, replacement := range []string{"lock", "parent"} {
+		t.Run(replacement, func(t *testing.T) {
+			root := t.TempDir()
+			parent := filepath.Join(root, "store")
+			if err := os.Mkdir(parent, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(parent, "data.db")
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer durable.Close()
+			if replacement == "lock" {
+				if err := os.Rename(path+lockSuffix, path+lockSuffix+".stale"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path+lockSuffix, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Rename(parent, parent+".stale"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(parent, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := durable.append(emptyState()); !errors.Is(err, errUnsafePath) {
+				t.Fatalf("%s replacement error = %v", replacement, err)
+			}
+		})
+	}
+}
+
+func TestParentReplacementDuringOpenFailsClosed(t *testing.T) {
+	root := t.TempDir()
+	parent := filepath.Join(root, "store")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(parent, "data.db")
+	hooks := &ioHooks{sync: func(operation string, file *os.File) error {
+		if operation == "lock-sync" {
+			if err := os.Rename(parent, parent+".stale"); err != nil {
+				return err
+			}
+			if err := os.Mkdir(parent, 0o700); err != nil {
+				return err
+			}
+		}
+		return file.Sync()
+	}}
+	if durable, err := openWithHooks(path, hooks); durable != nil || !errors.Is(err, errUnsafePath) {
+		if durable != nil {
+			_ = durable.Close()
+		}
+		t.Fatalf("Open parent replacement = %#v, %v", durable, err)
+	}
+}
+
+func TestOpenStoreDetectsNewHardlinkAliases(t *testing.T) {
+	for _, target := range []string{"data", "lock"} {
+		t.Run(target, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "data.db")
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer durable.Close()
+			targetPath := path
+			if target == "lock" {
+				targetPath += lockSuffix
+			}
+			if err := os.Link(targetPath, filepath.Join(root, target+"-alias")); err != nil {
+				t.Fatal(err)
+			}
+			if err := durable.append(emptyState()); !errors.Is(err, errUnsafePath) {
+				t.Fatalf("new %s hardlink error = %v", target, err)
+			}
+		})
+	}
+}
+
+func TestV2FrameLayoutAndNoLegacyFallback(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(frame[:8], frameMagic[:]) || !bytes.Equal(frame[len(frame)-frameFooter:len(frame)-frameFooter+8], frameCommitMagic[:]) {
+		t.Fatalf("v2 magic is absent")
+	}
+	if binary.BigEndian.Uint16(frame[8:10]) != frameFormatVersion {
+		t.Fatalf("frame version = %d", binary.BigEndian.Uint16(frame[8:10]))
+	}
+	payloadLength := binary.BigEndian.Uint64(frame[framePayloadLength : framePayloadLength+8])
+	footer := frame[frameHeader+payloadLength:]
+	if footerPayload := binary.BigEndian.Uint64(footer[footerPayloadLength : footerPayloadLength+8]); footerPayload != payloadLength {
+		t.Fatalf("footer payload length = %d, header = %d", footerPayload, payloadLength)
+	}
+	encodedLength := binary.BigEndian.Uint64(frame[frameEncodedLength : frameEncodedLength+8])
+	if footerEncoded := binary.BigEndian.Uint64(footer[footerEncodedLength : footerEncodedLength+8]); footerEncoded != encodedLength || encodedLength != uint64(len(frame)) {
+		t.Fatalf("repeated encoded lengths header=%d footer=%d actual=%d", encodedLength, footerEncoded, len(frame))
+	}
+	legacyState := emptyState()
+	legacyState.Version = 1
+	legacyPayload, err := canonicaljson.MarshalWithLimits(legacyState, frameJSONLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := make([]byte, 8+len(legacyPayload)+sha256.Size)
+	binary.BigEndian.PutUint64(legacy[:8], uint64(len(legacyPayload)))
+	copy(legacy[8:], legacyPayload)
+	sum := sha256.Sum256(legacyPayload)
+	copy(legacy[8+len(legacyPayload):], sum[:])
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("legacy v1 fallback error = %v", err)
+	}
+	v1PayloadInV2Frame, err := encodeFrame(legacyState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(t.TempDir(), "v1-state-v2-frame.db")
+	if err := os.WriteFile(path, v1PayloadInV2Frame, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("v1 state inside v2 frame error = %v", err)
+	}
+}
+
+func TestV2FrameLengthAndCorruptionMatrix(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadLength := int(binary.BigEndian.Uint64(frame[framePayloadLength : framePayloadLength+8]))
+	footerStart := frameHeader + payloadLength
+	tests := []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{"header-magic", flipAt(0)},
+		{"header-version", flipAt(9)},
+		{"header-length", flipAt(11)},
+		{"header-payload-length-zero", setUint64(framePayloadLength, 0)},
+		{"header-payload-length-minus-one", setUint64(framePayloadLength, uint64(payloadLength-1))},
+		{"header-payload-length-plus-one", setUint64(framePayloadLength, uint64(payloadLength+1))},
+		{"header-payload-length-over-max", setUint64(framePayloadLength, maxFrameBytes+1)},
+		{"header-frame-length", flipAt(frameEncodedLength + 7)},
+		{"header-payload-digest", flipAt(framePayloadDigest)},
+		{"header-digest", flipAt(frameHeaderCore)},
+		{"payload", flipAt(frameHeader)},
+		{"footer-magic", flipAt(footerStart)},
+		{"footer-version", flipAt(footerStart + 9)},
+		{"footer-length", flipAt(footerStart + 11)},
+		{"footer-payload-length", flipAt(footerStart + footerPayloadLength + 7)},
+		{"footer-frame-length", flipAt(footerStart + footerEncodedLength + 7)},
+		{"footer-payload-digest", flipAt(footerStart + footerPayloadDigest)},
+		{"footer-header-digest", flipAt(footerStart + footerHeaderDigest)},
+		{"footer-digest", flipAt(len(frame) - 1)},
+		{"only-minus-one", func(raw []byte) []byte { return append([]byte(nil), raw[:len(raw)-1]...) }},
+		{"tail-plus-one", func(raw []byte) []byte { return append(append([]byte(nil), raw...), 0) }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "frame.db")
+			raw := test.mutate(append([]byte(nil), frame...))
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			durable, err := Open(path)
+			if test.name == "only-minus-one" || test.name == "tail-plus-one" {
+				if err != nil {
+					t.Fatalf("recoverable crash tail = %v", err)
+				}
+				_ = durable.Close()
+				info, statErr := os.Stat(path)
+				wantSize := int64(0)
+				if test.name == "tail-plus-one" {
+					wantSize = int64(len(frame))
+				}
+				if statErr != nil || info.Size() != wantSize {
+					t.Fatalf("recovered bytes=%d want=%d err=%v", info.Size(), wantSize, statErr)
+				}
+				return
+			}
+			if !errors.Is(err, store.ErrCorrupt) {
+				if durable != nil {
+					_ = durable.Close()
+				}
+				t.Fatalf("corruption error = %v", err)
+			}
+		})
+	}
+}
+
+func TestV2OnlyAndLatestDeclaredLengthMatrix(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadLength := binary.BigEndian.Uint64(frame[framePayloadLength : framePayloadLength+8])
+	tests := []struct {
+		name          string
+		payloadLength uint64
+		encodedLength uint64
+	}{
+		{"minus-one", payloadLength - 1, uint64(len(frame) - 1)},
+		{"zero", 0, frameHeader + frameFooter},
+		{"plus-one", payloadLength + 1, uint64(len(frame) + 1)},
+		{"over-max", maxFrameBytes + 1, maxEncodedFrameBytes + 1},
+	}
+	for _, position := range []string{"only", "latest"} {
+		for _, test := range tests {
+			t.Run(position+"-"+test.name, func(t *testing.T) {
+				mutated := append([]byte(nil), frame...)
+				binary.BigEndian.PutUint64(mutated[framePayloadLength:framePayloadLength+8], test.payloadLength)
+				binary.BigEndian.PutUint64(mutated[frameEncodedLength:frameEncodedLength+8], test.encodedLength)
+				headerSum := sha256.Sum256(mutated[:frameHeaderCore])
+				copy(mutated[frameHeaderCore:frameHeader], headerSum[:])
+				raw := mutated
+				if position == "latest" {
+					raw = append(append([]byte(nil), frame...), mutated...)
+				}
+				path := filepath.Join(t.TempDir(), "length.db")
+				if err := os.WriteFile(path, raw, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if durable, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+					if durable != nil {
+						_ = durable.Close()
+					}
+					t.Fatalf("declared length error = %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestCommittedCorruptionNeverRollsBackToOlderFrame(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, corruptIndex := range []int{0, 1} {
+		t.Run(fmt.Sprintf("frame-%d", corruptIndex), func(t *testing.T) {
+			raw := bytes.Repeat(frame, 2)
+			raw[corruptIndex*len(frame)+frameHeader] ^= 0xff
+			path := filepath.Join(t.TempDir(), "committed-corrupt.db")
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if durable, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+				if durable != nil {
+					_ = durable.Close()
+				}
+				t.Fatalf("committed corruption error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRecoveryHardBounds(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Run("frame-count", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "too-many.db")
+		if err := os.WriteFile(path, bytes.Repeat(frame, retainedFrameBudget+1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if durable, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+			if durable != nil {
+				_ = durable.Close()
+			}
+			t.Fatalf("frame-count bound error = %v", err)
+		}
+	})
+	t.Run("file-size", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "too-large.db")
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Truncate(maxRecoveryBytes + 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if durable, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+			if durable != nil {
+				_ = durable.Close()
+			}
+			t.Fatalf("file-size bound error = %v", err)
+		}
+	})
+}
+
+func TestOpenDurabilityBarriersAndFailClosedFaults(t *testing.T) {
+	t.Run("barrier-order", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "barriers.db")
+		var observed []string
+		hooks := &ioHooks{sync: func(operation string, file *os.File) error {
+			observed = append(observed, operation)
+			info, err := file.Stat()
+			if err != nil {
+				return err
+			}
+			if operation == "dir-sync" && !info.IsDir() {
+				return errors.New("dir-sync did not target the pinned parent")
+			}
+			if operation != "dir-sync" && !info.Mode().IsRegular() {
+				return errors.New("file sync did not target a regular file")
+			}
+			return file.Sync()
+		}}
+		durable, err := openWithHooks(path, hooks)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := durable.Close(); err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"lock-sync", "data-sync", "dir-sync"}
+		if fmt.Sprint(observed) != fmt.Sprint(want) {
+			t.Fatalf("Open barriers = %v, want %v", observed, want)
+		}
+	})
+
+	for _, operation := range []string{"lock-sync", "data-sync", "dir-sync"} {
+		t.Run(operation+"-fault", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "barrier-fault.db")
+			injected := errors.New("injected " + operation)
+			failed := false
+			hooks := &ioHooks{sync: func(current string, file *os.File) error {
+				if current == operation && !failed {
+					failed = true
+					return injected
+				}
+				return file.Sync()
+			}}
+			if durable, err := openWithHooks(path, hooks); durable != nil || !errors.Is(err, injected) {
+				if durable != nil {
+					_ = durable.Close()
+				}
+				t.Fatalf("faulted Open = %#v, %v", durable, err)
+			}
+			// Open's failure cleanup must release the sidecar and leave no
+			// apparently successful handle behind.
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen after barrier fault: %v", err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOpenRecoveryFaultsFailClosed(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, operation := range []string{"truncate", "data-sync"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "recovery-fault.db")
+			if err := os.WriteFile(path, frame[:len(frame)-1], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			injected := errors.New("injected " + operation)
+			hooks := &ioHooks{}
+			if operation == "truncate" {
+				hooks.truncate = func(*os.File, int64) error { return injected }
+			} else {
+				failed := false
+				hooks.sync = func(current string, file *os.File) error {
+					if current == "data-sync" && !failed {
+						failed = true
+						return injected
+					}
+					return file.Sync()
+				}
+			}
+			if durable, err := openWithHooks(path, hooks); durable != nil || !errors.Is(err, injected) {
+				if durable != nil {
+					_ = durable.Close()
+				}
+				t.Fatalf("faulted recovery = %#v, %v", durable, err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen after recovery fault: %v", err)
+			}
+			_ = reopened.Close()
+		})
+	}
+}
+
+func TestWriteAndReplacementFaultsPoisonUntilReopen(t *testing.T) {
+	injected := errors.New("injected durability fault")
+	tests := []struct {
+		name        string
+		prepare     func(*testing.T, *Store)
+		installHook func(*Store)
+	}{
+		{
+			name: "write",
+			installHook: func(durable *Store) {
+				failed := false
+				durable.hooks = &ioHooks{write: func(operation string, file *os.File, raw []byte) (int, error) {
+					if operation == "data-write" && !failed {
+						failed = true
+						written, writeErr := file.Write(raw[:len(raw)/2])
+						return written, errors.Join(injected, writeErr)
+					}
+					return file.Write(raw)
+				}}
+			},
+		},
+		{
+			name:    "stage-write",
+			prepare: appendFrames(retainedFrameBudget),
+			installHook: func(durable *Store) {
+				durable.hooks = &ioHooks{write: func(operation string, file *os.File, raw []byte) (int, error) {
+					if operation == "stage-write" {
+						return 0, injected
+					}
+					return file.Write(raw)
+				}}
+			},
+		},
+		{
+			name: "data-sync",
+			installHook: func(durable *Store) {
+				durable.hooks = &ioHooks{sync: func(operation string, file *os.File) error {
+					if operation == "data-sync" {
+						return injected
+					}
+					return file.Sync()
+				}}
+			},
+		},
+		{
+			name:    "rename",
+			prepare: appendFrames(retainedFrameBudget),
+			installHook: func(durable *Store) {
+				durable.hooks = &ioHooks{rename: func(*os.File, string, string) error { return injected }}
+			},
+		},
+		{
+			name:    "dir-sync",
+			prepare: appendFrames(retainedFrameBudget),
+			installHook: func(durable *Store) {
+				durable.hooks = &ioHooks{sync: func(operation string, file *os.File) error {
+					if operation == "dir-sync" {
+						if syncErr := file.Sync(); syncErr != nil {
+							return syncErr
+						}
+						return injected
+					}
+					return file.Sync()
+				}}
+			},
+		},
+		{
+			name:    "replacement-close",
+			prepare: appendFrames(retainedFrameBudget),
+			installHook: func(durable *Store) {
+				durable.hooks = &ioHooks{close: func(operation string, file *os.File) error {
+					closeErr := file.Close()
+					if operation == "replaced-data-close" {
+						return errors.Join(injected, closeErr)
+					}
+					return closeErr
+				}}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fault.db")
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				test.prepare(t, durable)
+			}
+			test.installHook(durable)
+			if err := durable.append(emptyState()); !errors.Is(err, injected) {
+				t.Fatalf("first fault = %v", err)
+			}
+			if err := durable.append(emptyState()); err == nil || !strings.Contains(err.Error(), "uncertain") {
+				t.Fatalf("poisoned write = %v", err)
+			}
+			durable.hooks = nil
+			if err := durable.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen after %s fault: %v", test.name, err)
+			}
+			if err := reopened.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestUnlockAndCloseFaultsStillReleaseForReopen(t *testing.T) {
+	injected := errors.New("injected close fault")
+	for _, operation := range []string{"unlock", "data-close", "lock-close", "parent-close"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "close.db")
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			durable.hooks = &ioHooks{
+				flock: func(current string, file *os.File, how int) error {
+					flockErr := syscall.Flock(int(file.Fd()), how)
+					if current == operation {
+						return errors.Join(injected, flockErr)
+					}
+					return flockErr
+				},
+				close: func(current string, file *os.File) error {
+					closeErr := file.Close()
+					if current == operation {
+						return errors.Join(injected, closeErr)
+					}
+					return closeErr
+				},
+			}
+			if err := durable.Close(); !errors.Is(err, injected) {
+				t.Fatalf("Close fault = %v", err)
+			}
+			reopened, err := Open(path)
+			if err != nil {
+				t.Fatalf("reopen after %s fault: %v", operation, err)
+			}
+			_ = reopened.Close()
+		})
+	}
+}
+
+func appendFrames(count int) func(*testing.T, *Store) {
+	return func(t *testing.T, durable *Store) {
+		t.Helper()
+		for index := 0; index < count; index++ {
+			if err := durable.append(emptyState()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+func TestV2PartialCrashTailBoundaries(t *testing.T) {
+	frame, err := encodeFrame(emptyState())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cut := range []int{
+		1, len(frameMagic), frameHeader - 1, frameHeader, frameHeader + 1,
+		len(frame) - frameFooter, len(frame) - frameFooter + 1,
+		len(frame) - frameFooter/2, len(frame) - 1,
+	} {
+		t.Run(fmt.Sprintf("cut-%d", cut), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "partial.db")
+			if err := os.WriteFile(path, frame[:cut], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			durable, err := Open(path)
+			if err != nil {
+				t.Fatalf("partial frame failed recovery: %v", err)
+			}
+			if err := durable.Close(); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil || info.Size() != 0 {
+				t.Fatalf("partial recovery bytes=%d err=%v", info.Size(), err)
+			}
+		})
+	}
+}
+
+func flipAt(offset int) func([]byte) []byte {
+	return func(raw []byte) []byte {
+		raw[offset] ^= 0xff
+		return raw
+	}
+}
+
+func setUint64(offset int, value uint64) func([]byte) []byte {
+	return func(raw []byte) []byte {
+		binary.BigEndian.PutUint64(raw[offset:offset+8], value)
+		return raw
+	}
+}
+
+func TestOpenValidatesAndCompactsRetainedSnapshots(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "seed.wal")
 	durable, err := Open(path)
 	if err != nil {
@@ -290,11 +1057,8 @@ func TestOpenSeeksPastSupersededSnapshotsAndCompactsJournal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const legacyFrames = 32
-	journal := bytes.Repeat(frame, legacyFrames)
-	// A superseded full snapshot may be damaged without affecting the newest
-	// checksummed snapshot. Recovery must not decode or trust the old payload.
-	journal[frameHeader+8] ^= 0xff
+	const retainedFrames = retainedFrameBudget
+	journal := bytes.Repeat(frame, retainedFrames)
 	if err := os.WriteFile(path, journal, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +1091,21 @@ func TestAppendKeepsOnlyBoundedFullSnapshotHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for index := 0; index < 100; index++ {
+	for index := 0; index < retainedFrameBudget; index++ {
+		if err := durable.append(emptyState()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if durable.frameCount != retainedFrameBudget {
+		t.Fatalf("frame count before boundary = %d", durable.frameCount)
+	}
+	if err := durable.append(emptyState()); err != nil {
+		t.Fatal(err)
+	}
+	if durable.frameCount != 1 {
+		t.Fatalf("fifth frame was not compacted first: count=%d", durable.frameCount)
+	}
+	for index := 0; index < 95; index++ {
 		if err := durable.append(emptyState()); err != nil {
 			t.Fatal(err)
 		}

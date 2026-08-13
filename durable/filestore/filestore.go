@@ -1,16 +1,16 @@
 // Package filestore is the standard-library durable Store reference adapter
-// for a single local orchestration controller. State changes use checksummed,
-// fsynced snapshot frames. Recovery seeks across superseded full snapshots and
-// decodes only the newest complete frame; the journal is periodically replaced
-// atomically so long-running workflows do not turn restart into a linear scan
-// of gigabytes of obsolete state. The file is process-locked and mode 0600.
+// for a single local orchestration controller. State changes use committed,
+// checksummed v2 snapshot frames. A stable sidecar, rather than the replaceable
+// data inode, carries the process lock for the complete Store lifetime.
 package filestore
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,12 +30,32 @@ import (
 )
 
 const (
-	diskVersion         = 1
-	frameHeader         = 8
-	frameChecksum       = sha256.Size
-	maxFrameBytes       = 64 << 20
-	maxJournalBytes     = 64 << 20
-	retainedFrameBudget = 4
+	diskVersion          = 2
+	frameFormatVersion   = 2
+	frameHeader          = 96
+	frameFooter          = 128
+	frameHeaderCore      = frameHeader - sha256.Size
+	frameFooterCore      = frameFooter - sha256.Size
+	maxFrameBytes        = 64 << 20
+	retainedFrameBudget  = 4
+	maxEncodedFrameBytes = frameHeader + maxFrameBytes + frameFooter
+	maxJournalBytes      = maxEncodedFrameBytes
+	maxRecoveryBytes     = maxEncodedFrameBytes
+	lockSuffix           = ".lock"
+	frameFlagOffset      = 12
+	framePayloadLength   = 16
+	frameEncodedLength   = 24
+	framePayloadDigest   = 32
+	footerPayloadLength  = 16
+	footerEncodedLength  = 24
+	footerPayloadDigest  = 32
+	footerHeaderDigest   = 64
+)
+
+var (
+	frameMagic       = [8]byte{'X', 'G', 'C', '2', 'F', 'S', 'V', '2'}
+	frameCommitMagic = [8]byte{'X', 'G', 'C', '2', 'C', 'M', 'V', '2'}
+	errUnsafePath    = errors.New("filestore path authority changed or is unsafe")
 )
 
 type commandRecord struct {
@@ -54,73 +74,141 @@ type diskState struct {
 }
 
 type Store struct {
-	mu       sync.RWMutex
-	file     *os.File
-	path     string
-	state    diskState
-	closed   bool
-	poisoned error
+	mu         sync.RWMutex
+	file       *os.File
+	lockFile   *os.File
+	parent     *os.File
+	path       string
+	parentPath string
+	dataName   string
+	lockName   string
+	parentID   fileIdentity
+	dataID     fileIdentity
+	lockID     fileIdentity
+	state      diskState
+	frameCount int
+	closed     bool
+	poisoned   error
+	hooks      *ioHooks
 }
 
 func Open(path string) (*Store, error) {
-	if path == "" || strings.TrimSpace(path) != path {
-		return nil, errors.New("filestore path is required and canonical")
-	}
-	_, statErr := os.Stat(path)
-	created := errors.Is(statErr, os.ErrNotExist)
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	return openWithHooks(path, nil)
+}
+
+// ioHooks is deliberately package-private. It makes every durability barrier
+// faultable in deterministic tests without weakening the public Store port.
+type ioHooks struct {
+	write    func(string, *os.File, []byte) (int, error)
+	sync     func(string, *os.File) error
+	rename   func(*os.File, string, string) error
+	flock    func(string, *os.File, int) error
+	close    func(string, *os.File) error
+	truncate func(*os.File, int64) error
+}
+
+func openWithHooks(path string, hooks *ioHooks) (_ *Store, returnedErr error) {
+	parentPath, dataName, err := canonicalStorePath(path)
 	if err != nil {
 		return nil, err
 	}
-	failed := true
-	defer func() {
-		if failed {
-			_ = file.Close()
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
+	parent, parentID, err := openCanonicalParent(parentPath)
+	if err != nil {
 		return nil, err
 	}
-	if created {
-		if err := syncParent(path); err != nil {
-			return nil, err
-		}
+	result := &Store{
+		parent: parent, path: path, parentPath: parentPath, dataName: dataName,
+		lockName: dataName + lockSuffix, parentID: parentID, hooks: hooks,
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	locked := false
+	succeeded := false
+	defer func() {
+		if succeeded {
+			return
+		}
+		var cleanup []error
+		if result.file != nil {
+			cleanup = append(cleanup, result.doClose("data-close", result.file))
+		}
+		if locked && result.lockFile != nil {
+			cleanup = append(cleanup, result.doFlock("unlock", result.lockFile, syscall.LOCK_UN))
+		}
+		if result.lockFile != nil {
+			cleanup = append(cleanup, result.doClose("lock-close", result.lockFile))
+		}
+		if result.parent != nil {
+			cleanup = append(cleanup, result.doClose("parent-close", result.parent))
+		}
+		cleanup = append([]error{returnedErr}, cleanup...)
+		returnedErr = errors.Join(cleanup...)
+	}()
+
+	lockFile, lockID, err := openRegularAt(parent, result.lockName)
+	if err != nil {
+		return nil, fmt.Errorf("open filestore lock: %w", err)
+	}
+	result.lockFile, result.lockID = lockFile, lockID
+	if err := result.doFlock("lock", lockFile, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return nil, store.ErrLocked
 		}
+		return nil, fmt.Errorf("lock filestore: %w", err)
+	}
+	locked = true
+	if err := result.verifyParentAndLock(); err != nil {
 		return nil, err
 	}
-	state, recoveredOffset, frameCount, err := load(file)
+
+	dataFile, dataID, err := openRegularAt(parent, dataName)
 	if err != nil {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-		return nil, err
+		return nil, fmt.Errorf("open filestore data: %w", err)
 	}
-	info, err := file.Stat()
+	result.file, result.dataID = dataFile, dataID
+	dataInfo, err := dataFile.Stat()
 	if err != nil {
 		return nil, err
 	}
-	if frameCount == 0 && recoveredOffset < info.Size() {
-		if err := file.Truncate(recoveredOffset); err != nil {
-			return nil, err
+	initialSize := dataInfo.Size()
+	state, recoveredOffset, frameCount, partialTail, err := load(dataFile)
+	if err != nil {
+		return nil, err
+	}
+	if initialSize > 0 && frameCount == 0 && !partialV2Prefix(dataFile, initialSize) {
+		return nil, store.ErrCorrupt
+	}
+	result.state, result.frameCount = state, frameCount
+	if partialTail {
+		if err := result.doTruncate(dataFile, recoveredOffset); err != nil {
+			return nil, fmt.Errorf("truncate incomplete filestore tail: %w", err)
 		}
-		if err := file.Sync(); err != nil {
-			return nil, err
+		if err := result.doSync("data-sync", dataFile); err != nil {
+			return nil, fmt.Errorf("sync recovered filestore: %w", err)
 		}
 	}
-	result := &Store{file: file, path: path, state: state}
-	if frameCount > 1 || (frameCount == 1 && recoveredOffset < info.Size()) {
+	if frameCount > 1 {
 		frame, frameErr := encodeFrame(state)
 		if frameErr != nil {
 			return nil, frameErr
 		}
 		if err := result.replaceFrame(frame); err != nil {
-			_ = result.Close()
 			return nil, err
 		}
 	}
-	failed = false
+	// Open never reports success until both persistent objects and the pinned,
+	// canonical parent directory have crossed an fsync barrier.
+	if err := result.doSync("lock-sync", result.lockFile); err != nil {
+		return nil, fmt.Errorf("sync filestore lock: %w", err)
+	}
+	if err := result.doSync("data-sync", result.file); err != nil {
+		return nil, fmt.Errorf("sync filestore data: %w", err)
+	}
+	if err := result.doSync("dir-sync", result.parent); err != nil {
+		return nil, fmt.Errorf("sync filestore parent: %w", err)
+	}
+	if err := result.verifyAuthority(); err != nil {
+		return nil, err
+	}
+	succeeded = true
 	return result, nil
 }
 
@@ -131,9 +219,11 @@ func (fileStore *Store) Close() error {
 		return nil
 	}
 	fileStore.closed = true
-	unlockErr := syscall.Flock(int(fileStore.file.Fd()), syscall.LOCK_UN)
-	closeErr := fileStore.file.Close()
-	return errors.Join(unlockErr, closeErr)
+	dataCloseErr := fileStore.doClose("data-close", fileStore.file)
+	unlockErr := fileStore.doFlock("unlock", fileStore.lockFile, syscall.LOCK_UN)
+	lockCloseErr := fileStore.doClose("lock-close", fileStore.lockFile)
+	parentCloseErr := fileStore.doClose("parent-close", fileStore.parent)
+	return errors.Join(unlockErr, dataCloseErr, lockCloseErr, parentCloseErr)
 }
 
 func (fileStore *Store) Commit(ctx context.Context, transaction store.Transaction) (store.CommitResult, error) {
@@ -599,22 +689,39 @@ func (fileStore *Store) append(state diskState) error {
 	if err != nil {
 		return err
 	}
-	info, err := fileStore.file.Stat()
-	if err != nil {
+	if err := fileStore.ensureOpen(); err != nil {
 		return err
 	}
-	if shouldCompact(info.Size(), int64(len(frame))) {
-		return fileStore.replaceFrame(frame)
+	if err := fileStore.verifyAuthority(); err != nil {
+		fileStore.poisoned = err
+		return err
+	}
+	info, err := fileStore.file.Stat()
+	if err != nil {
+		fileStore.poisoned = err
+		return err
+	}
+	if shouldCompact(info.Size(), int64(len(frame)), fileStore.frameCount) {
+		err = fileStore.replaceFrame(frame)
+		if err != nil {
+			fileStore.poisoned = err
+		}
+		return err
 	}
 	if _, err := fileStore.file.Seek(0, io.SeekEnd); err != nil {
 		fileStore.poisoned = err
 		return err
 	}
-	if err := writeAll(fileStore.file, frame); err != nil {
+	if err := fileStore.writeAll("data-write", fileStore.file, frame); err != nil {
 		fileStore.poisoned = err
 		return err
 	}
-	if err := fileStore.file.Sync(); err != nil {
+	if err := fileStore.doSync("data-sync", fileStore.file); err != nil {
+		fileStore.poisoned = err
+		return err
+	}
+	fileStore.frameCount++
+	if err := fileStore.verifyAuthority(); err != nil {
 		fileStore.poisoned = err
 		return err
 	}
@@ -629,127 +736,490 @@ func encodeFrame(state diskState) ([]byte, error) {
 	if len(payload) > maxFrameBytes {
 		return nil, fmt.Errorf("durable frame exceeds %d bytes", maxFrameBytes)
 	}
-	frame := make([]byte, frameHeader+len(payload)+frameChecksum)
-	binary.BigEndian.PutUint64(frame[:frameHeader], uint64(len(payload)))
+	if len(payload) == 0 {
+		return nil, errors.New("durable frame payload is empty")
+	}
+	encodedLength := frameHeader + len(payload) + frameFooter
+	frame := make([]byte, encodedLength)
+	copy(frame[:8], frameMagic[:])
+	binary.BigEndian.PutUint16(frame[8:10], frameFormatVersion)
+	binary.BigEndian.PutUint16(frame[10:12], frameHeader)
+	binary.BigEndian.PutUint64(frame[framePayloadLength:framePayloadLength+8], uint64(len(payload)))
+	binary.BigEndian.PutUint64(frame[frameEncodedLength:frameEncodedLength+8], uint64(encodedLength))
+	payloadSum := sha256.Sum256(payload)
+	copy(frame[framePayloadDigest:framePayloadDigest+sha256.Size], payloadSum[:])
+	headerSum := sha256.Sum256(frame[:frameHeaderCore])
+	copy(frame[frameHeaderCore:frameHeader], headerSum[:])
 	copy(frame[frameHeader:], payload)
-	sum := sha256.Sum256(payload)
-	copy(frame[frameHeader+len(payload):], sum[:])
+	footer := frame[frameHeader+len(payload):]
+	copy(footer[:8], frameCommitMagic[:])
+	binary.BigEndian.PutUint16(footer[8:10], frameFormatVersion)
+	binary.BigEndian.PutUint16(footer[10:12], frameFooter)
+	binary.BigEndian.PutUint64(footer[footerPayloadLength:footerPayloadLength+8], uint64(len(payload)))
+	binary.BigEndian.PutUint64(footer[footerEncodedLength:footerEncodedLength+8], uint64(encodedLength))
+	copy(footer[footerPayloadDigest:footerPayloadDigest+sha256.Size], payloadSum[:])
+	copy(footer[footerHeaderDigest:footerHeaderDigest+sha256.Size], headerSum[:])
+	footerSum := sha256.Sum256(footer[:frameFooterCore])
+	copy(footer[frameFooterCore:frameFooter], footerSum[:])
 	return frame, nil
 }
 
-func shouldCompact(currentBytes, nextFrameBytes int64) bool {
+func shouldCompact(currentBytes, nextFrameBytes int64, frameCount int) bool {
 	return currentBytes+nextFrameBytes > maxJournalBytes ||
-		currentBytes > nextFrameBytes*int64(retainedFrameBudget-1)
+		frameCount >= retainedFrameBudget
 }
 
-// replaceFrame installs a complete snapshot on a new, already-locked inode.
-// Locking the stage before rename closes the process-ownership race: another
-// controller can observe either locked inode, never an unlocked path between
-// replacement and file-handle handoff.
+// replaceFrame installs a complete snapshot while the independent sidecar lock
+// remains held. All namespace operations are relative to the pinned parent fd,
+// so replacing the path's parent cannot redirect an in-flight compaction.
 func (fileStore *Store) replaceFrame(frame []byte) error {
-	directory := filepath.Dir(fileStore.path)
-	stage, err := os.CreateTemp(directory, "."+filepath.Base(fileStore.path)+".compact-*")
+	if err := fileStore.verifyAuthority(); err != nil {
+		return err
+	}
+	stageName, stage, err := createStageAt(fileStore.parent, fileStore.dataName)
 	if err != nil {
 		return err
 	}
-	stagePath := stage.Name()
 	installed := false
 	defer func() {
 		if installed {
 			return
 		}
-		_ = syscall.Flock(int(stage.Fd()), syscall.LOCK_UN)
-		_ = stage.Close()
-		_ = os.Remove(stagePath)
+		_ = fileStore.doClose("stage-close", stage)
+		_ = syscall.Unlinkat(int(fileStore.parent.Fd()), stageName)
 	}()
-	if err := stage.Chmod(0o600); err != nil {
+	if err := fileStore.writeAll("stage-write", stage, frame); err != nil {
 		return err
 	}
-	if err := syscall.Flock(int(stage.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := fileStore.doSync("data-sync", stage); err != nil {
 		return err
 	}
-	if err := writeAll(stage, frame); err != nil {
+	dataID, err := regularIdentity(stage)
+	if err != nil {
 		return err
 	}
-	if err := stage.Sync(); err != nil {
-		return err
-	}
-	if err := os.Rename(stagePath, fileStore.path); err != nil {
+	if err := fileStore.doRename(stageName, fileStore.dataName); err != nil {
 		return err
 	}
 	installed = true
 	prior := fileStore.file
 	fileStore.file = stage
-	parentErr := syncParent(fileStore.path)
-	unlockErr := syscall.Flock(int(prior.Fd()), syscall.LOCK_UN)
-	closeErr := prior.Close()
-	if err := errors.Join(parentErr, unlockErr, closeErr); err != nil {
-		fileStore.poisoned = err
-		return err
+	fileStore.dataID = dataID
+	fileStore.frameCount = 1
+	directorySyncErr := fileStore.doSync("dir-sync", fileStore.parent)
+	authorityErr := fileStore.verifyAuthority()
+	priorCloseErr := fileStore.doClose("replaced-data-close", prior)
+	return errors.Join(directorySyncErr, authorityErr, priorCloseErr)
+}
+
+type frameMetadata struct {
+	payloadLength uint64
+	encodedLength uint64
+	payloadDigest [sha256.Size]byte
+	headerDigest  [sha256.Size]byte
+}
+
+// load validates every committed frame within explicit byte and frame-count
+// limits. Only a suffix that cannot contain a valid commit footer is a crash
+// tail; any malformed committed frame fails closed instead of rolling back.
+func load(file *os.File) (diskState, int64, int, bool, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return diskState{}, 0, 0, false, err
+	}
+	fileSize := info.Size()
+	if fileSize < 0 || fileSize > maxRecoveryBytes {
+		return diskState{}, 0, 0, false, store.ErrCorrupt
+	}
+	offset := int64(0)
+	frameCount := 0
+	latest := emptyState()
+	header := make([]byte, frameHeader)
+	for offset < fileSize {
+		if frameCount >= retainedFrameBudget {
+			return diskState{}, offset, frameCount, false, store.ErrCorrupt
+		}
+		remaining := fileSize - offset
+		if remaining < frameHeader {
+			return latest, offset, frameCount, true, nil
+		}
+		if _, err := file.ReadAt(header, offset); err != nil {
+			return diskState{}, offset, frameCount, false, err
+		}
+		metadata, err := decodeHeader(header)
+		if err != nil {
+			return diskState{}, offset, frameCount, false, err
+		}
+		frameBytes := int64(metadata.encodedLength)
+		if frameBytes > remaining {
+			committed, footerErr := committedFooterInRange(file, offset, remaining)
+			if footerErr != nil {
+				return diskState{}, offset, frameCount, false, footerErr
+			}
+			if committed {
+				return diskState{}, offset, frameCount, false, store.ErrCorrupt
+			}
+			return latest, offset, frameCount, true, nil
+		}
+		payload := make([]byte, int(metadata.payloadLength))
+		if _, err := file.ReadAt(payload, offset+frameHeader); err != nil {
+			return diskState{}, offset, frameCount, false, err
+		}
+		payloadSum := sha256.Sum256(payload)
+		if !bytes.Equal(payloadSum[:], metadata.payloadDigest[:]) {
+			return diskState{}, offset, frameCount, false, store.ErrCorrupt
+		}
+		footer := make([]byte, frameFooter)
+		footerOffset := offset + frameHeader + int64(metadata.payloadLength)
+		if _, err := file.ReadAt(footer, footerOffset); err != nil {
+			return diskState{}, offset, frameCount, false, err
+		}
+		footerMetadata, err := decodeFooter(footer)
+		if err != nil || footerMetadata != metadata {
+			return diskState{}, offset, frameCount, false, store.ErrCorrupt
+		}
+		var state diskState
+		if err := canonicaljson.UnmarshalStrictWithLimits(payload, &state, frameJSONLimits()); err != nil {
+			return diskState{}, offset, frameCount, false, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
+		}
+		if err := validateState(state); err != nil {
+			return diskState{}, offset, frameCount, false, err
+		}
+		latest = state
+		offset += frameBytes
+		frameCount++
+	}
+	return latest, offset, frameCount, false, nil
+}
+
+func decodeHeader(header []byte) (frameMetadata, error) {
+	if len(header) != frameHeader || !bytes.Equal(header[:8], frameMagic[:]) ||
+		binary.BigEndian.Uint16(header[8:10]) != frameFormatVersion ||
+		binary.BigEndian.Uint16(header[10:12]) != frameHeader ||
+		binary.BigEndian.Uint32(header[frameFlagOffset:framePayloadLength]) != 0 {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	headerSum := sha256.Sum256(header[:frameHeaderCore])
+	if !bytes.Equal(header[frameHeaderCore:], headerSum[:]) {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	metadata := frameMetadata{
+		payloadLength: binary.BigEndian.Uint64(header[framePayloadLength : framePayloadLength+8]),
+		encodedLength: binary.BigEndian.Uint64(header[frameEncodedLength : frameEncodedLength+8]),
+	}
+	copy(metadata.payloadDigest[:], header[framePayloadDigest:framePayloadDigest+sha256.Size])
+	copy(metadata.headerDigest[:], header[frameHeaderCore:frameHeader])
+	if metadata.payloadLength == 0 || metadata.payloadLength > maxFrameBytes ||
+		metadata.encodedLength != frameHeader+metadata.payloadLength+frameFooter ||
+		metadata.encodedLength > maxEncodedFrameBytes {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	return metadata, nil
+}
+
+func decodeFooter(footer []byte) (frameMetadata, error) {
+	if len(footer) != frameFooter || !bytes.Equal(footer[:8], frameCommitMagic[:]) ||
+		binary.BigEndian.Uint16(footer[8:10]) != frameFormatVersion ||
+		binary.BigEndian.Uint16(footer[10:12]) != frameFooter ||
+		binary.BigEndian.Uint32(footer[frameFlagOffset:footerPayloadLength]) != 0 {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	footerSum := sha256.Sum256(footer[:frameFooterCore])
+	if !bytes.Equal(footer[frameFooterCore:], footerSum[:]) {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	metadata := frameMetadata{
+		payloadLength: binary.BigEndian.Uint64(footer[footerPayloadLength : footerPayloadLength+8]),
+		encodedLength: binary.BigEndian.Uint64(footer[footerEncodedLength : footerEncodedLength+8]),
+	}
+	copy(metadata.payloadDigest[:], footer[footerPayloadDigest:footerPayloadDigest+sha256.Size])
+	copy(metadata.headerDigest[:], footer[footerHeaderDigest:footerHeaderDigest+sha256.Size])
+	if metadata.payloadLength == 0 || metadata.payloadLength > maxFrameBytes ||
+		metadata.encodedLength != frameHeader+metadata.payloadLength+frameFooter ||
+		metadata.encodedLength > maxEncodedFrameBytes {
+		return frameMetadata{}, store.ErrCorrupt
+	}
+	return metadata, nil
+}
+
+// committedFooterInRange performs a bounded search for a self-validating commit
+// record whose repeated encoded length places it at the current frame boundary.
+// Its presence turns a header length mismatch into committed corruption.
+func committedFooterInRange(file *os.File, offset, remaining int64) (bool, error) {
+	if remaining < frameFooter {
+		return false, nil
+	}
+	raw := make([]byte, int(remaining))
+	if _, err := file.ReadAt(raw, offset); err != nil {
+		return false, err
+	}
+	searchAt := 0
+	for searchAt+frameFooter <= len(raw) {
+		candidateAt := bytes.Index(raw[searchAt:], frameCommitMagic[:])
+		if candidateAt < 0 {
+			return false, nil
+		}
+		candidateAt += searchAt
+		if candidateAt+frameFooter <= len(raw) {
+			metadata, err := decodeFooter(raw[candidateAt : candidateAt+frameFooter])
+			if err == nil && metadata.encodedLength == uint64(candidateAt+frameFooter) {
+				return true, nil
+			}
+		}
+		searchAt = candidateAt + 1
+	}
+	return false, nil
+}
+
+func partialV2Prefix(file *os.File, size int64) bool {
+	if size <= 0 {
+		return true
+	}
+	prefixLength := size
+	if prefixLength > int64(len(frameMagic)) {
+		prefixLength = int64(len(frameMagic))
+	}
+	prefix := make([]byte, int(prefixLength))
+	if _, err := file.ReadAt(prefix, 0); err != nil {
+		return false
+	}
+	return bytes.Equal(prefix, frameMagic[:len(prefix)])
+}
+
+type fileIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+func identityFromInfo(info os.FileInfo) (fileIdentity, uint64, error) {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fileIdentity{}, 0, errUnsafePath
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdentity{}, 0, errUnsafePath
+	}
+	return fileIdentity{device: uint64(stat.Dev), inode: stat.Ino}, uint64(stat.Nlink), nil
+}
+
+func directoryIdentity(info os.FileInfo) (fileIdentity, error) {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fileIdentity{}, errUnsafePath
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdentity{}, errUnsafePath
+	}
+	return fileIdentity{device: uint64(stat.Dev), inode: stat.Ino}, nil
+}
+
+func canonicalStorePath(path string) (string, string, error) {
+	if path == "" || strings.TrimSpace(path) != path || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", "", errors.New("filestore path must be absolute, clean, and canonical")
+	}
+	parentPath := filepath.Dir(path)
+	dataName := filepath.Base(path)
+	if dataName == "." || dataName == string(filepath.Separator) || dataName == "" {
+		return "", "", errors.New("filestore path must name a file")
+	}
+	if info, err := os.Lstat(path); err == nil {
+		if _, nlink, identityErr := identityFromInfo(info); identityErr != nil || nlink != 1 {
+			return "", "", errUnsafePath
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", err
+	}
+	if info, err := os.Lstat(path + lockSuffix); err == nil {
+		if _, nlink, identityErr := identityFromInfo(info); identityErr != nil || nlink != 1 {
+			return "", "", errUnsafePath
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", "", err
+	}
+	return parentPath, dataName, nil
+}
+
+func openCanonicalParent(parentPath string) (*os.File, fileIdentity, error) {
+	rootFD, err := syscall.Open(string(filepath.Separator), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fileIdentity{}, err
+	}
+	parent := os.NewFile(uintptr(rootFD), string(filepath.Separator))
+	relative := strings.TrimPrefix(parentPath, string(filepath.Separator))
+	if relative != "" {
+		for _, component := range strings.Split(relative, string(filepath.Separator)) {
+			fd, openErr := syscall.Openat(int(parent.Fd()), component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+			if openErr != nil {
+				_ = parent.Close()
+				return nil, fileIdentity{}, errors.Join(errUnsafePath, openErr)
+			}
+			next := os.NewFile(uintptr(fd), component)
+			if closeErr := parent.Close(); closeErr != nil {
+				_ = next.Close()
+				return nil, fileIdentity{}, closeErr
+			}
+			parent = next
+		}
+	}
+	info, err := parent.Stat()
+	if err != nil {
+		_ = parent.Close()
+		return nil, fileIdentity{}, err
+	}
+	identity, err := directoryIdentity(info)
+	if err != nil {
+		_ = parent.Close()
+		return nil, fileIdentity{}, err
+	}
+	return parent, identity, nil
+}
+
+func openRegularAt(parent *os.File, name string) (*os.File, fileIdentity, error) {
+	fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return nil, fileIdentity{}, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, fileIdentity{}, err
+	}
+	identity, nlink, err := identityFromInfo(info)
+	if err != nil || nlink != 1 {
+		_ = file.Close()
+		return nil, fileIdentity{}, errUnsafePath
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, fileIdentity{}, err
+	}
+	return file, identity, nil
+}
+
+func regularIdentity(file *os.File) (fileIdentity, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return fileIdentity{}, err
+	}
+	identity, nlink, err := identityFromInfo(info)
+	if err != nil || nlink != 1 {
+		return fileIdentity{}, errUnsafePath
+	}
+	return identity, nil
+}
+
+func createStageAt(parent *os.File, dataName string) (string, *os.File, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		var entropy [12]byte
+		if _, err := rand.Read(entropy[:]); err != nil {
+			return "", nil, err
+		}
+		name := "." + dataName + ".compact-" + hex.EncodeToString(entropy[:])
+		fd, err := syscall.Openat(int(parent.Fd()), name, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
+		if errors.Is(err, syscall.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		return name, os.NewFile(uintptr(fd), name), nil
+	}
+	return "", nil, errors.New("could not allocate filestore stage file")
+}
+
+func (fileStore *Store) verifyParentAndLock() error {
+	parentInfo, err := os.Lstat(fileStore.parentPath)
+	if err != nil {
+		return errors.Join(errUnsafePath, err)
+	}
+	parentID, err := directoryIdentity(parentInfo)
+	if err != nil || parentID != fileStore.parentID {
+		return errUnsafePath
+	}
+	lockInfo, err := os.Lstat(fileStore.path + lockSuffix)
+	if err != nil {
+		return errors.Join(errUnsafePath, err)
+	}
+	lockID, nlink, err := identityFromInfo(lockInfo)
+	if err != nil || nlink != 1 || lockID != fileStore.lockID {
+		return errUnsafePath
 	}
 	return nil
 }
 
-// load scans only fixed-size frame headers, seeks over superseded full
-// snapshots, and validates/decodes the newest complete frame. A truncated tail
-// is recoverable; a malformed frame boundary or corrupt newest frame is not.
-func load(file *os.File) (diskState, int64, int, error) {
-	info, err := file.Stat()
+func (fileStore *Store) verifyAuthority() error {
+	if err := fileStore.verifyParentAndLock(); err != nil {
+		return err
+	}
+	dataInfo, err := os.Lstat(fileStore.path)
 	if err != nil {
-		return diskState{}, 0, 0, err
+		return errors.Join(errUnsafePath, err)
 	}
-	fileSize := info.Size()
-	offset := int64(0)
-	latestOffset := int64(-1)
-	latestLength := int64(0)
-	recoveredOffset := int64(0)
-	frameCount := 0
-	header := make([]byte, frameHeader)
-	for offset < fileSize {
-		remaining := fileSize - offset
-		if remaining < frameHeader {
-			break
+	dataID, nlink, err := identityFromInfo(dataInfo)
+	if err != nil || nlink != 1 || dataID != fileStore.dataID || dataID == fileStore.lockID {
+		return errUnsafePath
+	}
+	return nil
+}
+
+func (fileStore *Store) writeAll(operation string, file *os.File, raw []byte) error {
+	for len(raw) > 0 {
+		written, err := fileStore.doWrite(operation, file, raw)
+		if err != nil {
+			return err
 		}
-		if _, err := file.ReadAt(header, offset); err != nil {
-			return diskState{}, recoveredOffset, frameCount, err
+		if written == 0 {
+			return io.ErrShortWrite
 		}
-		length := binary.BigEndian.Uint64(header)
-		if length == 0 || length > maxFrameBytes {
-			return diskState{}, recoveredOffset, frameCount, store.ErrCorrupt
-		}
-		frameBytes := int64(frameHeader) + int64(length) + int64(frameChecksum)
-		if frameBytes > remaining {
-			break
-		}
-		latestOffset = offset
-		latestLength = int64(length)
-		offset += frameBytes
-		recoveredOffset = offset
-		frameCount++
+		raw = raw[written:]
 	}
-	if frameCount == 0 {
-		return emptyState(), 0, 0, nil
+	return nil
+}
+
+func (fileStore *Store) doWrite(operation string, file *os.File, raw []byte) (int, error) {
+	if fileStore.hooks != nil && fileStore.hooks.write != nil {
+		return fileStore.hooks.write(operation, file, raw)
 	}
-	payload := make([]byte, int(latestLength))
-	if _, err := file.ReadAt(payload, latestOffset+frameHeader); err != nil {
-		return diskState{}, recoveredOffset, frameCount, err
+	return file.Write(raw)
+}
+
+func (fileStore *Store) doSync(operation string, file *os.File) error {
+	if fileStore.hooks != nil && fileStore.hooks.sync != nil {
+		return fileStore.hooks.sync(operation, file)
 	}
-	checksum := make([]byte, frameChecksum)
-	if _, err := file.ReadAt(checksum, latestOffset+frameHeader+latestLength); err != nil {
-		return diskState{}, recoveredOffset, frameCount, err
+	return file.Sync()
+}
+
+func (fileStore *Store) doRename(oldName, newName string) error {
+	if fileStore.hooks != nil && fileStore.hooks.rename != nil {
+		return fileStore.hooks.rename(fileStore.parent, oldName, newName)
 	}
-	sum := sha256.Sum256(payload)
-	if !bytes.Equal(checksum, sum[:]) {
-		return diskState{}, recoveredOffset, frameCount, store.ErrCorrupt
+	return syscall.Renameat(int(fileStore.parent.Fd()), oldName, int(fileStore.parent.Fd()), newName)
+}
+
+func (fileStore *Store) doFlock(operation string, file *os.File, how int) error {
+	if fileStore.hooks != nil && fileStore.hooks.flock != nil {
+		return fileStore.hooks.flock(operation, file, how)
 	}
-	var state diskState
-	if err := canonicaljson.UnmarshalStrictWithLimits(payload, &state, frameJSONLimits()); err != nil {
-		return diskState{}, recoveredOffset, frameCount, fmt.Errorf("%w: %v", store.ErrCorrupt, err)
+	return syscall.Flock(int(file.Fd()), how)
+}
+
+func (fileStore *Store) doClose(operation string, file *os.File) error {
+	if file == nil {
+		return nil
 	}
-	if err := validateState(state); err != nil {
-		return diskState{}, recoveredOffset, frameCount, err
+	if fileStore.hooks != nil && fileStore.hooks.close != nil {
+		return fileStore.hooks.close(operation, file)
 	}
-	return state, recoveredOffset, frameCount, nil
+	return file.Close()
+}
+
+func (fileStore *Store) doTruncate(file *os.File, size int64) error {
+	if fileStore.hooks != nil && fileStore.hooks.truncate != nil {
+		return fileStore.hooks.truncate(file, size)
+	}
+	return file.Truncate(size)
 }
 
 func validateState(state diskState) error {
@@ -866,20 +1336,6 @@ func normalizeRaw(raw json.RawMessage) (json.RawMessage, string, error) {
 	return json.RawMessage(canonical), digest, err
 }
 
-func writeAll(writer io.Writer, raw []byte) error {
-	for len(raw) > 0 {
-		written, err := writer.Write(raw)
-		if err != nil {
-			return err
-		}
-		if written == 0 {
-			return io.ErrShortWrite
-		}
-		raw = raw[written:]
-	}
-	return nil
-}
-
 func (fileStore *Store) ensureOpen() error {
 	if fileStore.closed {
 		return os.ErrClosed
@@ -887,16 +1343,7 @@ func (fileStore *Store) ensureOpen() error {
 	if fileStore.poisoned != nil {
 		return fmt.Errorf("durable store write state is uncertain: %w", fileStore.poisoned)
 	}
-	return nil
-}
-
-func syncParent(path string) error {
-	directory, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	return fileStore.verifyAuthority()
 }
 
 func cloneRaw(raw json.RawMessage) json.RawMessage { return append(json.RawMessage(nil), raw...) }
