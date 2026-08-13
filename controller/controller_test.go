@@ -89,7 +89,8 @@ func TestControllerExecutesPinnedEntrypointAndRecoversDurableResult(t *testing.T
 		t.Fatalf("listed runs = %#v, err = %v", runs, err)
 	}
 	graph, err := fixture.controller.OwnershipGraph(t.Context(), run.RunID)
-	if err != nil || graph.Revision != 1 || graph.Run.Revision+1 != run.Revision || len(graph.Invocations) != 2 {
+	if err != nil || graph.Revision != 1 || graph.Run.Revision != run.Revision ||
+		graph.Run.Status != contracts.RunSucceeded || len(graph.Invocations) != 2 {
 		t.Fatalf("ownership graph = %#v, terminal revision=%d err=%v", graph, run.Revision, err)
 	}
 	facts, err := ownership.ClosureFacts(graph)

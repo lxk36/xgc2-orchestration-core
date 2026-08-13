@@ -16,8 +16,10 @@ func ownershipGraphKey(runID string) store.AggregateKey {
 }
 
 // OwnershipGraph returns the exact graph snapshot persisted in the same
-// transaction that closed the Run. Its embedded Run is deliberately the
-// pre-terminal revision against which closure was proved.
+// transaction that closed the Run, materialized with that transaction's
+// terminal Run revision. The durable payload retains the pre-terminal Run
+// against which closure was proved; callers should not have to join the proof
+// snapshot with the Run aggregate themselves to discover the committed state.
 func (controller *Controller) OwnershipGraph(ctx context.Context, runID string) (contracts.OwnershipGraph, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(runID) {
 		return contracts.OwnershipGraph{}, errors.New("controller, context, and Run identity are required")
@@ -26,7 +28,23 @@ func (controller *Controller) OwnershipGraph(ctx context.Context, runID string) 
 	if err != nil {
 		return contracts.OwnershipGraph{}, err
 	}
-	return decodeOwnershipGraph(record)
+	graph, err := decodeOwnershipGraph(record)
+	if err != nil {
+		return contracts.OwnershipGraph{}, err
+	}
+	runRecord, err := controller.store.GetAggregate(ctx, runKey(runID))
+	if err != nil {
+		return contracts.OwnershipGraph{}, err
+	}
+	run, err := decodeRun(runRecord)
+	if err != nil {
+		return contracts.OwnershipGraph{}, err
+	}
+	if !run.Status.Terminal() || run.Revision != graph.Run.Revision+1 {
+		return contracts.OwnershipGraph{}, errors.New("durable ownership graph is not bound to its terminal Run")
+	}
+	graph.Run = run
+	return graph, nil
 }
 
 func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run contracts.Run) (contracts.OwnershipGraph, contracts.RunClosureFacts, uint64, error) {
