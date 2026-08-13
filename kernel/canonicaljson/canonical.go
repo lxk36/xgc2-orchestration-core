@@ -1,5 +1,5 @@
 // Package canonicaljson defines the bounded, deterministic JSON profile used
-// for content identities in the XGC execution protocol.
+// for content identities in the XGC orchestration protocol.
 package canonicaljson
 
 import (

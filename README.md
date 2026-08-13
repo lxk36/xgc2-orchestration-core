@@ -1,7 +1,7 @@
-# XGC Execution & Control Platform
+# XGC Orchestration Core
 
-Product-neutral contracts and execution-control infrastructure for workflows,
-managed processes, tools, and bounded agent work.
+Product-neutral contracts and orchestration infrastructure for workflows,
+managed processes, tools, experiments, and bounded agent work.
 
 The repository keeps the existing `xgc2-` GitHub family prefix, while its
 portable protocol and package identities use `xgc.*`. The kernel does not
@@ -9,7 +9,7 @@ import a product source tree or interpret product resources.
 
 ## Current scope
 
-S1 provides a standard-library-only Go contract kernel:
+The standard-library-only Go kernel currently provides:
 
 - bounded canonical JSON and `sha256:` content identities;
 - one Action admission path for manual, schedule, webhook, API, Panel, and
@@ -22,8 +22,14 @@ S1 provides a standard-library-only Go contract kernel:
   child Action input maps;
 - v1 JSON Schemas, golden fixtures, architecture gates, and a standalone
   reference definition.
+- deterministic Run, Invocation, and append-only Attempt reducers;
+- mandatory stopping and ownership-closure proof before failed, canceled, or
+  stopped Run termination;
+- prepare-before-mutate Effect state, fenced Command envelopes, immutable
+  Receipt ledgers, explicit uncertainty, and independent compensation;
+- durable outbox/reconcile/cleanup intents as reducer output, without doing I/O.
 
-S1 is not a Controller or worker runtime. It does not yet provide persistence,
+The kernel is not a Controller or worker runtime. It does not yet provide persistence,
 durable queues, process supervision, remote execution, a Studio, HTTP APIs, or
 container deployment.
 
@@ -48,6 +54,7 @@ It compiles using only this repository.
 | Normalized ingress evidence | `spec/trigger-event/v1` |
 | Typed bindings and namespace rules | `spec/value-expression/v1`, `kernel/expression` |
 | Product-neutral DAG definition | `spec/workflow-definition/v1`, `kernel/workflow` |
+| Run, Invocation, Attempt, Effect, Command, Receipt | `spec/orchestration-state/v1`, `kernel/execution`, `kernel/effect` |
 | Language-facing contract types | `sdk/go/contracts` |
 | Cross-cutting acceptance gates | `conformance/architecture`, `conformance/fixtures` |
 

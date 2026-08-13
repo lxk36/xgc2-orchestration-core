@@ -7,7 +7,7 @@
 ## Context
 
 Public source repositories in this project family use an `xgc2-` prefix. The
-execution platform must nevertheless be independently usable by several
+orchestration core must nevertheless be independently usable by several
 products and third-party node authors. A repository discovery convention must
 not leak one product's resources, database, or lifecycle into the kernel.
 
@@ -16,10 +16,10 @@ not leak one product's resources, database, or lifecycle into the kernel.
 The source repository is:
 
 ```text
-github.com/lxk36/xgc2-execution-platform
+github.com/lxk36/xgc2-orchestration-core
 ```
 
-Its public display name is **XGC Execution & Control Platform**. Portable
+Its public display name is **XGC Orchestration Core**. Portable
 protocol, workflow, package, and node identities use `xgc.*`, for example
 `xgc.workflow/v1` and `xgc.node.transform/v1`. Default namespaces are neutral,
 such as `default` and `local`.

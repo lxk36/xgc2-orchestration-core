@@ -10,8 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/lxk36/xgc2-execution-platform/kernel/canonicaljson"
-	"github.com/lxk36/xgc2-execution-platform/sdk/go/contracts"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
+	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
 type Values struct {

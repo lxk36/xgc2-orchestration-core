@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lxk36/xgc2-execution-platform/sdk/go/contracts"
+	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
 const workflowDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

@@ -14,11 +14,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/lxk36/xgc2-execution-platform/kernel/action"
-	"github.com/lxk36/xgc2-execution-platform/kernel/canonicaljson"
-	"github.com/lxk36/xgc2-execution-platform/kernel/expression"
-	"github.com/lxk36/xgc2-execution-platform/kernel/workflow"
-	"github.com/lxk36/xgc2-execution-platform/sdk/go/contracts"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/action"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/expression"
+	"github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
+	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
 const fixtureDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -211,10 +211,28 @@ func TestPublishedSchemasAreStrictJSON(t *testing.T) {
 		{"spec", "trigger-event", "v1", "schema.json"},
 		{"spec", "value-expression", "v1", "schema.json"},
 		{"spec", "workflow-definition", "v1", "schema.json"},
+		{"spec", "orchestration-state", "v1", "schema.json"},
 	}
 	for _, segments := range paths {
 		if _, err := canonicaljson.Canonicalize(readFixture(t, segments...)); err != nil {
 			t.Fatalf("%s: %v", filepath.Join(segments...), err)
+		}
+	}
+}
+
+func TestPublicStateOmitsPrivateDispatchTokens(t *testing.T) {
+	value := contracts.CommandEnvelope{
+		CommandID: "command-1", EffectID: "effect-1", IdempotencyKey: "raw-idempotency-key",
+		CapabilityToken: "raw-capability-token", IdempotencyKeyHash: fixtureDigest,
+		CapabilityTokenHash: fixtureDigest,
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, private := range []string{"raw-idempotency-key", "raw-capability-token", "IdempotencyKey", "CapabilityToken"} {
+		if strings.Contains(string(raw), private) {
+			t.Fatalf("public command JSON leaked %q: %s", private, raw)
 		}
 	}
 }
@@ -243,7 +261,7 @@ func TestKernelImportGate(t *testing.T) {
 					return errors.New("forbidden kernel import " + pathValue)
 				}
 			}
-			if strings.Contains(pathValue, ".") && !strings.HasPrefix(pathValue, "github.com/lxk36/xgc2-execution-platform/") {
+			if strings.Contains(pathValue, ".") && !strings.HasPrefix(pathValue, "github.com/lxk36/xgc2-orchestration-core/") {
 				return errors.New("external kernel import " + pathValue)
 			}
 		}

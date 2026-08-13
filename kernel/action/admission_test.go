@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lxk36/xgc2-execution-platform/sdk/go/contracts"
+	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
 const testDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
