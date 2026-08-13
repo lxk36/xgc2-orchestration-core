@@ -167,6 +167,14 @@ func Admit(request Request) (Admission, error) {
 	}, nil
 }
 
+// ValidateVersion validates the public, immutable portion of an Action
+// version without admitting a trigger. Catalogs use it before persisting an
+// exact Action pin; runtime admission remains the only path that combines it
+// with a trigger and candidate inputs.
+func ValidateVersion(version contracts.ActionVersion) error {
+	return validateAction(version)
+}
+
 func setProvenance(target map[string]contracts.InputFieldProvenance, item contracts.InputFieldProvenance) {
 	for pointer := range target {
 		if pointer == item.TargetPointer || strings.HasPrefix(pointer, item.TargetPointer+"/") ||

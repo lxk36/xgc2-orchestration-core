@@ -124,6 +124,109 @@ func TestControllerFailsClosedWhenChildActionCannotResolve(t *testing.T) {
 	}
 }
 
+func TestCoordinatorAdvancesEffectfulChildActionBeforeJoiningParent(t *testing.T) {
+	fixture := newActionCallFixture(t, nil)
+	empty := contracts.Schema{Type: contracts.TypeObject, Properties: map[string]contracts.Schema{}}
+	effectDescriptor := descriptor(t, "xgc.test.child-effect/v1", empty, empty)
+	effectDescriptor.Mode = contracts.NodeEffectful
+	effectDescriptor.RequiredCapabilities = []contracts.CapabilityRequirement{{CapabilityRef: "process.control", Scope: "target"}}
+	effectDescriptor.AllowedEffectKinds = []string{"xgc.process-start/v1"}
+	effectDescriptor.DescriptorDigest = ""
+	effectDescriptor.DescriptorDigest, _ = node.DescriptorDigest(effectDescriptor)
+	effectExecutor := &effectExecutor{descriptor: effectDescriptor}
+	callDescriptor := fixture.callExecutor.descriptor
+	callDescriptor.OutputSchema = empty
+	callDescriptor.DescriptorDigest = ""
+	callDescriptor.DescriptorDigest, _ = node.DescriptorDigest(callDescriptor)
+	fixture.callExecutor.descriptor = callDescriptor
+
+	registry := node.NewRegistry()
+	for _, executor := range []nodesdk.Executor{effectExecutor, fixture.callExecutor} {
+		if err := registry.Register(executor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := registry.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	childDefinition := contracts.WorkflowDefinition{
+		SchemaVersion: workflowkernel.SchemaVersion, WorkflowID: "child.effect-workflow", Version: "v1",
+		InputSchema: empty, ResultSchema: empty, TriggerSchema: empty, ScopeSchema: empty,
+		Entrypoints: map[string]string{"main": "launch"},
+		Nodes: []contracts.WorkflowNodeDefinition{{
+			NodeID: "launch", TypeRef: effectDescriptor.TypeRef, DescriptorDigest: effectDescriptor.DescriptorDigest,
+			InputSchema: empty, OutputSchema: empty,
+		}},
+		Edges:          []contracts.WorkflowEdge{},
+		ResultBindings: map[string][]contracts.ValueBinding{"main": {}},
+	}
+	childPlan, err := workflowkernel.Compile(childDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childAction := contracts.ActionVersion{
+		ActionID: childDefinition.WorkflowID, Version: childDefinition.Version,
+		DefinitionDigest: childPlan.DefinitionDigest, Entrypoint: "main",
+		InputSchema: empty, ResultSchema: empty,
+		AcceptedTriggerKinds: []contracts.TriggerKind{contracts.TriggerActionCall},
+	}
+	parentDefinition := fixture.request.Definition
+	parentDefinition.ResultSchema = empty
+	parentDefinition.Nodes[0].TypeRef = callDescriptor.TypeRef
+	parentDefinition.Nodes[0].DescriptorDigest = callDescriptor.DescriptorDigest
+	parentDefinition.Nodes[0].OutputSchema = empty
+	parentDefinition.Nodes[0].CallAction = &contracts.CallAction{
+		TargetActionRef: childAction.Ref(), InputSchema: empty, TriggerSchema: empty,
+		ScopeSchema: empty, ResultSchema: empty,
+		InputMap: []contracts.ValueBinding{}, TriggerMap: []contracts.ValueBinding{},
+		ScopeMap: []contracts.ValueBinding{}, ResultMap: []contracts.ResultBinding{},
+	}
+	parentDefinition.ResultBindings = map[string][]contracts.ValueBinding{"main": {}}
+	parentPlan, err := workflowkernel.Compile(parentDefinition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Definition = parentDefinition
+	fixture.request.Action.DefinitionDigest = parentPlan.DefinitionDigest
+	fixture.request.Action.ResultSchema = empty
+
+	clock := fixture.controller.clock.(*fakeClock)
+	grants := staticGrants{clock: clock}
+	workflowController, err := New(Config{
+		Store: fixture.controller.store, Nodes: registry, OwnerRef: "controller-child-effects",
+		LeaseDuration: time.Minute, InvocationTimeout: 10 * time.Second, Clock: clock,
+		Grants: grants, Actions: actionCatalogFixture{action: childAction, definition: childDefinition},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invoked, err := workflowController.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter := &successfulEffectAdapter{clock: clock}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: workflowController, Store: fixture.controller.store,
+		Planner: staticEffectPlan{clock: clock}, Credentials: staticEffectCredentials{
+			idempotency: "coordinate-idempotency", capability: "coordinate-capability",
+		},
+		Adapters: []EffectAdapter{adapter}, OwnerRef: "child-effect-coordinator", Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if err != nil || completed.Status != contracts.RunSucceeded || effectExecutor.Calls() != 1 || !adapter.seenPrivate {
+		t.Fatalf("effectful child parent = %+v failure=%+v calls=%d private=%v err=%v", completed, completed.PrimaryFailure, effectExecutor.Calls(), adapter.seenPrivate, err)
+	}
+	invocationID, _ := execution.StableInvocationID(completed.RunID, "call-child")
+	childRunID, _ := execution.StableChildRunID(invocationID, childAction.Ref())
+	child, err := workflowController.GetRun(t.Context(), childRunID)
+	if err != nil || child.Status != contracts.RunSucceeded {
+		t.Fatalf("effectful child = %+v err=%v", child, err)
+	}
+}
+
 type actionCallFixture struct {
 	controller   *Controller
 	callExecutor *unreachableCallExecutor

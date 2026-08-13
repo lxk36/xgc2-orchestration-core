@@ -132,6 +132,14 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 			return run, err
 		}
 		if snapshot.ActionCall != nil {
+			child, childErr := coordinator.AdvanceRun(ctx, snapshot.ActionCall.ChildRunID)
+			if childErr != nil && !errors.Is(childErr, ErrRunWaiting) &&
+				!errors.Is(childErr, ErrAttemptLeaseActive) && !errors.Is(childErr, ErrRunClosureOpen) {
+				return run, childErr
+			}
+			if !child.Status.Terminal() {
+				return run, ErrRunWaiting
+			}
 			if _, err := coordinator.runBatch(ctx, contracts.IntentChildResolution, "child"); err != nil {
 				return run, err
 			}

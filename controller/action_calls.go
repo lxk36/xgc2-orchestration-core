@@ -279,11 +279,17 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 	var failure *contracts.StructuredFailure
 	if child.Status == contracts.RunSucceeded {
 		childSnapshot, _, snapshotErr := controller.GetSnapshot(ctx, child.RunID)
-		if snapshotErr != nil || childSnapshot.Result == nil || childSnapshot.ResultDigest == "" {
+		if snapshotErr != nil || childSnapshot.ResultDigest == "" {
 			local := structuredFailure("action-call.child-result", errors.New("succeeded child Run has no durable result"))
 			failure = &local
 		} else {
-			mapped, mapErr := workflowkernel.ResolveCallActionResult(snapshot.Definition, wait.NodeID, childSnapshot.Result)
+			childResult := childSnapshot.Result
+			if childResult == nil {
+				// An empty object is omitted by JSON encoding but remains a valid,
+				// digest-bearing result for an Action whose result schema is empty.
+				childResult = map[string]any{}
+			}
+			mapped, mapErr := workflowkernel.ResolveCallActionResult(snapshot.Definition, wait.NodeID, childResult)
 			if mapErr != nil {
 				local := structuredFailure("action-call.result-map", mapErr)
 				failure = &local
