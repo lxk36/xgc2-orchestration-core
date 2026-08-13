@@ -124,6 +124,24 @@ type RunSnapshot struct {
 	ResultDigest  string                           `json:"resultDigest,omitempty"`
 }
 
+// Compile validates the complete product-neutral graph and every installed
+// node descriptor/schema pin without creating a Run. Authoring tools and
+// Agents use the returned canonical digests instead of reimplementing the
+// compiler or guessing wire canonicalization.
+func (controller *Controller) Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflowPlan, error) {
+	if controller == nil {
+		return contracts.CompiledWorkflowPlan{}, errors.New("controller is unavailable")
+	}
+	plan, err := workflowkernel.Compile(definition)
+	if err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	if err := controller.validateNodePins(definition); err != nil {
+		return contracts.CompiledWorkflowPlan{}, err
+	}
+	return plan, nil
+}
+
 func New(config Config) (*Controller, error) {
 	if config.Store == nil || config.Nodes == nil || !contracts.ValidIdentifier(config.OwnerRef) {
 		return nil, errors.New("controller store, sealed node registry, and owner ref are required")

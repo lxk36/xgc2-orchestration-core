@@ -403,6 +403,23 @@ func TestCoordinatorOwnsCompleteEffectWaitLoop(t *testing.T) {
 	}
 }
 
+func TestCompileReturnsCanonicalPlanWithoutCreatingRun(t *testing.T) {
+	fixture := newControllerFixture(t)
+	request := fixture.request("compile-must-not-create", "compile-command")
+	plan, err := fixture.controller.Compile(request.Definition)
+	if err != nil || plan.DefinitionDigest != request.Action.DefinitionDigest || !contracts.ValidDigest(plan.PlanDigest) {
+		t.Fatalf("compiled plan = %#v, err=%v", plan, err)
+	}
+	if _, err := fixture.controller.GetRun(t.Context(), request.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("compile created a run: %v", err)
+	}
+	tampered := request.Definition
+	tampered.Nodes[0].DescriptorDigest = testPackageDigest
+	if _, err := fixture.controller.Compile(tampered); err == nil {
+		t.Fatal("compile accepted a node descriptor pin that is not installed")
+	}
+}
+
 func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-expired")
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
