@@ -86,12 +86,16 @@ func validateDispatch(dispatch processport.Dispatch, action string) error {
 }
 
 func validateSpec(spec contracts.ProcessSpec) error {
-	for _, value := range []string{spec.ProcessID, spec.Version, spec.ExecutableRef, spec.StdoutArtifactRef, spec.StderrArtifactRef} {
+	for _, value := range []string{
+		spec.ProcessID, spec.Version, spec.ExecutableRef, spec.ParameterSetRef,
+		spec.StdoutArtifactRef, spec.StderrArtifactRef,
+	} {
 		if !contracts.ValidIdentifier(value) {
 			return errors.New("process spec identity is invalid")
 		}
 	}
-	if !contracts.ValidDigest(spec.DescriptorDigest) || !contracts.ValidDigest(spec.ArgumentTemplateDigest) {
+	if !contracts.ValidDigest(spec.DescriptorDigest) || !contracts.ValidDigest(spec.DefinitionDigest) ||
+		!contracts.ValidDigest(spec.ArgumentTemplateDigest) || !contracts.ValidDigest(spec.ParameterSetDigest) {
 		return errors.New("process spec digest is invalid")
 	}
 	if spec.WorkingDirectoryRef != "" && !contracts.ValidIdentifier(spec.WorkingDirectoryRef) {

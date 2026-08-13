@@ -117,17 +117,25 @@ type RuntimeBinding struct {
 }
 
 type ProcessSpec struct {
-	ProcessID              string            `json:"processId"`
-	Version                string            `json:"version"`
-	DescriptorDigest       string            `json:"descriptorDigest"`
-	ExecutableRef          string            `json:"executableRef"`
-	ArgumentTemplateDigest string            `json:"argumentTemplateDigest"`
-	EnvironmentRefs        map[string]string `json:"environmentRefs,omitempty"`
-	WorkingDirectoryRef    string            `json:"workingDirectoryRef,omitempty"`
-	StdoutArtifactRef      string            `json:"stdoutArtifactRef"`
-	StderrArtifactRef      string            `json:"stderrArtifactRef"`
-	GracePeriodMillis      uint64            `json:"gracePeriodMillis"`
-	KillWaitMillis         uint64            `json:"killWaitMillis"`
+	ProcessID        string `json:"processId"`
+	Version          string `json:"version"`
+	DescriptorDigest string `json:"descriptorDigest"`
+	// DefinitionDigest pins the provider-owned immutable process definition;
+	// changing a catalog entry without changing this digest fails closed.
+	DefinitionDigest       string `json:"definitionDigest"`
+	ExecutableRef          string `json:"executableRef"`
+	ArgumentTemplateDigest string `json:"argumentTemplateDigest"`
+	// ParameterSetRef names an immutable host-side parameter artifact. The
+	// public workflow persists only its reference and digest, never resolved
+	// secret values or host paths.
+	ParameterSetRef     string            `json:"parameterSetRef"`
+	ParameterSetDigest  string            `json:"parameterSetDigest"`
+	EnvironmentRefs     map[string]string `json:"environmentRefs,omitempty"`
+	WorkingDirectoryRef string            `json:"workingDirectoryRef,omitempty"`
+	StdoutArtifactRef   string            `json:"stdoutArtifactRef"`
+	StderrArtifactRef   string            `json:"stderrArtifactRef"`
+	GracePeriodMillis   uint64            `json:"gracePeriodMillis"`
+	KillWaitMillis      uint64            `json:"killWaitMillis"`
 }
 
 type ProcessIdentity struct {
