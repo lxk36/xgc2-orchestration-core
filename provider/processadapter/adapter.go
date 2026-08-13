@@ -34,6 +34,12 @@ type Resolution struct {
 	WorkingDirectory string
 	StdoutPath       string
 	StderrPath       string
+	// Spec and KnownIdentity are private stop-time resolution results. A public
+	// stop Effect carries only an external identity reference and producing Run
+	// owner; the host resolves that reference to the original immutable spec and
+	// exact provider identity behind this port.
+	Spec          *contracts.ProcessSpec
+	KnownIdentity *contracts.ProcessIdentity
 }
 
 type Resolver interface {
@@ -103,12 +109,30 @@ func (adapter *Adapter) Dispatch(
 	if err != nil {
 		return contracts.CommandLedger{}, err
 	}
+	spec := intent.Spec
+	knownIdentity := intent.KnownIdentity
+	if adapter.descriptor.Kind == KindStart {
+		if resolved.Spec != nil || resolved.KnownIdentity != nil {
+			return contracts.CommandLedger{}, errors.New("process start resolver cannot replace the public process spec or identity")
+		}
+	} else {
+		if resolved.Spec != nil {
+			spec = *resolved.Spec
+		}
+		if resolved.KnownIdentity != nil {
+			identity := *resolved.KnownIdentity
+			knownIdentity = &identity
+		}
+		if knownIdentity == nil {
+			return contracts.CommandLedger{}, errors.New("process stop resolver did not resolve the exact process identity")
+		}
+	}
 	dispatch := processport.Dispatch{
-		Envelope: envelope, Spec: intent.Spec,
+		Envelope: envelope, Spec: spec,
 		Executable: resolved.Executable, Arguments: append([]string(nil), resolved.Arguments...),
 		Environment: append([]string(nil), resolved.Environment...), WorkingDirectory: resolved.WorkingDirectory,
 		StdoutPath: resolved.StdoutPath, StderrPath: resolved.StderrPath,
-		KnownIdentity: intent.KnownIdentity, AuthorizationDigest: authorizationDigest,
+		KnownIdentity: knownIdentity, AuthorizationDigest: authorizationDigest,
 		At: adapter.clock.Now().UTC(),
 	}
 	var result processport.Result

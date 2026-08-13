@@ -38,6 +38,12 @@ inferring cleanup from a product status field.
 references/digests; resolved executable paths, arguments, environments, log
 paths, idempotency keys, and capability tokens remain private.
 
+A public stop Effect carries only the exact external identity reference and
+the producing Run owner. The host-side `processadapter.Resolver` restores the
+original immutable `ProcessSpec` and exact `ProcessIdentity` at dispatch time.
+Those PID/PGID/start-tick facts never enter authored workflows. Start-time
+resolution may not replace the authored public spec or inject an identity.
+
 The Linux reference provider:
 
 - calls `execve` through `os/exec` without an implicit shell;
