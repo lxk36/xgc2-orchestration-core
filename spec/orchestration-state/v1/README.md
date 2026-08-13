@@ -1,7 +1,8 @@
 # Orchestration state protocol v1
 
 This directory publishes the product-neutral wire envelope for immutable Run,
-Invocation/Attempt, Effect, Command/Receipt, and DomainEvent snapshots.
+Invocation/Attempt, Effect, RuntimeBinding, Command/Receipt, and DomainEvent
+snapshots.
 
 Every document is wrapped by:
 

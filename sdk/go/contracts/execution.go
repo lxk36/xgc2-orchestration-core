@@ -137,6 +137,7 @@ type RunClosureFacts struct {
 	LiveAttemptCount            uint64 `json:"liveAttemptCount"`
 	OpenWaitCount               uint64 `json:"openWaitCount"`
 	OpenChildCount              uint64 `json:"openChildCount"`
+	OpenEffectCount             uint64 `json:"openEffectCount"`
 	OpenEffectCompensationCount uint64 `json:"openEffectCompensationCount"`
 	OpenOwnedRuntimeCount       uint64 `json:"openOwnedRuntimeBindingCount"`
 	OpenOwnedResourceCount      uint64 `json:"openOwnedResourceLeaseCount"`
@@ -144,7 +145,7 @@ type RunClosureFacts struct {
 
 func (facts RunClosureFacts) Satisfied() bool {
 	return facts.ActiveInvocationCount == 0 && facts.LiveAttemptCount == 0 && facts.OpenWaitCount == 0 &&
-		facts.OpenChildCount == 0 && facts.OpenEffectCompensationCount == 0 &&
+		facts.OpenChildCount == 0 && facts.OpenEffectCount == 0 && facts.OpenEffectCompensationCount == 0 &&
 		facts.OpenOwnedRuntimeCount == 0 && facts.OpenOwnedResourceCount == 0
 }
 

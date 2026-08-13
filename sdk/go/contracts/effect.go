@@ -73,6 +73,11 @@ func (state EffectCompensationState) Valid() bool {
 	}
 }
 
+func (state EffectCompensationState) Terminal() bool {
+	return state == EffectCompensationNotRequired || state == EffectCompensationSucceeded ||
+		state == EffectCompensationFailed || state == EffectCompensationCanceled
+}
+
 type EffectIntent struct {
 	EffectID               string             `json:"effectId"`
 	NamespaceID            string             `json:"namespaceId"`

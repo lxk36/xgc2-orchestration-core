@@ -7,13 +7,14 @@
   "required": ["schemaVersion", "kind", "value"],
   "properties": {
     "schemaVersion": { "const": "xgc.orchestration-state/v1" },
-    "kind": { "enum": ["run", "invocation-ledger", "effect", "command-ledger", "domain-event"] },
+    "kind": { "enum": ["run", "invocation-ledger", "effect", "runtime-binding", "command-ledger", "domain-event"] },
     "value": true
   },
   "allOf": [
     { "if": { "properties": { "kind": { "const": "run" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/run" } } } },
     { "if": { "properties": { "kind": { "const": "invocation-ledger" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/invocationLedger" } } } },
     { "if": { "properties": { "kind": { "const": "effect" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/effect" } } } },
+    { "if": { "properties": { "kind": { "const": "runtime-binding" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/runtimeBinding" } } } },
     { "if": { "properties": { "kind": { "const": "command-ledger" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/commandLedger" } } } },
     { "if": { "properties": { "kind": { "const": "domain-event" } } }, "then": { "properties": { "value": { "$ref": "#/$defs/domainEvent" } } } }
   ],
@@ -125,6 +126,24 @@
         "compensationAttemptCount": { "type": "integer", "minimum": 0 }, "compensationCommandId": { "$ref": "#/$defs/identifier" }, "compensationFailure": { "$ref": "#/$defs/failure" }, "compensationNextAttemptAt": { "$ref": "#/$defs/timestamp" },
         "preparedAt": { "$ref": "#/$defs/timestamp" }, "applyingAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalAt": { "$ref": "#/$defs/timestamp" },
         "compensationStartedAt": { "$ref": "#/$defs/timestamp" }, "compensationFinishedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "runtimeBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["bindingId", "namespaceId", "runId", "invocationId", "nodeId", "runtimeKey", "kind", "specDigest", "providerRef", "providerDigest", "ownership", "cleanupPolicy", "state", "observedState", "health", "generation", "fencingToken", "leaseOwner", "leaseTokenHash", "leaseExpiresAt", "createdAt", "updatedAt", "revision"],
+      "properties": {
+        "bindingId": { "$ref": "#/$defs/identifier" }, "namespaceId": { "$ref": "#/$defs/identifier" }, "runId": { "$ref": "#/$defs/identifier" },
+        "invocationId": { "$ref": "#/$defs/identifier" }, "nodeId": { "$ref": "#/$defs/identifier" }, "runtimeKey": { "$ref": "#/$defs/identifier" },
+        "kind": { "$ref": "#/$defs/typeRef" }, "specDigest": { "$ref": "#/$defs/digest" }, "providerRef": { "$ref": "#/$defs/identifier" }, "providerDigest": { "$ref": "#/$defs/digest" },
+        "ownership": { "enum": ["owned", "attached", "shared"] }, "cleanupPolicy": { "enum": ["none", "on-run-close", "on-scope-exit"] },
+        "state": { "enum": ["preparing", "active", "stopping", "released", "lost"] },
+        "observedState": { "enum": ["unknown", "starting", "running", "stopping", "stopped", "failed", "lost"] },
+        "health": { "enum": ["unknown", "healthy", "degraded", "unhealthy", "lost"] }, "externalIdentity": { "$ref": "#/$defs/identifier" },
+        "generation": { "type": "integer", "minimum": 1 }, "fencingToken": { "type": "integer", "minimum": 1 },
+        "leaseOwner": { "type": "string" }, "leaseTokenHash": { "type": "string" }, "leaseExpiresAt": { "$ref": "#/$defs/timestamp" },
+        "observationDigest": { "$ref": "#/$defs/digest" }, "observationAt": { "$ref": "#/$defs/timestamp" }, "primaryFailure": { "$ref": "#/$defs/failure" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }, "activatedAt": { "$ref": "#/$defs/timestamp" }, "releaseStartedAt": { "$ref": "#/$defs/timestamp" },
+        "finishedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
       }
     },
     "revisionFence": { "type": "object", "additionalProperties": false, "required": ["targetId", "expectedRevision"], "properties": { "targetId": { "$ref": "#/$defs/identifier" }, "expectedRevision": { "type": "integer", "minimum": 1 } } },

@@ -21,22 +21,27 @@ The standard-library-only Go kernel currently provides:
 - deterministic DAG compilation, explicit data edges, dominance checks, and
   child Action input maps;
 - v1 JSON Schemas, golden fixtures, architecture gates, and a standalone
-  reference definition.
+  reference definition;
 - deterministic Run, Invocation, and append-only Attempt reducers;
 - mandatory stopping and ownership-closure proof before failed, canceled, or
   stopped Run termination;
 - prepare-before-mutate Effect state, fenced Command envelopes, immutable
   Receipt ledgers, explicit uncertainty, and independent compensation;
-- durable outbox/reconcile/cleanup intents as reducer output, without doing I/O.
+- durable outbox/reconcile/cleanup intents as reducer output, without doing I/O;
 - a durability port plus a locked, checksummed, fsynced local file adapter with
   command replay, revision CAS, inbox dedupe, expiring intent leases, and crash
   tail recovery;
 - an intent worker that requires explicit complete/retry/dead/leave results and
-  never treats uncertain external effects as automatically retryable.
+  never treats uncertain external effects as automatically retryable;
+- independent RuntimeBinding ownership, generation fencing, lease takeover,
+  provider observation, and exact ownership-graph closure facts;
+- a Linux local-process provider with process groups, PID/start-time reuse
+  protection, TERM/KILL/reap control, generation high-water fencing, and
+  immutable receipts.
 
-The repository does not yet provide process supervision, remote execution, a
-Studio, HTTP APIs, or container deployment. The file store is for a single
-local controller; public-server HA storage is a separate adapter.
+The repository does not yet provide remote execution, a Studio, HTTP APIs, or
+container deployment. The file store and local-process provider are for a
+single local controller; public-server HA storage is a separate adapter.
 
 ## Verify
 
@@ -62,6 +67,8 @@ It compiles using only this repository.
 | Run, Invocation, Attempt, Effect, Command, Receipt | `spec/orchestration-state/v1`, `kernel/execution`, `kernel/effect` |
 | Atomic state/event/intent persistence | `durable/store`, `durable/filestore` |
 | Fenced intent draining | `durable/worker` |
+| Runtime ownership and Run closure | `kernel/runtime`, `kernel/ownership` |
+| Managed process provider port/reference | `provider/process`, `provider/processlocal` |
 | Language-facing contract types | `sdk/go/contracts` |
 | Cross-cutting acceptance gates | `conformance/architecture`, `conformance/fixtures` |
 
