@@ -79,6 +79,16 @@ type ObserveCompensationCommand struct {
 	CommandID        string
 }
 
+type ReconcileCompensationCommand struct {
+	EffectID         string
+	ExpectedRevision uint64
+	EvidenceDigest   string
+	ReconciledBy     string
+	ReasonCode       string
+	CommandID        string
+	At               time.Time
+}
+
 type Decision struct {
 	Effect  contracts.EffectRecord
 	Ledger  *contracts.CommandLedger
@@ -474,6 +484,67 @@ func ObserveCompensation(current contracts.EffectRecord, ledger contracts.Comman
 	return Decision{Effect: next, Ledger: &nextLedger, Events: []contracts.DomainEvent{event}}, nil
 }
 
+// ReconcileCompensation closes Required compensation only with an explicit,
+// content-addressed, revision-fenced proof from a separate authority. It does
+// not accept a pending or running provider command.
+func ReconcileCompensation(current contracts.EffectRecord, command ReconcileCompensationCommand) (Decision, error) {
+	if err := ValidateRecord(current); err != nil {
+		return Decision{}, err
+	}
+	if command.EffectID != current.EffectID || command.ExpectedRevision != current.Revision {
+		return Decision{}, ErrRevisionConflict
+	}
+	if current.State != contracts.EffectApplied || current.Intent.CompensationPolicy != contracts.CompensationRequired ||
+		(current.CompensationState != contracts.EffectCompensationFailed &&
+			current.CompensationState != contracts.EffectCompensationCanceled &&
+			current.CompensationState != contracts.EffectCompensationRetryWait) {
+		return Decision{}, fmt.Errorf("%w: compensation is not awaiting explicit reconciliation", ErrInvalidTransition)
+	}
+	if !contracts.ValidDigest(command.EvidenceDigest) {
+		return Decision{}, errors.New("compensation reconciliation evidence digest is invalid")
+	}
+	for label, value := range map[string]string{
+		"compensation reconciledBy":              command.ReconciledBy,
+		"compensation reconciliation reasonCode": command.ReasonCode,
+		"compensation reconciliation command id": command.CommandID,
+	} {
+		if err := validateIdentity(value, label); err != nil {
+			return Decision{}, err
+		}
+	}
+	if command.At.IsZero() || command.At.Before(current.UpdatedAt) {
+		return Decision{}, errors.New("compensation reconciliation time is missing or moves backwards")
+	}
+	next := cloneRecord(current)
+	next.CompensationState = contracts.EffectCompensationReconciled
+	next.CompensationFailure = nil
+	next.CompensationNextAt = nil
+	next.CompensationReconciliation = &contracts.EffectCompensationReconciliation{
+		RequestedRevision: command.ExpectedRevision,
+		EvidenceDigest:    command.EvidenceDigest,
+		ReconciledBy:      command.ReconciledBy,
+		ReasonCode:        command.ReasonCode,
+		CommandID:         command.CommandID,
+		ObservedAt:        command.At.UTC(),
+	}
+	finished := command.At.UTC()
+	next.CompensationFinishedAt = &finished
+	next.UpdatedAt = finished
+	next.Revision++
+	if err := ValidateRecord(next); err != nil {
+		return Decision{}, err
+	}
+	event, err := newEvent(next, "effect.compensation.reconciled", command.CommandID, command.At, map[string]any{
+		"evidenceDigest": command.EvidenceDigest,
+		"reconciledBy":   command.ReconciledBy,
+		"reasonCode":     command.ReasonCode,
+	})
+	if err != nil {
+		return Decision{}, err
+	}
+	return Decision{Effect: next, Events: []contracts.DomainEvent{event}}, nil
+}
+
 func ValidateIntent(intent contracts.EffectIntent, at time.Time) error {
 	for label, value := range map[string]string{
 		"effect id": intent.EffectID, "namespace id": intent.NamespaceID, "run id": intent.RunID,
@@ -559,7 +630,7 @@ func ValidateRecord(record contracts.EffectRecord) error {
 	if record.PrimaryTerminalAt != nil && (record.PrimaryTerminalAt.Before(record.PreparedAt) || record.PrimaryTerminalAt.After(record.UpdatedAt)) {
 		return errors.New("effect terminal time is outside its lifecycle")
 	}
-	if record.PrimaryTerminalRevision > record.Revision || (record.PrimaryTerminalRevision != 0 && !record.State.Terminal()) {
+	if record.State.Terminal() != (record.PrimaryTerminalRevision != 0) || record.PrimaryTerminalRevision > record.Revision {
 		return errors.New("effect primary terminal revision is outside its lifecycle")
 	}
 	switch record.State {
@@ -846,7 +917,7 @@ func validateFence(fence contracts.TargetFence) error {
 
 func validateCompensation(record contracts.EffectRecord) error {
 	if record.Intent.CompensationPolicy == contracts.CompensationNone {
-		if record.CompensationState != contracts.EffectCompensationNotRequired {
+		if record.CompensationState != contracts.EffectCompensationNotRequired || record.CompensationReconciliation != nil {
 			return errors.New("non-compensatable effect has compensation state")
 		}
 		return nil
@@ -875,6 +946,26 @@ func validateCompensation(record contracts.EffectRecord) error {
 		if err := validateIdentity(record.CompensationCommandID, "compensation command id"); err != nil {
 			return err
 		}
+	}
+	if record.CompensationState == contracts.EffectCompensationReconciled {
+		proof := record.CompensationReconciliation
+		if record.Intent.CompensationPolicy != contracts.CompensationRequired || proof == nil || proof.RequestedRevision == 0 ||
+			proof.RequestedRevision+1 != record.Revision || !contracts.ValidDigest(proof.EvidenceDigest) ||
+			proof.ObservedAt.IsZero() || !proof.ObservedAt.Equal(record.UpdatedAt) ||
+			record.CompensationFinishedAt == nil || !record.CompensationFinishedAt.Equal(proof.ObservedAt) {
+			return errors.New("reconciled compensation proof is invalid")
+		}
+		for label, value := range map[string]string{
+			"compensation reconciledBy":              proof.ReconciledBy,
+			"compensation reconciliation reasonCode": proof.ReasonCode,
+			"compensation reconciliation command id": proof.CommandID,
+		} {
+			if err := validateIdentity(value, label); err != nil {
+				return err
+			}
+		}
+	} else if record.CompensationReconciliation != nil {
+		return errors.New("compensation reconciliation proof exists outside reconciled state")
 	}
 	return nil
 }
@@ -1010,6 +1101,10 @@ func cloneRecord(record contracts.EffectRecord) contracts.EffectRecord {
 	record.CompensationStartedAt = cloneTime(record.CompensationStartedAt)
 	record.CompensationFinishedAt = cloneTime(record.CompensationFinishedAt)
 	record.CompensationNextAt = cloneTime(record.CompensationNextAt)
+	if record.CompensationReconciliation != nil {
+		copy := *record.CompensationReconciliation
+		record.CompensationReconciliation = &copy
+	}
 	return record
 }
 

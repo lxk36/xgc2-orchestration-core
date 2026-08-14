@@ -96,9 +96,17 @@ func DeriveClosureFacts(base contracts.OwnershipClosureBase, graphRevision uint6
 		if !record.State.Terminal() || record.State == contracts.EffectUncertain {
 			facts.OpenEffectCount++
 		}
-		if record.State == contracts.EffectApplied && record.Intent.Ownership == contracts.EffectOwned &&
-			record.Intent.CompensationPolicy != contracts.CompensationNone && !record.CompensationState.Terminal() {
-			facts.OpenEffectCompensationCount++
+		if record.State == contracts.EffectApplied && record.Intent.Ownership == contracts.EffectOwned {
+			switch record.Intent.CompensationPolicy {
+			case contracts.CompensationRequired:
+				if !record.CompensationState.ClosesRequired() {
+					facts.OpenEffectCompensationCount++
+				}
+			case contracts.CompensationBestEffort:
+				if !record.CompensationState.Terminal() {
+					facts.OpenEffectCompensationCount++
+				}
+			}
 		}
 	}
 	for index, binding := range base.Runtimes {

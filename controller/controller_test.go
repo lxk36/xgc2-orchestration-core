@@ -856,6 +856,88 @@ func TestExactTerminationCancelsPreparedEffectAndReplaysFrozenCommand(t *testing
 	}
 }
 
+type intentLookupStore struct {
+	store.Store
+	missing map[string]bool
+	dead    map[string]bool
+}
+
+func (durable intentLookupStore) GetIntent(ctx context.Context, identity string) (store.IntentRecord, error) {
+	if durable.missing[identity] {
+		return store.IntentRecord{}, store.ErrNotFound
+	}
+	record, err := durable.Store.GetIntent(ctx, identity)
+	if err == nil && durable.dead[identity] {
+		record.Status = store.IntentDead
+	}
+	return record, err
+}
+
+func TestTerminationRequiredIntentLedgerFailsClosedOnMissingOrDeadIdentity(t *testing.T) {
+	fixture := newControllerFixture(t)
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-stop-intent-ledger", "invoke-stop-intent-ledger"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopping, err := fixture.controller.RequestRunTermination(t.Context(), TerminateRunRequest{
+		RunID: invoked.Run.RunID, ExpectedRevision: invoked.Run.Revision, Kind: contracts.TerminationStopped,
+		RequestedBy: "operator", ReasonCode: "operator.stop", CommandID: "stop-intent-ledger",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := fixture.controller.GetSnapshot(t.Context(), invoked.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identities, err := requiredTerminationIntentIDs(t.Context(), fixture.store, stopping.Run, snapshot)
+	if err != nil || len(identities) != 1 {
+		t.Fatalf("required intent ledger = %#v err=%v", identities, err)
+	}
+	missing := *fixture.controller
+	missing.store = intentLookupStore{Store: fixture.store, missing: map[string]bool{identities[0]: true}}
+	if _, err := missing.terminationIntentsSettled(t.Context(), stopping.Run, snapshot); err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("missing required intent error = %v", err)
+	}
+	dead := *fixture.controller
+	dead.store = intentLookupStore{Store: fixture.store, dead: map[string]bool{identities[0]: true}}
+	if _, err := dead.terminationIntentsSettled(t.Context(), stopping.Run, snapshot); err == nil || !strings.Contains(err.Error(), "dead") {
+		t.Fatalf("dead required intent error = %v", err)
+	}
+}
+
+func TestFailedAndCanceledRunsCannotBypassIntentSettlement(t *testing.T) {
+	for _, kind := range []contracts.TerminationKind{contracts.TerminationFailed, contracts.TerminationCanceled} {
+		t.Run(string(kind), func(t *testing.T) {
+			fixture := newControllerFixture(t)
+			invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-settlement-"+string(kind), "invoke-settlement-"+string(kind)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := TerminateRunRequest{
+				RunID: invoked.Run.RunID, ExpectedRevision: invoked.Run.Revision, Kind: kind,
+				RequestedBy: "operator", ReasonCode: "operator." + string(kind), CommandID: "terminate-settlement-" + string(kind),
+			}
+			if kind == contracts.TerminationFailed {
+				request.PrimaryFailure = &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "operator.failed", Message: "operator marked the run failed"}
+			}
+			stopping, err := fixture.controller.RequestRunTermination(t.Context(), request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cleanupID, err := execution.StableIntentID(contracts.IntentCleanup, stopping.Run.RunID, stopping.Run.Revision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closed := *fixture.controller
+			closed.store = intentLookupStore{Store: fixture.store, missing: map[string]bool{cleanupID: true}}
+			if terminal, err := closed.Drive(t.Context(), stopping.Run.RunID); err == nil || !strings.Contains(err.Error(), "missing") || terminal.Status.Terminal() {
+				t.Fatalf("%s settlement bypass = %#v err=%v", kind, terminal, err)
+			}
+		})
+	}
+}
+
 func TestConcurrentDuplicateTerminationHasOneDurableDecision(t *testing.T) {
 	fixture := newControllerFixture(t)
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-stop-concurrent", "invoke-stop-concurrent"))
@@ -1013,6 +1095,139 @@ func TestTerminationResumesAppliedEffectCompensationAfterControllerRestart(t *te
 	}
 }
 
+func TestRequiredCompensationFailureNeedsExactReconciliationProofToCloseRun(t *testing.T) {
+	fixture := newEffectControllerFixture(t, "run-stop-reconcile-proof")
+	fixture.executor.owned = true
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || waiting.Status != contracts.RunWaiting {
+		t.Fatalf("waiting Run = %#v err=%v", waiting, err)
+	}
+	planner := staticCompensationPlan{staticEffectPlan{clock: fixture.clock}}
+	adapter := &compensatingEffectAdapter{successfulEffectAdapter: &successfulEffectAdapter{clock: fixture.clock}}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.store, Planner: planner,
+		Credentials: plannedEffectCredentials{}, Adapters: []EffectAdapter{adapter},
+		OwnerRef: "proof-coordinator", Clock: fixture.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invocationID, _ := execution.StableInvocationID(waiting.RunID, "launch")
+	effectID, _ := effect.StableEffectID(invocationID, "start-process")
+	prepared, err := fixture.controller.GetEffect(t.Context(), effectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	begin, err := planner.PlanEffectDispatch(t.Context(), prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.BeginEffect(t.Context(), begin); err != nil {
+		t.Fatal(err)
+	}
+	if batch, err := coordinator.runBatch(t.Context(), contracts.IntentOutbox, "apply-before-proof-stop"); err != nil || batch.Completed != 1 {
+		t.Fatalf("primary outbox = %#v err=%v", batch, err)
+	}
+	current, err := fixture.controller.GetRun(t.Context(), waiting.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.RequestRunTermination(t.Context(), TerminateRunRequest{
+		RunID: current.RunID, ExpectedRevision: current.Revision, Kind: contracts.TerminationStopped,
+		RequestedBy: "operator", ReasonCode: "operator.stop", CommandID: "stop-before-proof",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.Drive(t.Context(), current.RunID); !errors.Is(err, ErrRunClosureOpen) {
+		t.Fatalf("schedule compensation error = %v", err)
+	}
+	pending, err := fixture.controller.GetEffect(t.Context(), effectID)
+	if err != nil || pending.CompensationState != contracts.EffectCompensationPending {
+		t.Fatalf("pending compensation = %#v err=%v", pending, err)
+	}
+	compensationRequest, err := planner.PlanEffectCompensation(t.Context(), pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	begun, err := fixture.controller.BeginEffectCompensation(t.Context(), compensationRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := adapter.Descriptor()
+	accepted, err := syntheticReceipt(begun.Ledger.Envelope, descriptor, testPackageDigest, 1, contracts.ReceiptAccepted, nil, fixture.clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedResult, err := fixture.controller.ObserveEffectCompensation(t.Context(), ObserveEffectCompensationRequest{
+		EffectID: effectID, Receipt: accepted, CommandID: "observe-proof-accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failure := &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "cleanup.failed", Message: "cleanup was not proved"}
+	failedReceipt, err := syntheticReceipt(acceptedResult.Ledger.Envelope, descriptor, testPackageDigest, 2, contracts.ReceiptFailed, failure, fixture.clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedResult, err := fixture.controller.ObserveEffectCompensation(t.Context(), ObserveEffectCompensationRequest{
+		EffectID: effectID, Receipt: failedReceipt, CommandID: "observe-proof-failed",
+	})
+	if err != nil || failedResult.Effect.CompensationState != contracts.EffectCompensationFailed {
+		t.Fatalf("failed compensation = %#v err=%v", failedResult.Effect, err)
+	}
+	stoppingRun, err := fixture.controller.GetRun(t.Context(), current.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := fixture.controller.deriveOwnershipClosure(t.Context(), stoppingRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err := ownership.DeriveClosureFacts(base, 1)
+	if err != nil || facts.OpenEffectCompensationCount != 1 {
+		t.Fatalf("failed Required closure = %#v err=%v", facts, err)
+	}
+	request := ReconcileEffectCompensationRequest{
+		EffectID: effectID, ExpectedRevision: failedResult.Effect.Revision,
+		EvidenceDigest: testPackageDigest, ReconciledBy: "cleanup-reconciler",
+		ReasonCode: "provider.cleanup-observed", CommandID: "reconcile-required-cleanup",
+	}
+	reconciled, err := fixture.controller.ReconcileEffectCompensation(t.Context(), request)
+	if err != nil || reconciled.Replay || reconciled.Effect.CompensationState != contracts.EffectCompensationReconciled {
+		t.Fatalf("reconciled compensation = %#v err=%v", reconciled, err)
+	}
+	replay, err := fixture.controller.ReconcileEffectCompensation(t.Context(), request)
+	if err != nil || !replay.Replay {
+		t.Fatalf("reconciliation replay = %#v err=%v", replay, err)
+	}
+	conflict := request
+	conflict.EvidenceDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	if _, err := fixture.controller.ReconcileEffectCompensation(t.Context(), conflict); !errors.Is(err, store.ErrIdentityConflict) {
+		t.Fatalf("reconciliation identity conflict = %v", err)
+	}
+	conflict = request
+	conflict.ExpectedRevision++
+	if _, err := fixture.controller.ReconcileEffectCompensation(t.Context(), conflict); !errors.Is(err, store.ErrIdentityConflict) {
+		t.Fatalf("reconciliation revision changed under one command = %v", err)
+	}
+	base, err = fixture.controller.deriveOwnershipClosure(t.Context(), stoppingRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	facts, err = ownership.DeriveClosureFacts(base, 1)
+	if err != nil || facts.OpenEffectCompensationCount != 0 {
+		t.Fatalf("reconciled Required closure = %#v err=%v", facts, err)
+	}
+	stopped, err := coordinator.AdvanceRun(t.Context(), current.RunID)
+	if err != nil || stopped.Status != contracts.RunStopped {
+		t.Fatalf("proof-closed Run = %#v err=%v", stopped, err)
+	}
+}
+
 func (plan staticEffectPlan) PlanEffectDispatch(_ context.Context, current contracts.EffectRecord) (BeginEffectRequest, error) {
 	return BeginEffectRequest{
 		EffectID: current.EffectID, CommandID: "coordinate-" + current.EffectID,
@@ -1120,9 +1335,20 @@ func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := recovered.Drive(t.Context(), invoked.Run.RunID)
+	stopping, err := recovered.Drive(t.Context(), invoked.Run.RunID)
+	if !errors.Is(err, ErrRunClosureOpen) || stopping.Status != contracts.RunStopping || fixture.executor.Calls() != 0 {
+		t.Fatalf("failed-closed run before settlement = %#v, err = %v, calls = %d", stopping, err, fixture.executor.Calls())
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: recovered, Store: fixture.store,
+		OwnerRef: "expired-effect-cleanup", Clock: fixture.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
 	if err != nil || run.Status != contracts.RunFailed || fixture.executor.Calls() != 0 {
-		t.Fatalf("failed-closed run = %#v, err = %v, calls = %d", run, err, fixture.executor.Calls())
+		t.Fatalf("failed-closed run after settlement = %#v, err = %v, calls = %d", run, err, fixture.executor.Calls())
 	}
 }
 

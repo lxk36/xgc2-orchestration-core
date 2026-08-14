@@ -325,8 +325,14 @@ func TestActiveOwnerReleasesAtEveryExactTerminalStatus(t *testing.T) {
 					t.Fatalf("wrong-key termination error = %v", err)
 				}
 				stopping, err := fixture.controller.RequestActiveRunTermination(t.Context(), fixture.key, termination)
-				if err != nil || stopping.Run.Status != contracts.RunStopping {
+				if err != nil || stopping.Run.Status != contracts.RunStopping || stopping.Run.Termination == nil ||
+					stopping.Run.Termination.RequestedRevision != termination.ExpectedRevision {
 					t.Fatalf("termination = %#v, err=%v", stopping, err)
+				}
+				wrongRevision := termination
+				wrongRevision.ExpectedRevision++
+				if _, err := fixture.controller.RequestActiveRunTermination(t.Context(), fixture.key, wrongRevision); !errors.Is(err, store.ErrIdentityConflict) {
+					t.Fatalf("owner-scoped termination changed revision under one command: %v", err)
 				}
 			}
 			var terminal contracts.Run
@@ -357,6 +363,11 @@ func TestActiveOwnerReleasesAtEveryExactTerminalStatus(t *testing.T) {
 				replay, err := fixture.controller.RequestActiveRunTermination(t.Context(), fixture.key, termination)
 				if err != nil || !replay.Replay || replay.Run.Status != terminal.Status {
 					t.Fatalf("owner-scoped termination replay = %#v, err=%v", replay, err)
+				}
+				wrongRevision := termination
+				wrongRevision.ExpectedRevision++
+				if _, err := fixture.controller.RequestActiveRunTermination(t.Context(), fixture.key, wrongRevision); !errors.Is(err, store.ErrIdentityConflict) {
+					t.Fatalf("released owner replay changed revision under one command: %v", err)
 				}
 			}
 		})

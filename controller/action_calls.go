@@ -359,7 +359,7 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 	if failure != nil {
 		runCommand.To = contracts.RunStopping
 		runCommand.Termination = &contracts.TerminationIntent{
-			Kind: contracts.TerminationFailed, RequestedBy: controller.ownerRef,
+			Kind: contracts.TerminationFailed, RequestedRevision: parent.Revision, RequestedBy: controller.ownerRef,
 			ReasonCode: failure.Code, Reason: failure.Message, PrimaryFailure: failure,
 			CommandID: commandID, RequestedAt: now,
 		}

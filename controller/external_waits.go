@@ -342,7 +342,7 @@ func (controller *Controller) resolveExternalWait(
 	if failure != nil {
 		runCommand.To = contracts.RunStopping
 		runCommand.Termination = &contracts.TerminationIntent{
-			Kind: contracts.TerminationFailed, RequestedBy: controller.ownerRef,
+			Kind: contracts.TerminationFailed, RequestedRevision: run.Revision, RequestedBy: controller.ownerRef,
 			ReasonCode: failure.Code, Reason: failure.Message, PrimaryFailure: failure,
 			CommandID: commandID, RequestedAt: now,
 		}

@@ -132,7 +132,18 @@ func TestControllerFailsClosedWhenChildActionCannotResolve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	completed, err := fixture.controller.Drive(context.Background(), invoked.Run.RunID)
+	stopping, err := fixture.controller.Drive(context.Background(), invoked.Run.RunID)
+	if !errors.Is(err, ErrRunClosureOpen) || stopping.Status != contracts.RunStopping {
+		t.Fatalf("unresolved child did not wait for cleanup settlement: %+v err=%v", stopping, err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.controller.store,
+		OwnerRef: "unresolved-child-cleanup", Clock: fixture.controller.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err := coordinator.AdvanceRun(context.Background(), invoked.Run.RunID)
 	if err != nil || completed.Status != contracts.RunFailed || completed.PrimaryFailure == nil ||
 		completed.PrimaryFailure.Code != "action-call.resolve" || !strings.Contains(completed.PrimaryFailure.Message, "catalog unavailable") {
 		t.Fatalf("failed parent = %+v err=%v", completed, err)

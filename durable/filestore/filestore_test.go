@@ -93,7 +93,7 @@ func TestAtomicCommitReplayLeaseAndRestart(t *testing.T) {
 	failure := &contracts.StructuredFailure{Class: contracts.FailureCanceled, Code: "operator.stop", Message: "operator requested stop"}
 	stopping, err := execution.TransitionRun(admitted.Run, execution.RunTransitionCommand{
 		RunID: admitted.Run.RunID, ExpectedRevision: admitted.Run.Revision, To: contracts.RunStopping,
-		Termination: &contracts.TerminationIntent{Kind: contracts.TerminationStopped, RequestedBy: "operator", ReasonCode: "operator.stop", PrimaryFailure: nil, CommandID: "stop-intent", RequestedAt: t0.Add(time.Second)},
+		Termination: &contracts.TerminationIntent{Kind: contracts.TerminationStopped, RequestedRevision: admitted.Run.Revision, RequestedBy: "operator", ReasonCode: "operator.stop", PrimaryFailure: nil, CommandID: "stop-intent", RequestedAt: t0.Add(time.Second)},
 		CommandID:   "stop-durable", At: t0.Add(time.Second),
 	})
 	_ = failure

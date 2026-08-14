@@ -11,6 +11,11 @@ identity. Only after that commit may the controller cancel Invocations, close
 prepared Effects, propagate termination to child Runs, or compensate applied
 Effects.
 
+The intent persists that pre-transition revision as `requestedRevision`.
+Replay comparison includes the Run ID and this revision; reusing one command
+with a different revision is an identity conflict even after the Run and its
+active-owner generation have become terminal.
+
 The contract deliberately separates three cases:
 
 1. A `prepared` Effect has not crossed the provider boundary. It may become
@@ -19,7 +24,10 @@ The contract deliberately separates three cases:
    until its exact Receipt or reconciliation is persisted.
 3. An `applied` owned Effect is compensated in reverse workflow order. Its
    compensation intent, command envelope, Receipts, and terminal state survive
-   controller restart.
+   controller restart. Required compensation closes ownership only on
+   `succeeded`, or on a revision-fenced `reconciled` record carrying an exact
+   evidence digest, authority, reason, command, and observation time. Failed,
+   canceled, and retry-wait compensation remain open ownership.
 
 Invocation cancellation is fenced by the frozen Run termination command and
 aggregate revision, not by disclosure of the worker's private lease token. A
@@ -36,13 +44,13 @@ new decision and one replay, not two cleanup scopes.
 
 ## Closure
 
-Before a stopped or canceled Run becomes terminal:
+Before a failed, stopped, or canceled Run becomes terminal:
 
 - direct child Runs have reached their own terminal ownership closure;
 - every local Invocation and Attempt is terminal;
 - pre-dispatch Effects are canceled;
 - applying Effects have terminal provider evidence;
-- applied owned Effects have terminal compensation evidence;
+- applied owned Effects have the compensation evidence required by policy;
 - the Run cleanup signal and any late wait/child-resolution signal are
   completed; and
 - the persisted `OwnershipGraph` derives zero open counts.
@@ -57,9 +65,13 @@ The graph is a create-once aggregate at revision 1. Any pre-existing graph
 prevents a later terminal transition instead of being overwritten.
 
 The coordinator continues outbox, wait-resolution, child-resolution, and
-cleanup intents while a Run is stopping. It never converts a missing provider
-observation into success. An uncertain Effect therefore keeps closure open
-until an explicit reconciler supplies evidence.
+cleanup intents while a Run is stopping. Settlement mechanically derives each
+required intent identity. Missing or dead intent records fail closed, and a
+terminal Effect must persist the exact revision that emitted its wait
+resolution; there is no current-revision fallback for older records. These
+rules apply equally to failed and canceled termination. The coordinator never
+converts a missing provider observation into success. An uncertain Effect
+therefore keeps closure open until an explicit reconciler supplies evidence.
 
 ## Product boundary
 

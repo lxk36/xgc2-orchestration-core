@@ -59,6 +59,15 @@ func TestReservedNamespaceInstallRequiresSameProductBuilderPermit(t *testing.T) 
 		installed.Record.AdmissionPolicyDigest != policy.Digest() {
 		t.Fatalf("reserved install = %#v, err=%v", installed, err)
 	}
+	if record, err := catalog.Get(t.Context(), spec.NamespaceID, version.Ref()); err != nil || record.AdmissionPolicyDigest != policy.Digest() {
+		t.Fatalf("reserved exact Get = %#v, err=%v", record, err)
+	}
+	if action, _, err := catalog.ResolveAction(t.Context(), spec.NamespaceID, version.Ref()); err != nil || !action.Ref().Equal(version.Ref()) {
+		t.Fatalf("reserved exact ResolveAction = %#v, err=%v", action, err)
+	}
+	if page, err := catalog.List(t.Context(), ListRequest{NamespaceID: spec.NamespaceID, Limit: 10}); err != nil || len(page.Items) != 1 {
+		t.Fatalf("reserved exact List = %#v, err=%v", page, err)
+	}
 	replayRequest := request
 	replayRequest.CommandID = "install-reserved-action-replay"
 	replayRequest.At = at.Add(time.Second)
@@ -82,6 +91,83 @@ func TestReservedNamespaceInstallRequiresSameProductBuilderPermit(t *testing.T) 
 		IngressPermit: permit, CommandID: "install-open-with-reserved-permit", At: at,
 	}); !errors.Is(err, ErrReservedNamespaceDenied) {
 		t.Fatalf("reserved permit escaped its namespace: %v", err)
+	}
+}
+
+func TestReservedNamespaceReadsRejectGenericAndStalePolicyRecords(t *testing.T) {
+	baseSpec := ingress.ReservedIngressPolicySpec{
+		PolicyRef: "experiment-builder-v1", NamespaceID: "xgc2-experiments",
+		TriggerKind: contracts.TriggerProductBuilder, TriggerVersion: "v1", SourceRef: "xgc2-experiment-builder",
+		CandidateOrigin: contracts.OriginProductBuilder, RootOnly: true,
+	}
+	for _, test := range []struct {
+		name          string
+		generic       bool
+		currentPolicy func(ingress.ReservedIngressPolicySpec) ingress.ReservedIngressPolicySpec
+	}{
+		{name: "generic-record", generic: true, currentPolicy: func(spec ingress.ReservedIngressPolicySpec) ingress.ReservedIngressPolicySpec { return spec }},
+		{name: "stale-policy-ref", currentPolicy: func(spec ingress.ReservedIngressPolicySpec) ingress.ReservedIngressPolicySpec {
+			spec.PolicyRef = "experiment-builder-v2"
+			return spec
+		}},
+		{name: "stale-policy-digest", currentPolicy: func(spec ingress.ReservedIngressPolicySpec) ingress.ReservedIngressPolicySpec {
+			spec.SourceRef = "xgc2-experiment-builder-v2"
+			return spec
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			durable, err := filestore.Open(t.TempDir() + "/actions.db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = durable.Close() })
+			definition, version := namedFixture(t, "reserved-read-action")
+			version.AcceptedTriggerKinds = []contracts.TriggerKind{contracts.TriggerProductBuilder}
+			request := InstallRequest{
+				NamespaceID: baseSpec.NamespaceID, Action: version, Definition: definition,
+				CommandID: "install-old-record", At: time.Date(2026, 8, 13, 10, 0, 0, 0, time.UTC),
+			}
+			if test.generic {
+				openCatalog, err := New(durable)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := openCatalog.Install(t.Context(), request); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				oldPolicy, oldPermit, err := ingress.NewReservedIngressPolicy(baseSpec)
+				if err != nil {
+					t.Fatal(err)
+				}
+				oldCatalog, err := NewWithConfig(Config{Store: durable, ReservedIngressPolicies: []*ingress.ReservedIngressPolicy{oldPolicy}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.IngressPermit = oldPermit
+				if _, err := oldCatalog.Install(t.Context(), request); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			currentPolicy, _, err := ingress.NewReservedIngressPolicy(test.currentPolicy(baseSpec))
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentCatalog, err := NewWithConfig(Config{Store: durable, ReservedIngressPolicies: []*ingress.ReservedIngressPolicy{currentPolicy}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := currentCatalog.Get(t.Context(), baseSpec.NamespaceID, version.Ref()); !errors.Is(err, ErrReservedNamespaceDenied) {
+				t.Fatalf("Get grandfathered stale record: %v", err)
+			}
+			if _, _, err := currentCatalog.ResolveAction(t.Context(), baseSpec.NamespaceID, version.Ref()); !errors.Is(err, ErrReservedNamespaceDenied) {
+				t.Fatalf("ResolveAction grandfathered stale record: %v", err)
+			}
+			if _, err := currentCatalog.List(t.Context(), ListRequest{NamespaceID: baseSpec.NamespaceID, Limit: 10}); !errors.Is(err, ErrReservedNamespaceDenied) {
+				t.Fatalf("List grandfathered stale record: %v", err)
+			}
+		})
 	}
 }
 

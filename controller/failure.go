@@ -82,7 +82,7 @@ func (controller *Controller) beginFailure(
 ) (contracts.Run, error) {
 	commandID := phaseCommand(run.RunID, "stop-failed", run.Revision)
 	termination := &contracts.TerminationIntent{
-		Kind: contracts.TerminationFailed, RequestedBy: controller.ownerRef,
+		Kind: contracts.TerminationFailed, RequestedRevision: run.Revision, RequestedBy: controller.ownerRef,
 		ReasonCode: failure.Code, Reason: failure.Message, PrimaryFailure: &failure,
 		CommandID: commandID, RequestedAt: at,
 	}
@@ -140,14 +140,12 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if scheduled {
 		return run, ErrRunClosureOpen
 	}
-	if run.Termination.Kind != contracts.TerminationFailed {
-		settled, settleErr := controller.terminationIntentsSettled(ctx, run, snapshot)
-		if settleErr != nil {
-			return contracts.Run{}, settleErr
-		}
-		if !settled {
-			return run, ErrRunClosureOpen
-		}
+	settled, settleErr := controller.terminationIntentsSettled(ctx, run, snapshot)
+	if settleErr != nil {
+		return contracts.Run{}, settleErr
+	}
+	if !settled {
+		return run, ErrRunClosureOpen
 	}
 	closureBase, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {

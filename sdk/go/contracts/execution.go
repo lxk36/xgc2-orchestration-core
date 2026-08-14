@@ -85,13 +85,14 @@ func (kind TerminationKind) RequiresStopping() bool {
 }
 
 type TerminationIntent struct {
-	Kind           TerminationKind    `json:"kind"`
-	RequestedBy    string             `json:"requestedBy"`
-	ReasonCode     string             `json:"reasonCode"`
-	Reason         string             `json:"reason,omitempty"`
-	PrimaryFailure *StructuredFailure `json:"primaryFailure,omitempty"`
-	CommandID      string             `json:"commandId"`
-	RequestedAt    time.Time          `json:"requestedAt"`
+	Kind              TerminationKind    `json:"kind"`
+	RequestedRevision uint64             `json:"requestedRevision"`
+	RequestedBy       string             `json:"requestedBy"`
+	ReasonCode        string             `json:"reasonCode"`
+	Reason            string             `json:"reason,omitempty"`
+	PrimaryFailure    *StructuredFailure `json:"primaryFailure,omitempty"`
+	CommandID         string             `json:"commandId"`
+	RequestedAt       time.Time          `json:"requestedAt"`
 }
 
 type ParentRunLink struct {

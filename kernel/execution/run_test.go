@@ -42,7 +42,7 @@ func TestRunRequiresStoppingAndOwnershipClosure(t *testing.T) {
 	failure := &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "node.failed", Message: "node failed", EvidenceRef: "log-1"}
 	stoppingDecision, err := TransitionRun(running, RunTransitionCommand{
 		RunID: running.RunID, ExpectedRevision: running.Revision, To: contracts.RunStopping,
-		Termination: &contracts.TerminationIntent{Kind: contracts.TerminationFailed, RequestedBy: "controller", ReasonCode: "node.failed", PrimaryFailure: failure, CommandID: "stop-intent-1", RequestedAt: t0.Add(3 * time.Second)},
+		Termination: &contracts.TerminationIntent{Kind: contracts.TerminationFailed, RequestedRevision: running.Revision, RequestedBy: "controller", ReasonCode: "node.failed", PrimaryFailure: failure, CommandID: "stop-intent-1", RequestedAt: t0.Add(3 * time.Second)},
 		CommandID:   "stop-1", At: t0.Add(3 * time.Second),
 	})
 	if err != nil {
@@ -57,6 +57,11 @@ func TestRunRequiresStoppingAndOwnershipClosure(t *testing.T) {
 	}
 
 	stopping := stoppingDecision.Run
+	tamperedTermination := cloneRun(stopping)
+	tamperedTermination.Termination.RequestedRevision++
+	if err := ValidateRun(tamperedTermination); err == nil {
+		t.Fatal("stopping Run accepted a termination intent with a different requested revision")
+	}
 	_, err = TransitionRun(stopping, RunTransitionCommand{
 		RunID: stopping.RunID, ExpectedRevision: stopping.Revision, To: contracts.RunFailed,
 		Closure: contracts.RunClosureFacts{RunRevision: stopping.Revision, LiveAttemptCount: 1}, CommandID: "finish-open", At: t0.Add(4 * time.Second),

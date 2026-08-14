@@ -84,7 +84,7 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 		}
 	}
 	if current.Termination != nil {
-		if terminationMatchesRequest(*current.Termination, request) {
+		if terminationMatchesRequest(current.RunID, *current.Termination, request) {
 			return TerminateRunResult{Run: current, Replay: true}, nil
 		}
 		if current.Termination.CommandID == request.CommandID {
@@ -103,7 +103,8 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 		at = current.UpdatedAt
 	}
 	termination := &contracts.TerminationIntent{
-		Kind: request.Kind, RequestedBy: request.RequestedBy, ReasonCode: request.ReasonCode,
+		Kind: request.Kind, RequestedRevision: request.ExpectedRevision,
+		RequestedBy: request.RequestedBy, ReasonCode: request.ReasonCode,
 		Reason: request.Reason, PrimaryFailure: cloneStructuredFailure(request.PrimaryFailure),
 		CommandID: request.CommandID, RequestedAt: at,
 	}
@@ -119,7 +120,7 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 		return TerminateRunResult{}, err
 	}
 	identityDigest, err := canonicaljson.DigestValue(map[string]any{
-		"runId": request.RunID, "expectedRevision": request.ExpectedRevision, "kind": request.Kind,
+		"runId": request.RunID, "requestedRevision": request.ExpectedRevision, "kind": request.Kind,
 		"requestedBy": request.RequestedBy, "reasonCode": request.ReasonCode, "reason": request.Reason,
 		"primaryFailure": request.PrimaryFailure, "commandId": request.CommandID,
 	})
@@ -150,12 +151,14 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 	return TerminateRunResult{Run: durable, Replay: committed.Replay}, nil
 }
 
-func terminationMatchesRequest(intent contracts.TerminationIntent, request TerminateRunRequest) bool {
+func terminationMatchesRequest(runID string, intent contracts.TerminationIntent, request TerminateRunRequest) bool {
 	left, leftErr := canonicaljson.DigestValue(map[string]any{
+		"runId": runID, "requestedRevision": intent.RequestedRevision,
 		"kind": intent.Kind, "requestedBy": intent.RequestedBy, "reasonCode": intent.ReasonCode,
 		"reason": intent.Reason, "primaryFailure": intent.PrimaryFailure, "commandId": intent.CommandID,
 	})
 	right, rightErr := canonicaljson.DigestValue(map[string]any{
+		"runId": request.RunID, "requestedRevision": request.ExpectedRevision,
 		"kind": request.Kind, "requestedBy": request.RequestedBy, "reasonCode": request.ReasonCode,
 		"reason": request.Reason, "primaryFailure": request.PrimaryFailure, "commandId": request.CommandID,
 	})
@@ -309,45 +312,14 @@ func (controller *Controller) terminateOpenChildren(ctx context.Context, run con
 }
 
 func (controller *Controller) terminationIntentsSettled(ctx context.Context, run contracts.Run, snapshot RunSnapshot) (bool, error) {
-	identities := make([]string, 0, 4)
-	runCleanup, err := execution.StableIntentID(contracts.IntentCleanup, run.RunID, run.Revision)
+	identities, err := requiredTerminationIntentIDs(ctx, controller.store, run, snapshot)
 	if err != nil {
 		return false, err
-	}
-	identities = append(identities, runCleanup)
-	if snapshot.ActionCall != nil {
-		childResolution, stableErr := execution.StableIntentID(contracts.IntentChildResolution, snapshot.ActionCall.ChildRunID, 1)
-		if stableErr != nil {
-			return false, stableErr
-		}
-		identities = append(identities, childResolution)
-	}
-	effects, err := listAllAggregates(ctx, controller.store, effectAggregateType)
-	if err != nil {
-		return false, err
-	}
-	for _, record := range effects {
-		current, decodeErr := decodeEffect(record)
-		if decodeErr != nil {
-			return false, decodeErr
-		}
-		if current.Intent.RunID != run.RunID || !current.State.Terminal() || current.State == contracts.EffectCanceled {
-			continue
-		}
-		terminalRevision := current.PrimaryTerminalRevision
-		if terminalRevision == 0 {
-			terminalRevision = current.Revision
-		}
-		waitResolution, stableErr := execution.StableIntentID(contracts.IntentWaitResolution, current.EffectID, terminalRevision)
-		if stableErr != nil {
-			return false, stableErr
-		}
-		identities = append(identities, waitResolution)
 	}
 	for _, identity := range identities {
 		intent, getErr := controller.store.GetIntent(ctx, identity)
 		if errors.Is(getErr, store.ErrNotFound) {
-			continue
+			return false, fmt.Errorf("termination required intent %s is missing", identity)
 		}
 		if getErr != nil {
 			return false, getErr
@@ -356,10 +328,57 @@ func (controller *Controller) terminationIntentsSettled(ctx context.Context, run
 		case store.IntentCompleted:
 			continue
 		case store.IntentDead:
-			return false, fmt.Errorf("termination intent %s is dead", identity)
+			return false, fmt.Errorf("termination required intent %s is dead", identity)
 		default:
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+// requiredTerminationIntentIDs mechanically derives every asynchronous
+// identity that must settle before a stopping Run may publish closure proof.
+// Each identity originates in the same transaction as its source transition.
+func requiredTerminationIntentIDs(ctx context.Context, durable store.Store, run contracts.Run, snapshot RunSnapshot) ([]string, error) {
+	identities := make([]string, 0, 4)
+	runCleanup, err := execution.StableIntentID(contracts.IntentCleanup, run.RunID, run.Revision)
+	if err != nil {
+		return nil, err
+	}
+	identities = append(identities, runCleanup)
+	if snapshot.ActionCall != nil {
+		childResolution, stableErr := execution.StableIntentID(contracts.IntentChildResolution, snapshot.ActionCall.ChildRunID, 1)
+		if stableErr != nil {
+			return nil, stableErr
+		}
+		identities = append(identities, childResolution)
+	}
+	effects, err := listAllAggregates(ctx, durable, effectAggregateType)
+	if err != nil {
+		return nil, err
+	}
+	for _, record := range effects {
+		current, decodeErr := decodeEffect(record)
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		if current.Intent.RunID != run.RunID || !current.State.Terminal() || current.State == contracts.EffectCanceled {
+			continue
+		}
+		if current.PrimaryTerminalRevision == 0 {
+			return nil, fmt.Errorf("terminal effect %s lacks its exact terminal revision", current.EffectID)
+		}
+		waitResolution, stableErr := execution.StableIntentID(contracts.IntentWaitResolution, current.EffectID, current.PrimaryTerminalRevision)
+		if stableErr != nil {
+			return nil, stableErr
+		}
+		identities = append(identities, waitResolution)
+	}
+	sort.Strings(identities)
+	for index, identity := range identities {
+		if index > 0 && identities[index-1] == identity {
+			return nil, fmt.Errorf("termination required intent %s is duplicated", identity)
+		}
+	}
+	return identities, nil
 }

@@ -16,6 +16,10 @@ An Action catalog configured with a reserved policy rejects generic installs
 in that namespace; the matching permit is required, must remain namespace
 scoped, and the Action must accept the policy's frozen trigger kind. The
 catalog record persists the authorizing policy ref and digest.
+Every catalog read path (`Get`, `ResolveAction`, and `List`) revalidates that
+seal against the policies currently registered for the namespace. A generic
+record that predates reservation, or a record admitted under an older policy
+ref or digest, is not grandfathered and has no dual-read fallback.
 
 The policy freezes namespace, trigger kind/version, source, candidate origin,
 root-only behavior, and—when requested—the active-owner kind and exact sorted

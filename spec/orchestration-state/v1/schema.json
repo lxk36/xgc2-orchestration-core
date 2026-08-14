@@ -40,9 +40,9 @@
     },
     "termination": {
       "type": "object", "additionalProperties": false,
-      "required": ["kind", "requestedBy", "reasonCode", "commandId", "requestedAt"],
+      "required": ["kind", "requestedRevision", "requestedBy", "reasonCode", "commandId", "requestedAt"],
       "properties": {
-        "kind": { "enum": ["failed", "canceled", "stopped"] }, "requestedBy": { "$ref": "#/$defs/identifier" },
+        "kind": { "enum": ["failed", "canceled", "stopped"] }, "requestedRevision": { "type": "integer", "minimum": 1 }, "requestedBy": { "$ref": "#/$defs/identifier" },
         "reasonCode": { "$ref": "#/$defs/identifier" }, "reason": { "type": "string", "maxLength": 4096 },
         "primaryFailure": { "$ref": "#/$defs/failure" }, "commandId": { "$ref": "#/$defs/identifier" }, "requestedAt": { "$ref": "#/$defs/timestamp" }
       }
@@ -166,10 +166,31 @@
         "effectId": { "$ref": "#/$defs/identifier" }, "intent": { "$ref": "#/$defs/effectIntent" }, "preparationDigest": { "$ref": "#/$defs/digest" },
         "state": { "enum": ["prepared", "applying", "applied", "failed", "uncertain", "canceled"] }, "commandId": { "$ref": "#/$defs/identifier" }, "commandIdentityDigest": { "$ref": "#/$defs/digest" },
         "externalIdentity": { "$ref": "#/$defs/identifier" }, "resultDigest": { "$ref": "#/$defs/digest" }, "resultArtifactRef": { "$ref": "#/$defs/identifier" }, "primaryFailure": { "$ref": "#/$defs/failure" },
-        "compensationState": { "enum": ["not-required", "unscheduled", "pending", "running", "retry-wait", "succeeded", "failed", "canceled"] },
-        "compensationAttemptCount": { "type": "integer", "minimum": 0 }, "compensationCommandId": { "$ref": "#/$defs/identifier" }, "compensationFailure": { "$ref": "#/$defs/failure" }, "compensationNextAttemptAt": { "$ref": "#/$defs/timestamp" },
+        "compensationState": { "enum": ["not-required", "unscheduled", "pending", "running", "retry-wait", "succeeded", "reconciled", "failed", "canceled"] },
+        "compensationAttemptCount": { "type": "integer", "minimum": 0 }, "compensationCommandId": { "$ref": "#/$defs/identifier" }, "compensationFailure": { "$ref": "#/$defs/failure" }, "compensationNextAttemptAt": { "$ref": "#/$defs/timestamp" }, "compensationReconciliation": { "$ref": "#/$defs/effectCompensationReconciliation" },
         "preparedAt": { "$ref": "#/$defs/timestamp" }, "applyingAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalAt": { "$ref": "#/$defs/timestamp" }, "primaryTerminalRevision": { "type": "integer", "minimum": 1 },
         "compensationStartedAt": { "$ref": "#/$defs/timestamp" }, "compensationFinishedAt": { "$ref": "#/$defs/timestamp" }, "updatedAt": { "$ref": "#/$defs/timestamp" }, "revision": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "state": { "enum": ["applied", "failed", "uncertain", "canceled"] } }, "required": ["state"] },
+          "then": { "required": ["primaryTerminalAt", "primaryTerminalRevision"] },
+          "else": { "not": { "anyOf": [{ "required": ["primaryTerminalAt"] }, { "required": ["primaryTerminalRevision"] }] } }
+        },
+        {
+          "if": { "properties": { "compensationState": { "const": "reconciled" } }, "required": ["compensationState"] },
+          "then": { "required": ["compensationReconciliation", "compensationFinishedAt"] },
+          "else": { "not": { "required": ["compensationReconciliation"] } }
+        }
+      ]
+    },
+    "effectCompensationReconciliation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requestedRevision", "evidenceDigest", "reconciledBy", "reasonCode", "commandId", "observedAt"],
+      "properties": {
+        "requestedRevision": { "type": "integer", "minimum": 1 }, "evidenceDigest": { "$ref": "#/$defs/digest" },
+        "reconciledBy": { "$ref": "#/$defs/identifier" }, "reasonCode": { "$ref": "#/$defs/identifier" },
+        "commandId": { "$ref": "#/$defs/identifier" }, "observedAt": { "$ref": "#/$defs/timestamp" }
       }
     },
     "runtimeBinding": {

@@ -67,6 +67,7 @@ const (
 	EffectCompensationRunning     EffectCompensationState = "running"
 	EffectCompensationRetryWait   EffectCompensationState = "retry-wait"
 	EffectCompensationSucceeded   EffectCompensationState = "succeeded"
+	EffectCompensationReconciled  EffectCompensationState = "reconciled"
 	EffectCompensationFailed      EffectCompensationState = "failed"
 	EffectCompensationCanceled    EffectCompensationState = "canceled"
 )
@@ -75,7 +76,7 @@ func (state EffectCompensationState) Valid() bool {
 	switch state {
 	case EffectCompensationNotRequired, EffectCompensationUnscheduled, EffectCompensationPending,
 		EffectCompensationRunning, EffectCompensationRetryWait, EffectCompensationSucceeded,
-		EffectCompensationFailed, EffectCompensationCanceled:
+		EffectCompensationReconciled, EffectCompensationFailed, EffectCompensationCanceled:
 		return true
 	default:
 		return false
@@ -83,8 +84,24 @@ func (state EffectCompensationState) Valid() bool {
 }
 
 func (state EffectCompensationState) Terminal() bool {
-	return state == EffectCompensationNotRequired || state == EffectCompensationSucceeded ||
+	return state == EffectCompensationNotRequired || state == EffectCompensationSucceeded || state == EffectCompensationReconciled ||
 		state == EffectCompensationFailed || state == EffectCompensationCanceled
+}
+
+// ClosesRequired reports the only durable terminal states that prove an
+// externally owned mutation no longer belongs to the Run. Failed, canceled,
+// and retry-wait observations remain open ownership.
+func (state EffectCompensationState) ClosesRequired() bool {
+	return state == EffectCompensationSucceeded || state == EffectCompensationReconciled
+}
+
+type EffectCompensationReconciliation struct {
+	RequestedRevision uint64    `json:"requestedRevision"`
+	EvidenceDigest    string    `json:"evidenceDigest"`
+	ReconciledBy      string    `json:"reconciledBy"`
+	ReasonCode        string    `json:"reasonCode"`
+	CommandID         string    `json:"commandId"`
+	ObservedAt        time.Time `json:"observedAt"`
 }
 
 type EffectIntent struct {
@@ -109,26 +126,27 @@ type EffectIntent struct {
 }
 
 type EffectRecord struct {
-	EffectID                 string                  `json:"effectId"`
-	Intent                   EffectIntent            `json:"intent"`
-	PreparationDigest        string                  `json:"preparationDigest"`
-	State                    EffectState             `json:"state"`
-	CommandID                string                  `json:"commandId"`
-	CommandIdentityDigest    string                  `json:"commandIdentityDigest"`
-	ExternalIdentity         string                  `json:"externalIdentity,omitempty"`
-	ResultDigest             string                  `json:"resultDigest,omitempty"`
-	ResultArtifactRef        string                  `json:"resultArtifactRef,omitempty"`
-	PrimaryFailure           *StructuredFailure      `json:"primaryFailure,omitempty"`
-	CompensationState        EffectCompensationState `json:"compensationState"`
-	CompensationAttemptCount uint32                  `json:"compensationAttemptCount"`
-	CompensationCommandID    string                  `json:"compensationCommandId,omitempty"`
-	CompensationFailure      *StructuredFailure      `json:"compensationFailure,omitempty"`
-	CompensationNextAt       *time.Time              `json:"compensationNextAttemptAt,omitempty"`
-	PreparedAt               time.Time               `json:"preparedAt"`
-	ApplyingAt               *time.Time              `json:"applyingAt,omitempty"`
-	PrimaryTerminalAt        *time.Time              `json:"primaryTerminalAt,omitempty"`
-	// PrimaryTerminalRevision pins the Effect revision that emitted its wait
-	// resolution intent. Zero remains readable for older compatible v1 records.
+	EffectID                   string                            `json:"effectId"`
+	Intent                     EffectIntent                      `json:"intent"`
+	PreparationDigest          string                            `json:"preparationDigest"`
+	State                      EffectState                       `json:"state"`
+	CommandID                  string                            `json:"commandId"`
+	CommandIdentityDigest      string                            `json:"commandIdentityDigest"`
+	ExternalIdentity           string                            `json:"externalIdentity,omitempty"`
+	ResultDigest               string                            `json:"resultDigest,omitempty"`
+	ResultArtifactRef          string                            `json:"resultArtifactRef,omitempty"`
+	PrimaryFailure             *StructuredFailure                `json:"primaryFailure,omitempty"`
+	CompensationState          EffectCompensationState           `json:"compensationState"`
+	CompensationAttemptCount   uint32                            `json:"compensationAttemptCount"`
+	CompensationCommandID      string                            `json:"compensationCommandId,omitempty"`
+	CompensationFailure        *StructuredFailure                `json:"compensationFailure,omitempty"`
+	CompensationNextAt         *time.Time                        `json:"compensationNextAttemptAt,omitempty"`
+	CompensationReconciliation *EffectCompensationReconciliation `json:"compensationReconciliation,omitempty"`
+	PreparedAt                 time.Time                         `json:"preparedAt"`
+	ApplyingAt                 *time.Time                        `json:"applyingAt,omitempty"`
+	PrimaryTerminalAt          *time.Time                        `json:"primaryTerminalAt,omitempty"`
+	// PrimaryTerminalRevision pins the Effect revision that atomically emitted
+	// its required wait-resolution intent.
 	PrimaryTerminalRevision uint64     `json:"primaryTerminalRevision,omitempty"`
 	CompensationStartedAt   *time.Time `json:"compensationStartedAt,omitempty"`
 	CompensationFinishedAt  *time.Time `json:"compensationFinishedAt,omitempty"`

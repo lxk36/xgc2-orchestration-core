@@ -153,7 +153,7 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 		return InstallResult{}, err
 	}
 	if existing, getErr := catalog.store.GetAggregate(ctx, key); getErr == nil {
-		current, decodeErr := decodeRecord(existing, request.NamespaceID, request.Action.Ref())
+		current, decodeErr := catalog.decodeCurrentRecord(existing, request.NamespaceID, request.Action.Ref())
 		if decodeErr != nil {
 			return InstallResult{}, decodeErr
 		}
@@ -234,7 +234,7 @@ func (catalog *Catalog) ResolveAction(ctx context.Context, namespaceID string, r
 	if err != nil {
 		return contracts.ActionVersion{}, contracts.WorkflowDefinition{}, err
 	}
-	record, err := decodeRecord(stored, namespaceID, ref)
+	record, err := catalog.decodeCurrentRecord(stored, namespaceID, ref)
 	if err != nil {
 		return contracts.ActionVersion{}, contracts.WorkflowDefinition{}, err
 	}
@@ -255,7 +255,7 @@ func (catalog *Catalog) Get(ctx context.Context, namespaceID string, ref contrac
 	if err != nil {
 		return Record{}, err
 	}
-	return decodeRecord(stored, namespaceID, ref)
+	return catalog.decodeCurrentRecord(stored, namespaceID, ref)
 }
 
 // List exposes a stable, bounded namespace projection. The durable cursor is
@@ -298,7 +298,7 @@ func (catalog *Catalog) List(ctx context.Context, request ListRequest) (Page, er
 			if candidate.NamespaceID != request.NamespaceID {
 				continue
 			}
-			decoded, decodeErr := decodeRecord(stored, candidate.NamespaceID, candidate.Action.Ref())
+			decoded, decodeErr := catalog.decodeCurrentRecord(stored, candidate.NamespaceID, candidate.Action.Ref())
 			if decodeErr != nil {
 				return Page{}, decodeErr
 			}
@@ -415,4 +415,33 @@ func decodeRecord(stored store.AggregateRecord, namespaceID string, ref contract
 		return Record{}, errors.New("durable exact Action admission policy is invalid")
 	}
 	return record, nil
+}
+
+// decodeCurrentRecord binds every read to the Catalog's currently registered
+// reserved-ingress policy seal. A generic record that predates reservation, or
+// a record admitted under an older ref/digest, is deliberately not readable.
+func (catalog *Catalog) decodeCurrentRecord(stored store.AggregateRecord, namespaceID string, ref contracts.ActionRef) (Record, error) {
+	record, err := decodeRecord(stored, namespaceID, ref)
+	if err != nil {
+		return Record{}, err
+	}
+	policies := catalog.reserved[namespaceID]
+	if len(policies) == 0 {
+		if record.AdmissionPolicyRef != "" || record.AdmissionPolicyDigest != "" {
+			return Record{}, fmt.Errorf("%w: Action record carries a policy for an unreserved namespace", ErrReservedNamespaceDenied)
+		}
+		return record, nil
+	}
+	for _, registered := range policies {
+		if record.AdmissionPolicyRef != registered.spec.PolicyRef || record.AdmissionPolicyDigest != registered.policy.Digest() {
+			continue
+		}
+		for _, kind := range record.Action.AcceptedTriggerKinds {
+			if kind == registered.spec.TriggerKind {
+				return record, nil
+			}
+		}
+		return Record{}, fmt.Errorf("%w: durable Action no longer accepts its sealed policy trigger", ErrReservedNamespaceDenied)
+	}
+	return Record{}, fmt.Errorf("%w: durable Action policy ref or digest is not current", ErrReservedNamespaceDenied)
 }

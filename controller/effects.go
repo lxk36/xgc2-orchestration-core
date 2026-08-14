@@ -58,6 +58,20 @@ type ObserveEffectCompensationRequest struct {
 	CommandID string
 }
 
+type ReconcileEffectCompensationRequest struct {
+	EffectID         string
+	ExpectedRevision uint64
+	EvidenceDigest   string
+	ReconciledBy     string
+	ReasonCode       string
+	CommandID        string
+}
+
+type ReconcileEffectCompensationResult struct {
+	Effect contracts.EffectRecord `json:"effect"`
+	Replay bool                   `json:"replay"`
+}
+
 func (controller *Controller) GetEffect(ctx context.Context, effectID string) (contracts.EffectRecord, error) {
 	record, err := controller.store.GetAggregate(ctx, effectKey(effectID))
 	if err != nil {
@@ -457,6 +471,85 @@ func (controller *Controller) ObserveEffectCompensation(ctx context.Context, req
 		}
 		result.Replay = true
 	}
+	return result, nil
+}
+
+// ReconcileEffectCompensation records exact content-addressed evidence that a
+// Required compensation no longer owns its external mutation. The request is
+// fenced to the precise failed/canceled/retry-wait Effect revision.
+func (controller *Controller) ReconcileEffectCompensation(
+	ctx context.Context,
+	request ReconcileEffectCompensationRequest,
+) (ReconcileEffectCompensationResult, error) {
+	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.EffectID) || request.ExpectedRevision == 0 ||
+		!contracts.ValidDigest(request.EvidenceDigest) || !contracts.ValidIdentifier(request.ReconciledBy) ||
+		!contracts.ValidIdentifier(request.ReasonCode) || !contracts.ValidIdentifier(request.CommandID) {
+		return ReconcileEffectCompensationResult{}, errors.New("compensation reconciliation request is invalid")
+	}
+	record, err := controller.store.GetAggregate(ctx, effectKey(request.EffectID))
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	current, err := decodeEffect(record)
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	if current.CompensationReconciliation != nil {
+		proof := current.CompensationReconciliation
+		if proof.CommandID == request.CommandID && proof.RequestedRevision == request.ExpectedRevision &&
+			proof.EvidenceDigest == request.EvidenceDigest && proof.ReconciledBy == request.ReconciledBy &&
+			proof.ReasonCode == request.ReasonCode {
+			return ReconcileEffectCompensationResult{Effect: current, Replay: true}, nil
+		}
+		if proof.CommandID == request.CommandID {
+			return ReconcileEffectCompensationResult{}, store.ErrIdentityConflict
+		}
+		return ReconcileEffectCompensationResult{}, effect.ErrRevisionConflict
+	}
+	if current.Revision != request.ExpectedRevision || record.Revision != request.ExpectedRevision {
+		return ReconcileEffectCompensationResult{}, effect.ErrRevisionConflict
+	}
+	at := controller.clock.Now().UTC()
+	if at.Before(current.UpdatedAt) {
+		at = current.UpdatedAt
+	}
+	decision, err := effect.ReconcileCompensation(current, effect.ReconcileCompensationCommand{
+		EffectID: request.EffectID, ExpectedRevision: request.ExpectedRevision,
+		EvidenceDigest: request.EvidenceDigest, ReconciledBy: request.ReconciledBy,
+		ReasonCode: request.ReasonCode, CommandID: request.CommandID, At: at,
+	})
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	mutation, err := aggregateMutation(effectKey(request.EffectID), record.Revision, decision.Effect)
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	result := ReconcileEffectCompensationResult{Effect: decision.Effect}
+	outcome, err := canonicaljson.Marshal(result)
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{
+		"operation": "effect.compensation.reconcile", "effectId": request.EffectID,
+		"expectedRevision": request.ExpectedRevision, "evidenceDigest": request.EvidenceDigest,
+		"reconciledBy": request.ReconciledBy, "reasonCode": request.ReasonCode, "commandId": request.CommandID,
+	})
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	committed, err := controller.store.Commit(ctx, store.Transaction{
+		CommandID: request.CommandID, IdentityDigest: identity,
+		Expected:  []store.ExpectedRevision{{Key: mutation.Key, Revision: record.Revision}},
+		Mutations: []store.AggregateRecord{mutation}, Events: decision.Events, Outcome: outcome, At: at,
+	})
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	if err := canonicaljson.UnmarshalStrict(committed.Outcome, &result); err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	result.Replay = committed.Replay
 	return result, nil
 }
 

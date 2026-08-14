@@ -135,6 +135,79 @@ func TestClosureFactsAreDerivedFromExactOwnershipGraph(t *testing.T) {
 	}
 }
 
+func TestRequiredCompensationFailureCancellationAndRetryKeepOwnershipOpen(t *testing.T) {
+	t0 := time.Date(2026, 8, 13, 2, 0, 0, 0, time.UTC)
+	run := admittedRun(t, "run-required-compensation", nil, "run-required-compensation", t0)
+	for _, test := range []struct {
+		name     string
+		state    contracts.EffectCompensationState
+		wantOpen uint64
+	}{
+		{name: "failed", state: contracts.EffectCompensationFailed, wantOpen: 1},
+		{name: "canceled", state: contracts.EffectCompensationCanceled, wantOpen: 1},
+		{name: "retry-wait", state: contracts.EffectCompensationRetryWait, wantOpen: 1},
+		{name: "succeeded", state: contracts.EffectCompensationSucceeded, wantOpen: 0},
+		{name: "reconciled", state: contracts.EffectCompensationReconciled, wantOpen: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record := requiredCompensationRecord(t, run.RunID, test.state, t0)
+			facts, err := DeriveClosureFacts(contracts.OwnershipClosureBase{Run: run, Effects: []contracts.EffectRecord{record}}, 1)
+			if err != nil || facts.OpenEffectCompensationCount != test.wantOpen {
+				t.Fatalf("closure facts = %#v err=%v", facts, err)
+			}
+		})
+	}
+}
+
+func requiredCompensationRecord(t *testing.T, runID string, state contracts.EffectCompensationState, at time.Time) contracts.EffectRecord {
+	t.Helper()
+	payload := map[string]any{"target": "target-1"}
+	intentDigest, err := canonicaljson.DigestValue(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := contracts.EffectIntent{
+		EffectID: "effect-required", NamespaceID: "lab", RunID: runID, InvocationID: "invocation-required",
+		PreparedAttemptID: "attempt-required", EffectKey: "external-call", Kind: "xgc.test-effect/v1", TargetRef: "target-1",
+		IntentSchemaDigest: digest, Intent: payload, IntentDigest: intentDigest, Ownership: contracts.EffectOwned,
+		CompensationPolicy: contracts.CompensationRequired, PolicyDigest: digest, DescriptorDigest: digest, Deadline: at.Add(time.Hour),
+	}
+	preparationDigest, err := canonicaljson.DigestValue(intent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyingAt := at.Add(time.Second)
+	terminalAt := at.Add(2 * time.Second)
+	updatedAt := at.Add(5 * time.Second)
+	finishedAt := updatedAt
+	record := contracts.EffectRecord{
+		EffectID: intent.EffectID, Intent: intent, PreparationDigest: preparationDigest,
+		State: contracts.EffectApplied, CommandID: "apply-required", CommandIdentityDigest: digest,
+		ExternalIdentity: "external-required", ResultDigest: digest, CompensationState: state,
+		CompensationAttemptCount: 1, CompensationCommandID: "compensate-required",
+		PreparedAt: at, ApplyingAt: &applyingAt, PrimaryTerminalAt: &terminalAt, PrimaryTerminalRevision: 4,
+		UpdatedAt: updatedAt, Revision: 7,
+	}
+	switch state {
+	case contracts.EffectCompensationFailed:
+		record.CompensationFailure = &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "cleanup.failed", Message: "cleanup failed"}
+		record.CompensationFinishedAt = &finishedAt
+	case contracts.EffectCompensationCanceled, contracts.EffectCompensationSucceeded:
+		record.CompensationFinishedAt = &finishedAt
+	case contracts.EffectCompensationRetryWait:
+		retryAt := at.Add(10 * time.Second)
+		record.CompensationFailure = &contracts.StructuredFailure{Class: contracts.FailureTransient, Code: "cleanup.retry", Message: "cleanup retrying"}
+		record.CompensationNextAt = &retryAt
+	case contracts.EffectCompensationReconciled:
+		record.CompensationFinishedAt = &finishedAt
+		record.CompensationReconciliation = &contracts.EffectCompensationReconciliation{
+			RequestedRevision: 6, EvidenceDigest: digest, ReconciledBy: "cleanup-auditor",
+			ReasonCode: "cleanup.observed", CommandID: "reconcile-required", ObservedAt: updatedAt,
+		}
+	}
+	return record
+}
+
 func admittedRun(t *testing.T, id string, parent *contracts.ParentRunLink, root string, at time.Time) contracts.Run {
 	t.Helper()
 	decision, err := execution.AdmitRun(execution.AdmitRunCommand{

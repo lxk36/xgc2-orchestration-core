@@ -230,6 +230,19 @@ func ValidateRun(run contracts.Run) error {
 		if err := validateTermination(*run.Termination); err != nil {
 			return err
 		}
+		if run.Status != contracts.RunStopping && !run.Status.Terminal() {
+			return errors.New("frozen termination intent exists outside stopping or terminal state")
+		}
+		expectedRevision := run.Termination.RequestedRevision + 1
+		if run.Status.Terminal() {
+			expectedRevision++
+			if terminalStatus(run.Termination.Kind) != run.Status {
+				return errors.New("terminal run status differs from its frozen termination intent")
+			}
+		}
+		if run.Revision != expectedRevision {
+			return errors.New("run revision is not derived from its frozen termination request")
+		}
 	}
 	if err := validateFailure(run.PrimaryFailure, run.Status == contracts.RunFailed, "run primary failure"); err != nil {
 		return err
@@ -351,8 +364,8 @@ func validateRunTransitionGuards(current contracts.Run, command RunTransitionCom
 }
 
 func validateTermination(intent contracts.TerminationIntent) error {
-	if !intent.Kind.RequiresStopping() {
-		return errors.New("termination intent kind is invalid")
+	if !intent.Kind.RequiresStopping() || intent.RequestedRevision == 0 {
+		return errors.New("termination intent kind or requested revision is invalid")
 	}
 	for label, value := range map[string]string{
 		"termination requestedBy": intent.RequestedBy, "termination reasonCode": intent.ReasonCode,

@@ -145,6 +145,86 @@ func TestCompensationHasIndependentRetryLifecycle(t *testing.T) {
 	}
 }
 
+func TestRequiredCompensationClosesOnlyOnSuccessOrExactReconciliation(t *testing.T) {
+	t0 := time.Date(2026, 8, 12, 17, 0, 0, 0, time.UTC)
+	applied := applyTestEffect(t, t0)
+	pending := transitionCompensation(t, applied, CompensationCommand{
+		To: contracts.EffectCompensationPending, CommandID: "schedule-required", At: t0.Add(4 * time.Second),
+	})
+	running := transitionCompensation(t, pending.Effect, CompensationCommand{
+		To: contracts.EffectCompensationRunning, CompensationCommandID: "compensate-required",
+		CommandID: "start-required", At: t0.Add(5 * time.Second),
+	})
+	retryAt := t0.Add(30 * time.Second)
+	retry := transitionCompensation(t, running.Effect, CompensationCommand{
+		To:      contracts.EffectCompensationRetryWait,
+		Failure: &contracts.StructuredFailure{Class: contracts.FailureTransient, Code: "cleanup.busy", Message: "cleanup is retrying"},
+		RetryAt: &retryAt, CommandID: "retry-required", At: t0.Add(6 * time.Second),
+	})
+	canceled := transitionCompensation(t, retry.Effect, CompensationCommand{
+		To: contracts.EffectCompensationCanceled, CommandID: "cancel-required", At: t0.Add(31 * time.Second),
+	})
+	failure := &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "cleanup.failed", Message: "cleanup failed"}
+	failed := transitionCompensation(t, running.Effect, CompensationCommand{
+		To: contracts.EffectCompensationFailed, Failure: failure, CommandID: "fail-required", At: t0.Add(7 * time.Second),
+	})
+	succeeded := transitionCompensation(t, running.Effect, CompensationCommand{
+		To: contracts.EffectCompensationSucceeded, CommandID: "succeed-required", At: t0.Add(7 * time.Second),
+	})
+	for name, state := range map[string]contracts.EffectCompensationState{
+		"failed": failed.Effect.CompensationState, "canceled": canceled.Effect.CompensationState,
+		"retry-wait": retry.Effect.CompensationState,
+	} {
+		if state.ClosesRequired() {
+			t.Fatalf("%s compensation closed Required ownership", name)
+		}
+	}
+	if !succeeded.Effect.CompensationState.ClosesRequired() {
+		t.Fatal("succeeded compensation did not close Required ownership")
+	}
+
+	if _, err := ReconcileCompensation(failed.Effect, ReconcileCompensationCommand{
+		EffectID: failed.Effect.EffectID, ExpectedRevision: failed.Effect.Revision + 1,
+		EvidenceDigest: digest, ReconciledBy: "cleanup-auditor", ReasonCode: "cleanup.observed",
+		CommandID: "reconcile-wrong-revision", At: t0.Add(8 * time.Second),
+	}); !errors.Is(err, ErrRevisionConflict) {
+		t.Fatalf("wrong reconciliation revision error = %v", err)
+	}
+	reconciled, err := ReconcileCompensation(failed.Effect, ReconcileCompensationCommand{
+		EffectID: failed.Effect.EffectID, ExpectedRevision: failed.Effect.Revision,
+		EvidenceDigest: digest, ReconciledBy: "cleanup-auditor", ReasonCode: "cleanup.observed",
+		CommandID: "reconcile-required", At: t0.Add(8 * time.Second),
+	})
+	if err != nil || reconciled.Effect.CompensationState != contracts.EffectCompensationReconciled ||
+		!reconciled.Effect.CompensationState.ClosesRequired() || reconciled.Effect.CompensationReconciliation == nil {
+		t.Fatalf("reconciled effect = %#v err=%v", reconciled.Effect, err)
+	}
+	for name, mutate := range map[string]func(*contracts.EffectRecord){
+		"missing-proof":  func(record *contracts.EffectRecord) { record.CompensationReconciliation = nil },
+		"wrong-revision": func(record *contracts.EffectRecord) { record.CompensationReconciliation.RequestedRevision++ },
+		"wrong-time": func(record *contracts.EffectRecord) {
+			record.CompensationReconciliation.ObservedAt = record.UpdatedAt.Add(time.Second)
+		},
+		"invalid-authority": func(record *contracts.EffectRecord) { record.CompensationReconciliation.ReconciledBy = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			tampered := cloneRecord(reconciled.Effect)
+			mutate(&tampered)
+			if err := ValidateRecord(tampered); err == nil {
+				t.Fatal("tampered reconciliation proof validated")
+			}
+		})
+	}
+}
+
+func TestTerminalEffectRequiresExactPrimaryTerminalRevision(t *testing.T) {
+	record := applyTestEffect(t, time.Date(2026, 8, 12, 18, 0, 0, 0, time.UTC))
+	record.PrimaryTerminalRevision = 0
+	if err := ValidateRecord(record); err == nil || !strings.Contains(err.Error(), "primary terminal revision") {
+		t.Fatalf("terminal Effect without exact revision error = %v", err)
+	}
+}
+
 func TestDetachedEffectCannotClaimCompensation(t *testing.T) {
 	t0 := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
 	intent := prepareTestEffect(t, t0, contracts.CompensationNone).Intent
