@@ -53,4 +53,14 @@ Run or Snapshot.
 `ResolveActiveRun` additionally cross-checks its Run, generation, namespace,
 and policy fence. Owner-backed Runs can only be stopped through
 `RequestActiveRunTermination` with the exact canonical key and Run ID; generic
-termination fails closed.
+termination fails closed. The same fence applies to external event, approval,
+and timer waits: generic `ResolveExternalWait` rejects owner-backed Runs, while
+`ResolveActiveExternalWait` authorizes the exact canonical key and Run before
+reading a resolution receipt or mutating the wait. Exact terminal command
+replays remain valid after owner release; a foreign key or changed command is
+rejected.
+
+Every Trigger also carries the canonical digest of the pinned Workflow
+`TriggerSchema`. `Invoke` compares that digest before validating the payload or
+creating a Run, so a caller cannot attach an unrelated schema identity to an
+otherwise schema-valid event.

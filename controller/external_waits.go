@@ -82,12 +82,43 @@ type externalWaitOccurrenceConsumption struct {
 // wait subject and condition digest are mandatory fences; names alone never
 // identify an occurrence.
 func (controller *Controller) ResolveExternalWait(ctx context.Context, request ResolveExternalWaitRequest) (contracts.Run, error) {
+	return controller.resolveExternalWait(ctx, request, "")
+}
+
+// ResolveActiveExternalWait requires the exact canonical owner key and Run ID
+// before consuming a signal, approval, or timer occurrence for an
+// owner-backed reserved Run. Generic external wait ingress cannot unlock it.
+func (controller *Controller) ResolveActiveExternalWait(
+	ctx context.Context, key contracts.ActiveOwnerKey, request ResolveExternalWaitRequest,
+) (contracts.Run, error) {
+	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) {
+		return contracts.Run{}, errors.New("controller, context, and target Run are required")
+	}
+	_, _, ownerRef, err := normalizeActiveOwnerKey(key)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	return controller.resolveExternalWait(ctx, request, ownerRef)
+}
+
+func (controller *Controller) resolveExternalWait(
+	ctx context.Context, request ResolveExternalWaitRequest, activeOwnerRef string,
+) (contracts.Run, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) ||
 		!contracts.ValidIdentifier(request.InvocationID) || request.WaitGeneration == 0 ||
 		!contracts.ValidIdentifier(request.SubjectRef) || !contracts.ValidDigest(request.ConditionDigest) ||
 		!request.Status.Valid() || !contracts.ValidIdentifier(request.CommandID) || request.ObservedAt.IsZero() ||
 		(request.PayloadArtifactRef != "" && !contracts.ValidIdentifier(request.PayloadArtifactRef)) {
 		return contracts.Run{}, errors.New("external wait resolution identity, status, evidence, or time is invalid")
+	}
+	if err := controller.authorizeExternalWait(ctx, request.RunID, activeOwnerRef); err != nil {
+		// Preserve generic command-ledger identity conflicts when a replay changes
+		// only the Run ID to an unknown Run. Active ingress never gets this
+		// fallback: its exact key and target Run must authorize before receipt
+		// lookup or any mutation.
+		if activeOwnerRef != "" || !errors.Is(err, store.ErrNotFound) {
+			return contracts.Run{}, err
+		}
 	}
 	requestIdentityDigest, payloadDigest, err := externalWaitRequestIdentity(request)
 	if err != nil {
@@ -385,6 +416,36 @@ func externalWaitResolutionKey(commandID string) store.AggregateKey {
 	return store.AggregateKey{Type: externalWaitResolutionType, ID: commandID}
 }
 
+func (controller *Controller) authorizeExternalWait(ctx context.Context, runID, activeOwnerRef string) error {
+	run, err := controller.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	if run.ActiveOwnerRef != activeOwnerRef {
+		if run.ActiveOwnerRef != "" || activeOwnerRef != "" {
+			return fmt.Errorf("%w: owner-backed Run requires its exact active owner key", ErrReservedIngressDenied)
+		}
+		return nil
+	}
+	if activeOwnerRef == "" || run.Status.Terminal() {
+		return nil
+	}
+	ownerRecord, err := controller.store.GetAggregate(ctx, activeOwnerKey(activeOwnerRef))
+	if err != nil {
+		return err
+	}
+	owner, err := decodeActiveRunOwner(ownerRecord)
+	if err != nil {
+		return err
+	}
+	if owner.State != contracts.ActiveRunOwnerActive || owner.RunID != run.RunID ||
+		owner.Key.NamespaceID != run.NamespaceID || owner.Generation != run.ActiveOwnerGeneration ||
+		owner.PolicyRef != run.AdmissionPolicyRef || owner.PolicyDigest != run.AdmissionPolicyDigest {
+		return fmt.Errorf("%w: key is not owned by the target Run", ErrActiveOwnerConflict)
+	}
+	return nil
+}
+
 func externalWaitOccurrenceKey(runID, invocationID string, waitGeneration uint32) (store.AggregateKey, error) {
 	digest, err := canonicaljson.DigestValue(map[string]any{
 		"schemaVersion": externalWaitOccurrenceSchema, "runId": runID,
@@ -574,6 +635,15 @@ func (controller *Controller) driveAfterExternalWait(ctx context.Context, runID 
 	driven, driveErr := controller.Drive(ctx, runID)
 	if driveErr == nil {
 		return driven, nil
+	}
+	// A concurrent exact replay can observe the resolution commit and race the
+	// first caller while it atomically publishes the terminal Run and releases
+	// its owner. The losing drive may have read the old owner generation; the
+	// newly published terminal Run is nevertheless the authoritative outcome.
+	if record, readErr := controller.store.GetAggregate(ctx, runKey(runID)); readErr == nil {
+		if current, decodeErr := decodeRun(record); decodeErr == nil && current.Status.Terminal() {
+			return current, nil
+		}
 	}
 	if errors.Is(driveErr, store.ErrRevisionConflict) || errors.Is(driveErr, store.ErrIdentityConflict) ||
 		errors.Is(driveErr, ErrRunWaiting) || errors.Is(driveErr, ErrRunClosureOpen) ||

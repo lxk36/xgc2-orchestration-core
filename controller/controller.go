@@ -302,6 +302,13 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 	if err := controller.validatePinnedAction(request.Action, request.Definition, plan); err != nil {
 		return InvokeResult{}, err
 	}
+	triggerSchemaDigest, err := canonicaljson.DigestValue(request.Definition.TriggerSchema)
+	if err != nil {
+		return InvokeResult{}, fmt.Errorf("digest invoke trigger schema: %w", err)
+	}
+	if request.Trigger.PayloadSchemaDigest != triggerSchemaDigest {
+		return InvokeResult{}, errors.New("trigger payload schema digest differs from the pinned Workflow trigger schema")
+	}
 	if err := controller.validateNodePins(request.Definition); err != nil {
 		return InvokeResult{}, err
 	}

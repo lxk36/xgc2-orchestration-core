@@ -161,7 +161,7 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	trigger := contracts.TriggerEvent{
 		EventID: "signal-start-event", Kind: contracts.TriggerManual, Version: "v1",
 		OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "signal-test", ActorRef: "operator",
-		PayloadSchemaDigest: testPackageDigest, Payload: map[string]any{},
+		PayloadSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema), Payload: map[string]any{},
 	}
 	invoked, err := orchestrator.Invoke(t.Context(), InvokeRequest{
 		RunID: "signal-run", NamespaceID: "test", Action: action, Definition: definition,
@@ -302,6 +302,186 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	assertOneSnapshotResolutionEvent(t, recovered, waiting.RunID, resolution.CommandID)
 }
 
+func TestActiveOwnerExternalWaitRequiresExactKeyAndReplaysConcurrentCommand(t *testing.T) {
+	durable, err := filestore.Open(t.TempDir() + "/active-signals.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = durable.Close() })
+	barrier := newExternalWaitCommitBarrierStore(durable)
+	executor := newSignalWaitExecutor()
+	registry := protocol.NewRegistry()
+	if err := registry.Register(executor); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Seal(); err != nil {
+		t.Fatal(err)
+	}
+	policy, permit, err := NewReservedIngressPolicy(ReservedIngressPolicySpec{
+		PolicyRef: "signal-builder-v1", NamespaceID: "xgc2-experiments",
+		TriggerKind: contracts.TriggerProductBuilder, TriggerVersion: "v1", SourceRef: "xgc2-experiment-builder",
+		CandidateOrigin: contracts.OriginProductBuilder, RootOnly: true, RequireActiveOwner: true,
+		ActiveOwnerKind: experimentOwnerKind, ActiveOwnerIdentityFields: []string{"branch", "domain", "resourceId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &fakeClock{now: time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)}
+	orchestrator, err := New(Config{
+		Store: barrier, Nodes: registry, OwnerRef: "active-signal-controller",
+		Clock: clock, LeaseDuration: 2 * time.Hour, InvocationTimeout: time.Hour,
+		ReservedIngressPolicies: []*ReservedIngressPolicy{policy},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: orchestrator, Store: barrier, OwnerRef: "active-signal-coordinator", Clock: clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition, action := signalWaitAction(t, executor.Descriptor(), "hold")
+	action.AcceptedTriggerKinds = []contracts.TriggerKind{contracts.TriggerProductBuilder}
+	key := contracts.ActiveOwnerKey{
+		NamespaceID: "xgc2-experiments", Kind: experimentOwnerKind,
+		Identity: map[string]string{"domain": "default", "resourceId": "experiment-signal", "branch": "main"},
+	}
+	invoked, err := orchestrator.Invoke(t.Context(), InvokeRequest{
+		RunID: "active-signal-run", NamespaceID: key.NamespaceID, Action: action, Definition: definition,
+		Trigger: contracts.TriggerEvent{
+			EventID: "active-signal-start", Kind: contracts.TriggerProductBuilder, Version: "v1",
+			OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "xgc2-experiment-builder", ActorRef: "operator",
+			PayloadSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema), Payload: map[string]any{},
+		},
+		Candidate: map[string]any{}, CandidateOrigin: contracts.OriginProductBuilder,
+		CandidateRef: "experiment-signal-main", Scope: map[string]any{}, CommandID: "invoke-active-signal",
+		IngressPermit: permit, ActiveOwnerKey: &key,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if !errors.Is(err, ErrRunWaiting) || waiting.Status != contracts.RunWaiting {
+		t.Fatalf("active external wait Run = %+v err=%v", waiting, err)
+	}
+	resolution := currentSignalResolution(
+		t, orchestrator, waiting.RunID, "resolve-active-signal", clock.Now().Add(time.Second),
+	)
+	before, beforeRevision, err := orchestrator.GetSnapshot(t.Context(), waiting.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orchestrator.ResolveExternalWait(t.Context(), resolution); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("generic owner-backed resolution error = %v", err)
+	}
+	foreignKey := key
+	foreignKey.Identity = map[string]string{"domain": "default", "resourceId": "experiment-signal", "branch": "foreign"}
+	if _, err := orchestrator.ResolveActiveExternalWait(t.Context(), foreignKey, resolution); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("foreign owner key resolution error = %v", err)
+	}
+	manualAction := action
+	manualAction.AcceptedTriggerKinds = []contracts.TriggerKind{contracts.TriggerManual}
+	manualInvoked, err := orchestrator.Invoke(t.Context(), InvokeRequest{
+		RunID: "foreign-signal-run", NamespaceID: "test", Action: manualAction, Definition: definition,
+		Trigger: contracts.TriggerEvent{
+			EventID: "foreign-signal-start", Kind: contracts.TriggerManual, Version: "v1",
+			OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "signal-test", ActorRef: "operator",
+			PayloadSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema), Payload: map[string]any{},
+		},
+		Candidate: map[string]any{}, CandidateOrigin: contracts.OriginCaller,
+		CandidateRef: "foreign-signal", Scope: map[string]any{}, CommandID: "invoke-foreign-signal",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignWaiting, err := coordinator.AdvanceRun(t.Context(), manualInvoked.Run.RunID)
+	if !errors.Is(err, ErrRunWaiting) || foreignWaiting.Status != contracts.RunWaiting {
+		t.Fatalf("foreign external wait Run = %+v err=%v", foreignWaiting, err)
+	}
+	foreignResolution := currentSignalResolution(
+		t, orchestrator, foreignWaiting.RunID, "resolve-foreign-run", clock.Now().Add(time.Second),
+	)
+	if _, err := orchestrator.ResolveActiveExternalWait(t.Context(), key, foreignResolution); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("active key with foreign Run ID error = %v", err)
+	}
+	foreignAfter, err := orchestrator.GetRun(t.Context(), foreignWaiting.RunID)
+	if err != nil || foreignAfter.Status != contracts.RunWaiting {
+		t.Fatalf("foreign Run changed after denied active resolution: %+v err=%v", foreignAfter, err)
+	}
+	afterDenied, afterDeniedRevision, err := orchestrator.GetSnapshot(t.Context(), waiting.RunID)
+	if err != nil || afterDeniedRevision != beforeRevision || afterDenied.NextNode != before.NextNode ||
+		len(barrier.resolutionResults()) != 0 {
+		t.Fatalf("denied ingress changed wait: before=%+v/%d after=%+v/%d commits=%d err=%v",
+			before, beforeRevision, afterDenied, afterDeniedRevision, len(barrier.resolutionResults()), err)
+	}
+
+	type outcome struct {
+		run contracts.Run
+		err error
+	}
+	gate := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	for range 2 {
+		go func() {
+			<-gate
+			run, resolveErr := orchestrator.ResolveActiveExternalWait(t.Context(), key, resolution)
+			outcomes <- outcome{run: run, err: resolveErr}
+		}()
+	}
+	close(gate)
+	released := false
+	defer func() {
+		if !released {
+			close(barrier.release)
+		}
+	}()
+	for range 2 {
+		select {
+		case <-barrier.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent active resolutions did not both freeze before commit")
+		}
+	}
+	close(barrier.release)
+	released = true
+	for range 2 {
+		result := <-outcomes
+		if result.err != nil || result.run.RunID != waiting.RunID || result.run.Status != contracts.RunSucceeded {
+			t.Fatalf("concurrent active external wait = %+v err=%v", result.run, result.err)
+		}
+	}
+	commitResults := barrier.resolutionResults()
+	if len(commitResults) != 2 {
+		t.Fatalf("active resolution commits = %d, want 2", len(commitResults))
+	}
+	replayed := 0
+	for _, result := range commitResults {
+		if result.Replay {
+			replayed++
+		}
+	}
+	if replayed != 1 {
+		t.Fatalf("active resolution replays = %d, want exactly 1", replayed)
+	}
+	owner, err := orchestrator.GetActiveRunOwner(t.Context(), key)
+	if err != nil || owner.State != contracts.ActiveRunOwnerReleased || owner.RunID != waiting.RunID {
+		t.Fatalf("terminal active owner = %+v err=%v", owner, err)
+	}
+	exactReplay, err := orchestrator.ResolveActiveExternalWait(t.Context(), key, resolution)
+	if err != nil || exactReplay.RunID != waiting.RunID || exactReplay.Status != contracts.RunSucceeded {
+		t.Fatalf("terminal active resolution replay = %+v err=%v", exactReplay, err)
+	}
+	if _, err := orchestrator.ResolveExternalWait(t.Context(), resolution); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("generic terminal replay error = %v", err)
+	}
+	changed := resolution
+	changed.Payload = map[string]any{"signalId": "changed"}
+	if _, err := orchestrator.ResolveActiveExternalWait(t.Context(), key, changed); !errors.Is(err, store.ErrIdentityConflict) {
+		t.Fatalf("changed active resolution error = %v, want identity conflict", err)
+	}
+}
+
 func TestOldExternalWaitOccurrenceCannotUnlockSameNamedNewWait(t *testing.T) {
 	durable, err := filestore.Open(t.TempDir() + "/repeated-signals.db")
 	if err != nil {
@@ -334,7 +514,7 @@ func TestOldExternalWaitOccurrenceCannotUnlockSameNamedNewWait(t *testing.T) {
 	trigger := contracts.TriggerEvent{
 		EventID: "repeat-signal-start", Kind: contracts.TriggerManual, Version: "v1",
 		OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "signal-test", ActorRef: "operator",
-		PayloadSchemaDigest: testPackageDigest, Payload: map[string]any{},
+		PayloadSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema), Payload: map[string]any{},
 	}
 	invoked, err := orchestrator.Invoke(t.Context(), InvokeRequest{
 		RunID: "repeat-signal-run", NamespaceID: "test", Action: action, Definition: definition,

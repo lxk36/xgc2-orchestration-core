@@ -982,6 +982,20 @@ func TestCompileReturnsCanonicalPlanWithoutCreatingRun(t *testing.T) {
 	}
 }
 
+func TestInvokeRejectsTriggerSchemaDigestOutsidePinnedDefinition(t *testing.T) {
+	fixture := newControllerFixture(t)
+	request := fixture.request("trigger-schema-mismatch", "invoke-trigger-schema-mismatch")
+	request.Trigger.PayloadSchemaDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+	if _, err := fixture.controller.Invoke(t.Context(), request); err == nil ||
+		!strings.Contains(err.Error(), "trigger payload schema digest") {
+		t.Fatalf("mismatched trigger schema digest error = %v", err)
+	}
+	if _, err := fixture.controller.GetRun(t.Context(), request.RunID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("mismatched trigger schema digest created a Run: %v", err)
+	}
+}
+
 func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-effect-expired")
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
@@ -1009,16 +1023,17 @@ func TestControllerFailsClosedInsteadOfReplayingExpiredEffectfulNode(t *testing.
 }
 
 type controllerFixture struct {
-	controller  *Controller
-	store       *filestore.Store
-	path        string
-	registry    *node.Registry
-	clock       *fakeClock
-	definition  contracts.WorkflowDefinition
-	action      contracts.ActionVersion
-	prepare     *countExecutor
-	render      *countExecutor
-	diagnostics *countExecutor
+	controller          *Controller
+	store               *filestore.Store
+	path                string
+	registry            *node.Registry
+	clock               *fakeClock
+	definition          contracts.WorkflowDefinition
+	action              contracts.ActionVersion
+	triggerSchemaDigest string
+	prepare             *countExecutor
+	render              *countExecutor
+	diagnostics         *countExecutor
 }
 
 type effectExecutor struct {
@@ -1150,7 +1165,7 @@ func newEffectControllerFixture(t *testing.T, runID string) effectControllerFixt
 		Trigger: contracts.TriggerEvent{
 			EventID: "event-" + runID, Kind: contracts.TriggerManual, Version: "v1",
 			OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "test-suite", ActorRef: "operator",
-			PayloadSchemaDigest: testPackageDigest, Payload: map[string]any{},
+			PayloadSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema), Payload: map[string]any{},
 		},
 		Candidate: map[string]any{}, CandidateOrigin: contracts.OriginCaller, CandidateRef: "manual-form",
 		Scope: map[string]any{}, CommandID: "invoke-" + runID,
@@ -1227,7 +1242,8 @@ func newControllerFixture(t *testing.T) controllerFixture {
 	}
 	return controllerFixture{
 		controller: workflowController, store: durable, path: path, registry: registry, clock: clock,
-		definition: definition, action: actionVersion, prepare: prepare, render: render, diagnostics: diagnostics,
+		definition: definition, action: actionVersion, triggerSchemaDigest: mustTriggerSchemaDigest(t, definition.TriggerSchema),
+		prepare: prepare, render: render, diagnostics: diagnostics,
 	}
 }
 
@@ -1237,11 +1253,20 @@ func (fixture controllerFixture) request(runID, commandID string) InvokeRequest 
 		Trigger: contracts.TriggerEvent{
 			EventID: "event-" + runID, Kind: contracts.TriggerManual, Version: "v1",
 			OccurredAt: fixture.clock.Now(), ReceivedAt: fixture.clock.Now(), SourceRef: "test-suite", ActorRef: "operator",
-			PayloadSchemaDigest: testPackageDigest, Payload: map[string]any{},
+			PayloadSchemaDigest: fixture.triggerSchemaDigest, Payload: map[string]any{},
 		},
 		Candidate: map[string]any{"name": "XGC"}, CandidateOrigin: contracts.OriginCaller,
 		CandidateRef: "manual-form", Scope: map[string]any{}, CommandID: commandID,
 	}
+}
+
+func mustTriggerSchemaDigest(t *testing.T, schema contracts.Schema) string {
+	t.Helper()
+	digest, err := canonicaljson.DigestValue(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
 
 func descriptor(t *testing.T, typeRef string, input, output contracts.Schema) contracts.NodeDescriptor {

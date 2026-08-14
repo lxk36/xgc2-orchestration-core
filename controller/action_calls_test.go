@@ -355,7 +355,7 @@ func newActionCallFixture(t *testing.T, catalogErr error) actionCallFixture {
 		Trigger: contracts.TriggerEvent{
 			EventID: "event-parent-action", Kind: contracts.TriggerManual, Version: "v1",
 			OccurredAt: clock.Now(), ReceivedAt: clock.Now(), SourceRef: "test-suite", ActorRef: "operator",
-			PayloadSchemaDigest: testPackageDigest, Payload: map[string]any{"origin": "panel"},
+			PayloadSchemaDigest: mustTriggerSchemaDigest(t, parentDefinition.TriggerSchema), Payload: map[string]any{"origin": "panel"},
 		},
 		Candidate: map[string]any{"name": "Ada"}, CandidateOrigin: contracts.OriginCaller,
 		CandidateRef: "manual-form", Scope: map[string]any{"site": "lab-a"}, CommandID: "invoke-parent-action",
