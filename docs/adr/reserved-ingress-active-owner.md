@@ -71,9 +71,9 @@ and timer waits: generic `ResolveExternalWait` rejects owner-backed Runs, while
 `ResolveActiveExternalWait` authorizes the exact canonical key and Run before
 reading a resolution receipt or mutating the wait. Exact terminal command
 replays remain valid after owner release; a foreign key or changed command is
-rejected. The additive `ResolveExternalWaitResult` and
-`ResolveActiveExternalWaitResult` methods expose whether that exact durable
-resolution was a replay; the older Run-only methods remain source compatible.
+rejected. Both methods return `ResolveExternalWaitResult`, whose `Replay` field
+is the authoritative durable idempotency outcome. There is no Run-only method,
+compatibility alias, or second replay protocol.
 
 `RunSnapshot` v2 replaces the old bare waiting result with a typed
 `WaitingOccurrence` containing the original `NodeResult` plus authoritative

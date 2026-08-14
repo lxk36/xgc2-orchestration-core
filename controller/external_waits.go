@@ -85,17 +85,12 @@ type ResolveExternalWaitResult struct {
 }
 
 // ResolveExternalWait atomically consumes the exact wait occurrence, resumes
-// its pure node, and returns the Run to normal workflow driving. The persisted
-// wait subject and condition digest are mandatory fences; names alone never
-// identify an occurrence. InvocationID and WaitGeneration must be copied from
-// RunSnapshot.Waiting, never inferred from node order or history.
-func (controller *Controller) ResolveExternalWait(ctx context.Context, request ResolveExternalWaitRequest) (contracts.Run, error) {
-	result, err := controller.ResolveExternalWaitResult(ctx, request)
-	return result.Run, err
-}
-
-// ResolveExternalWaitResult is the replay-aware form of ResolveExternalWait.
-func (controller *Controller) ResolveExternalWaitResult(
+// its pure node, and returns the Run plus the authoritative durable replay
+// outcome. The persisted wait subject and condition digest are mandatory
+// fences; names alone never identify an occurrence. InvocationID and
+// WaitGeneration must be copied from RunSnapshot.Waiting, never inferred from
+// node order or history.
+func (controller *Controller) ResolveExternalWait(
 	ctx context.Context, request ResolveExternalWaitRequest,
 ) (ResolveExternalWaitResult, error) {
 	replay := false
@@ -107,15 +102,6 @@ func (controller *Controller) ResolveExternalWaitResult(
 // before consuming a signal, approval, or timer occurrence for an
 // owner-backed reserved Run. Generic external wait ingress cannot unlock it.
 func (controller *Controller) ResolveActiveExternalWait(
-	ctx context.Context, key contracts.ActiveOwnerKey, request ResolveExternalWaitRequest,
-) (contracts.Run, error) {
-	result, err := controller.ResolveActiveExternalWaitResult(ctx, key, request)
-	return result.Run, err
-}
-
-// ResolveActiveExternalWaitResult is the replay-aware, owner-fenced form of
-// ResolveActiveExternalWait.
-func (controller *Controller) ResolveActiveExternalWaitResult(
 	ctx context.Context, key contracts.ActiveOwnerKey, request ResolveExternalWaitRequest,
 ) (ResolveExternalWaitResult, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) {
