@@ -149,6 +149,24 @@ func (controller *Controller) commitWaiting(
 	commandID string,
 	at time.Time,
 ) error {
+	var projected RunSnapshot
+	if err := canonicaljson.UnmarshalStrict(snapshot.Payload, &projected); err != nil {
+		return err
+	}
+	if projected.RunID != run.Run.RunID || snapshot.Key != snapshotKey(projected.RunID) {
+		return errors.New("waiting Snapshot identity differs from its Run or aggregate key")
+	}
+	if err := validateRunSnapshot(projected); err != nil {
+		return err
+	}
+	if err := validateSnapshotRunState(projected, run.Run); err != nil {
+		return err
+	}
+	if projected.Waiting != nil {
+		if err := validateSnapshotWaitingOccurrence(projected, invocation.Ledger); err != nil {
+			return err
+		}
+	}
 	runMutation, err := aggregateMutation(runKey(run.Run.RunID), runExpected, run.Run)
 	if err != nil {
 		return err
@@ -164,7 +182,9 @@ func (controller *Controller) commitWaiting(
 	}
 	mutations := []store.AggregateRecord{runMutation, invocationMutation, snapshot}
 	snapshotEvent, err := aggregateEvent(snapshot, "snapshot.node-waiting", commandID, at, map[string]any{
-		"nodeId": invocation.Ledger.Invocation.NodeID,
+		"nodeId":         invocation.Ledger.Invocation.NodeID,
+		"invocationId":   invocation.Ledger.Invocation.InvocationID,
+		"waitGeneration": invocation.Ledger.Invocation.WaitGeneration,
 	})
 	if err != nil {
 		return err

@@ -36,6 +36,7 @@ const (
 	commandLedgerType        = "command-ledger"
 	ownershipGraphType       = "ownership-graph"
 	activeOwnerAggregateType = "active-run-owner"
+	RunSnapshotSchemaVersion = "xgc.run-snapshot/v2"
 	eventSchemaDigest        = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
 )
 
@@ -143,11 +144,20 @@ type RunSnapshot struct {
 	Provenance    []contracts.InputFieldProvenance `json:"provenance"`
 	NodeOutputs   map[string]map[string]any        `json:"nodeOutputs"`
 	NextNode      int                              `json:"nextNode"`
-	Waiting       *contracts.NodeResult            `json:"waiting,omitempty"`
+	Waiting       *WaitingOccurrence               `json:"waiting,omitempty"`
 	ActionCall    *ActionCallWait                  `json:"actionCall,omitempty"`
 	Failure       *contracts.StructuredFailure     `json:"failure,omitempty"`
 	Result        map[string]any                   `json:"result,omitempty"`
 	ResultDigest  string                           `json:"resultDigest,omitempty"`
+}
+
+// WaitingOccurrence is the authoritative public fence for the exact durable
+// invocation wait projected by RunSnapshot.Waiting. Clients never derive its
+// generation from mutable history or private invocation-ledger reads.
+type WaitingOccurrence struct {
+	InvocationID   string               `json:"invocationId"`
+	WaitGeneration uint32               `json:"waitGeneration"`
+	Result         contracts.NodeResult `json:"result"`
 }
 
 // ActionCallWait is the exact durable join between one parent invocation and
@@ -385,7 +395,7 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 			return InvokeResult{}, admitErr
 		}
 		snapshot := RunSnapshot{
-			SchemaVersion: "xgc.run-snapshot/v1", RunID: request.RunID, Action: request.Action,
+			SchemaVersion: RunSnapshotSchemaVersion, RunID: request.RunID, Action: request.Action,
 			Definition: request.Definition, Plan: plan, Entrypoint: request.Action.Entrypoint, NodeOrder: nodeOrder,
 			Inputs: admission.Inputs, Trigger: admission.Trigger.Payload, Scope: request.Scope,
 			Provenance: admission.FieldProvenance, NodeOutputs: map[string]map[string]any{},
@@ -511,15 +521,161 @@ func (controller *Controller) ListRuns(ctx context.Context, afterRunID string, l
 }
 
 func (controller *Controller) GetSnapshot(ctx context.Context, runID string) (RunSnapshot, uint64, error) {
-	record, err := controller.store.GetAggregate(ctx, snapshotKey(runID))
-	if err != nil {
-		return RunSnapshot{}, 0, err
+	if controller == nil || ctx == nil || !contracts.ValidIdentifier(runID) {
+		return RunSnapshot{}, 0, errors.New("controller, context, and snapshot Run identity are required")
 	}
-	var snapshot RunSnapshot
-	if err := canonicaljson.UnmarshalStrict(record.Payload, &snapshot); err != nil {
-		return RunSnapshot{}, 0, err
+	for attempt := 0; attempt < 4; attempt++ {
+		snapshotRecord, err := controller.store.GetAggregate(ctx, snapshotKey(runID))
+		if err != nil {
+			return RunSnapshot{}, 0, err
+		}
+		var snapshot RunSnapshot
+		if err := canonicaljson.UnmarshalStrict(snapshotRecord.Payload, &snapshot); err != nil {
+			return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+		}
+		if snapshot.RunID != runID {
+			return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, errors.New("Run snapshot identity differs from its aggregate key"))
+		}
+		if err := validateRunSnapshot(snapshot); err != nil {
+			return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+		}
+		runRecord, err := controller.store.GetAggregate(ctx, runKey(runID))
+		if err != nil {
+			return RunSnapshot{}, 0, err
+		}
+		run, err := decodeRun(runRecord)
+		if err != nil {
+			return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+		}
+		var invocationRecord store.AggregateRecord
+		var ledger contracts.InvocationLedger
+		if snapshot.Waiting != nil {
+			invocationRecord, err = controller.store.GetAggregate(ctx, store.AggregateKey{
+				Type: invocationType, ID: snapshot.Waiting.InvocationID,
+			})
+			if err != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+			}
+			ledger, err = decodeLedger(invocationRecord)
+			if err != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+			}
+		}
+
+		// Snapshot, Run, and Invocation are atomically published but the Store
+		// intentionally exposes only single-aggregate reads. Re-read every member
+		// of the projection fence before treating a mismatch as durable corruption.
+		latestSnapshot, snapshotErr := controller.store.GetAggregate(ctx, snapshotKey(runID))
+		latestRun, runErr := controller.store.GetAggregate(ctx, runKey(runID))
+		if snapshotErr != nil {
+			return RunSnapshot{}, 0, snapshotErr
+		}
+		if runErr != nil {
+			return RunSnapshot{}, 0, runErr
+		}
+		if !sameAggregateVersion(snapshotRecord, latestSnapshot) || !sameAggregateVersion(runRecord, latestRun) {
+			continue
+		}
+		if snapshot.Waiting != nil {
+			latestInvocation, invocationErr := controller.store.GetAggregate(ctx, invocationRecord.Key)
+			if invocationErr != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, invocationErr)
+			}
+			if !sameAggregateVersion(invocationRecord, latestInvocation) {
+				continue
+			}
+		}
+		if err := validateSnapshotRunState(snapshot, run); err != nil {
+			return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+		}
+		if snapshot.Waiting != nil {
+			if err := validateSnapshotWaitingOccurrence(snapshot, ledger); err != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+			}
+		}
+		return snapshot, snapshotRecord.Revision, nil
 	}
-	return snapshot, record.Revision, nil
+	return RunSnapshot{}, 0, store.ErrRevisionConflict
+}
+
+func sameAggregateVersion(left, right store.AggregateRecord) bool {
+	return left.Key == right.Key && left.Revision == right.Revision && left.PayloadDigest == right.PayloadDigest
+}
+
+func validateRunSnapshot(snapshot RunSnapshot) error {
+	if snapshot.SchemaVersion != RunSnapshotSchemaVersion || !contracts.ValidIdentifier(snapshot.RunID) ||
+		snapshot.NextNode < 0 || snapshot.NextNode > len(snapshot.NodeOrder) {
+		return errors.New("Run snapshot schema, identity, or node position is invalid")
+	}
+	if snapshot.Waiting == nil {
+		return nil
+	}
+	result := snapshot.Waiting.Result
+	if snapshot.ActionCall != nil || snapshot.NextNode >= len(snapshot.NodeOrder) ||
+		result.Status != contracts.NodeResultWaiting || result.Wait == nil ||
+		result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" || result.Failure != nil ||
+		!result.Wait.Kind.Valid() || !contracts.ValidIdentifier(result.Wait.SubjectRef) ||
+		!contracts.ValidDigest(result.Wait.ConditionDigest) ||
+		!contracts.ValidDigest(result.EvidenceDigest) ||
+		!contracts.ValidIdentifier(snapshot.Waiting.InvocationID) ||
+		snapshot.Waiting.WaitGeneration == 0 {
+		return errors.New("Run snapshot waiting projection is invalid")
+	}
+	expectedInvocationID, err := execution.StableInvocationID(snapshot.RunID, snapshot.NodeOrder[snapshot.NextNode])
+	if err != nil || expectedInvocationID != snapshot.Waiting.InvocationID {
+		return errors.New("Run snapshot waiting occurrence is not the current node invocation")
+	}
+	if result.Wait.Kind == contracts.NodeWaitEffect {
+		if len(result.Effects) != 1 || result.Effects[0].EffectKey != result.Wait.SubjectRef ||
+			result.Effects[0].IntentDigest != result.Wait.ConditionDigest {
+			return errors.New("Run snapshot Effect wait differs from its proposal")
+		}
+	} else if len(result.Effects) != 0 {
+		return errors.New("Run snapshot non-Effect wait retains Effect proposals")
+	}
+	return nil
+}
+
+func validateSnapshotRunState(snapshot RunSnapshot, run contracts.Run) error {
+	if run.RunID != snapshot.RunID {
+		return errors.New("Run snapshot and Run identities differ")
+	}
+	switch run.Status {
+	case contracts.RunWaiting:
+		if (snapshot.Waiting == nil) == (snapshot.ActionCall == nil) {
+			return errors.New("waiting Run requires exactly one ordinary or child Action wait")
+		}
+	case contracts.RunStopping:
+		// The stopping Run may still project its wait until cancellation, and an
+		// ActionCall join remains durable for termination intent settlement.
+	case contracts.RunAccepted, contracts.RunQueued, contracts.RunRunning:
+		if snapshot.Waiting != nil || snapshot.ActionCall != nil {
+			return errors.New("active non-waiting Run retains a wait projection")
+		}
+	default:
+		if run.Status.Terminal() && snapshot.Waiting != nil {
+			return errors.New("terminal Run retains an ordinary wait occurrence")
+		}
+	}
+	return nil
+}
+
+func validateSnapshotWaitingOccurrence(snapshot RunSnapshot, ledger contracts.InvocationLedger) error {
+	if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
+		return errors.New("Run snapshot has no waiting occurrence")
+	}
+	wait := snapshot.Waiting.Result.Wait
+	attempt := activeAttempt(ledger)
+	if attempt == nil || ledger.Invocation.RunID != snapshot.RunID ||
+		ledger.Invocation.NodeID != snapshot.NodeOrder[snapshot.NextNode] ||
+		ledger.Invocation.Status != contracts.InvocationWaiting ||
+		ledger.Invocation.InvocationID != snapshot.Waiting.InvocationID ||
+		ledger.Invocation.WaitGeneration != snapshot.Waiting.WaitGeneration ||
+		ledger.Invocation.CurrentWaitRef != wait.SubjectRef ||
+		attempt.Status != contracts.AttemptWaiting {
+		return errors.New("Run snapshot waiting occurrence differs from its invocation ledger")
+	}
+	return nil
 }
 
 func (controller *Controller) validatePinnedAction(actionVersion contracts.ActionVersion, definition contracts.WorkflowDefinition, plan contracts.CompiledWorkflowPlan) error {

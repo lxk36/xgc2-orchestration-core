@@ -285,6 +285,11 @@ func TestControllerPreparesEffectBeforeLeavingRunWaiting(t *testing.T) {
 		t.Fatalf("waiting run = %#v, err = %v", run, err)
 	}
 	invocationID, _ := execution.StableInvocationID(run.RunID, "launch")
+	snapshot, _, err := fixture.controller.GetSnapshot(t.Context(), run.RunID)
+	if err != nil || snapshot.SchemaVersion != RunSnapshotSchemaVersion || snapshot.Waiting == nil ||
+		snapshot.Waiting.InvocationID != invocationID || snapshot.Waiting.WaitGeneration != 1 {
+		t.Fatalf("waiting occurrence projection = %#v err=%v", snapshot, err)
+	}
 	effectID, _ := effect.StableEffectID(invocationID, "start-process")
 	record, err := fixture.store.GetAggregate(t.Context(), store.AggregateKey{Type: effectAggregateType, ID: effectID})
 	if err != nil {
@@ -300,6 +305,101 @@ func TestControllerPreparesEffectBeforeLeavingRunWaiting(t *testing.T) {
 	}
 	if _, err := fixture.controller.Drive(t.Context(), run.RunID); !errors.Is(err, ErrRunWaiting) {
 		t.Fatalf("second drive error = %v", err)
+	}
+	if err := fixture.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := filestore.Open(fixture.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	recovered, err := New(Config{
+		Store: reopened, Nodes: fixture.registry, OwnerRef: "waiting-projection-recovery",
+		LeaseDuration: time.Minute, InvocationTimeout: 10 * time.Second, Clock: fixture.clock, Grants: fixture.grants,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredSnapshot, _, err := recovered.GetSnapshot(t.Context(), run.RunID)
+	if err != nil || recoveredSnapshot.Waiting == nil || recoveredSnapshot.Waiting.InvocationID != invocationID ||
+		recoveredSnapshot.Waiting.WaitGeneration != snapshot.Waiting.WaitGeneration {
+		t.Fatalf("recovered waiting projection = %#v err=%v", recoveredSnapshot, err)
+	}
+}
+
+func TestSnapshotWaitingOccurrenceFailsClosedOnLedgerMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*RunSnapshot)
+	}{
+		{name: "legacy-v1", mutate: func(snapshot *RunSnapshot) {
+			snapshot.SchemaVersion = "xgc.run-snapshot/v1"
+		}},
+		{name: "wrong-run", mutate: func(snapshot *RunSnapshot) {
+			snapshot.RunID = "another-run"
+		}},
+		{name: "missing-wait", mutate: func(snapshot *RunSnapshot) {
+			snapshot.Waiting = nil
+		}},
+		{name: "ledger-generation-mismatch", mutate: func(snapshot *RunSnapshot) {
+			next := *snapshot.Waiting
+			next.WaitGeneration++
+			snapshot.Waiting = &next
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newEffectControllerFixture(t, "run-wait-corrupt-"+test.name)
+			invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waiting, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+			if err != nil || waiting.Status != contracts.RunWaiting {
+				t.Fatalf("waiting Run = %#v err=%v", waiting, err)
+			}
+			snapshot, snapshotRevision, err := fixture.controller.GetSnapshot(t.Context(), waiting.RunID)
+			if err != nil || snapshot.Waiting == nil {
+				t.Fatalf("waiting Snapshot = %#v err=%v", snapshot, err)
+			}
+			test.mutate(&snapshot)
+			commitSnapshotTamper(t, fixture.store, waiting, snapshotRevision, snapshot, "corrupt-"+test.name)
+			if _, _, err := fixture.controller.GetSnapshot(t.Context(), waiting.RunID); !errors.Is(err, store.ErrCorrupt) {
+				t.Fatalf("corrupt waiting occurrence read error = %v", err)
+			}
+		})
+	}
+}
+
+func commitSnapshotTamper(
+	t *testing.T, durable store.Store, run contracts.Run, expected uint64, snapshot RunSnapshot, commandID string,
+) {
+	t.Helper()
+	mutation, err := aggregateMutation(snapshotKey(run.RunID), expected, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := run.UpdatedAt.Add(time.Second)
+	event, err := aggregateEvent(mutation, "snapshot.test-corrupted", commandID, at, map[string]any{"runId": run.RunID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outcome, err := canonicaljson.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := canonicaljson.DigestValue(map[string]any{"commandId": commandID, "mutation": mutation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := durable.Commit(t.Context(), store.Transaction{
+		CommandID: commandID, IdentityDigest: identity,
+		Expected:  []store.ExpectedRevision{{Key: mutation.Key, Revision: expected}},
+		Mutations: []store.AggregateRecord{mutation}, Events: []contracts.DomainEvent{event},
+		Outcome: outcome, At: at,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -725,6 +825,10 @@ func TestExactTerminationCancelsPreparedEffectAndReplaysFrozenCommand(t *testing
 	stopped, err := coordinator.AdvanceRun(t.Context(), waiting.RunID)
 	if err != nil || stopped.Status != contracts.RunStopped || stopped.TerminationKind != contracts.TerminationStopped {
 		t.Fatalf("stopped Run = %#v, err=%v", stopped, err)
+	}
+	stoppedSnapshot, _, err := fixture.controller.GetSnapshot(t.Context(), waiting.RunID)
+	if err != nil || stoppedSnapshot.Waiting != nil {
+		t.Fatalf("terminal Snapshot retained waiting occurrence: %#v err=%v", stoppedSnapshot, err)
 	}
 	invocationID, _ := execution.StableInvocationID(waiting.RunID, "launch")
 	effectID, _ := effect.StableEffectID(invocationID, "start-process")

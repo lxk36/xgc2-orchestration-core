@@ -126,9 +126,12 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if err := controller.cancelPreparedEffects(ctx, run, at); err != nil {
 		return contracts.Run{}, err
 	}
-	snapshot, _, err := controller.GetSnapshot(ctx, run.RunID)
+	snapshot, snapshotRevision, err := controller.GetSnapshot(ctx, run.RunID)
 	if err != nil {
 		return contracts.Run{}, err
+	}
+	if snapshot.Waiting != nil {
+		return contracts.Run{}, errors.New("stopping Run retains an uncanceled ordinary wait occurrence")
 	}
 	scheduled, cleanupFailures, err := controller.scheduleNextEffectCompensation(ctx, run, snapshot, at)
 	if err != nil {
@@ -187,9 +190,23 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	expected := []store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}, {Key: graphMutation.Key, Revision: 0}}
-	mutations := []store.AggregateRecord{runMutation, graphMutation}
-	events := append(append([]contracts.DomainEvent(nil), decision.Events...), graphEvent)
+	snapshotMutation, err := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	snapshotEvent, err := aggregateEvent(snapshotMutation, "snapshot.run-"+string(decision.Run.Status), commandID, at, map[string]any{
+		"runId": run.RunID, "terminalStatus": decision.Run.Status,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	expected := []store.ExpectedRevision{
+		{Key: runMutation.Key, Revision: runRecord.Revision},
+		{Key: snapshotMutation.Key, Revision: snapshotRevision},
+		{Key: graphMutation.Key, Revision: 0},
+	}
+	mutations := []store.AggregateRecord{runMutation, snapshotMutation, graphMutation}
+	events := append(append(append([]contracts.DomainEvent(nil), decision.Events...), snapshotEvent), graphEvent)
 	ownerExpected, ownerMutation, ownerEvent, owned, err := controller.releaseActiveOwner(ctx, run, decision.Run, commandID, at)
 	if err != nil {
 		return contracts.Run{}, err

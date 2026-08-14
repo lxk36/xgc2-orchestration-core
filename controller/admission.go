@@ -351,6 +351,33 @@ func (controller *Controller) GetActiveRunOwner(ctx context.Context, key contrac
 	return decodeActiveRunOwner(record)
 }
 
+// ValidateRunActiveOwnerKey proves that runID was admitted under the exact
+// canonical owner key. It validates the Run's frozen historical fence only;
+// the owner generation may already be released or a newer generation may now
+// be active. This makes it suitable for authorization before terminal reads
+// and exact command replay without turning a mutable owner head into history.
+func (controller *Controller) ValidateRunActiveOwnerKey(
+	ctx context.Context, key contracts.ActiveOwnerKey, runID string,
+) (contracts.Run, error) {
+	if controller == nil || ctx == nil || !contracts.ValidIdentifier(runID) {
+		return contracts.Run{}, errors.New("controller, context, and target Run are required")
+	}
+	normalized, _, ownerRef, err := normalizeActiveOwnerKey(key)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	run, err := controller.GetRun(ctx, runID)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	if run.NamespaceID != normalized.NamespaceID || run.ActiveOwnerRef != ownerRef ||
+		run.ActiveOwnerGeneration == 0 || !contracts.ValidIdentifier(run.AdmissionPolicyRef) ||
+		!contracts.ValidDigest(run.AdmissionPolicyDigest) {
+		return contracts.Run{}, fmt.Errorf("%w: key and Run frozen ownership differ", ErrReservedIngressDenied)
+	}
+	return run, nil
+}
+
 // ResolveActiveRun returns the Run currently protected by key. A released
 // owner deliberately resolves as store.ErrNotFound rather than a stale Run.
 func (controller *Controller) ResolveActiveRun(ctx context.Context, key contracts.ActiveOwnerKey) (contracts.Run, error) {

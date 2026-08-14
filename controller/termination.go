@@ -46,16 +46,9 @@ func (controller *Controller) RequestActiveRunTermination(
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) {
 		return TerminateRunResult{}, errors.New("controller, context, and target Run are required")
 	}
-	_, _, ownerRef, err := normalizeActiveOwnerKey(key)
+	run, err := controller.ValidateRunActiveOwnerKey(ctx, key, request.RunID)
 	if err != nil {
 		return TerminateRunResult{}, err
-	}
-	run, err := controller.GetRun(ctx, request.RunID)
-	if err != nil {
-		return TerminateRunResult{}, err
-	}
-	if run.ActiveOwnerRef != ownerRef || run.ActiveOwnerGeneration == 0 || run.NamespaceID != key.NamespaceID {
-		return TerminateRunResult{}, fmt.Errorf("%w: key and Run ownership differ", ErrReservedIngressDenied)
 	}
 	if run.Termination == nil && !run.Status.Terminal() {
 		owner, ownerErr := controller.GetActiveRunOwner(ctx, key)
@@ -68,7 +61,7 @@ func (controller *Controller) RequestActiveRunTermination(
 			return TerminateRunResult{}, fmt.Errorf("%w: key is not owned by the target Run", ErrActiveOwnerConflict)
 		}
 	}
-	return controller.requestRunTermination(ctx, request, ownerRef)
+	return controller.requestRunTermination(ctx, request, run.ActiveOwnerRef)
 }
 
 func (controller *Controller) requestRunTermination(ctx context.Context, request TerminateRunRequest, activeOwnerRef string) (TerminateRunResult, error) {
@@ -178,6 +171,10 @@ func cloneStructuredFailure(failure *contracts.StructuredFailure) *contracts.Str
 }
 
 func (controller *Controller) cancelOpenInvocations(ctx context.Context, run contracts.Run, at time.Time) error {
+	snapshot, snapshotRevision, err := controller.GetSnapshot(ctx, run.RunID)
+	if err != nil {
+		return err
+	}
 	records, err := listAllAggregates(ctx, controller.store, invocationType)
 	if err != nil {
 		return err
@@ -204,8 +201,32 @@ func (controller *Controller) cancelOpenInvocations(ctx context.Context, run con
 		if cancelErr != nil {
 			return cancelErr
 		}
-		if err := controller.commitInvocationDecision(ctx, record.Revision, decision, commandID, cancelAt, nil, nil); err != nil {
+		var snapshotMutation *store.AggregateRecord
+		var snapshotEvent *contracts.DomainEvent
+		if snapshot.Waiting != nil && snapshot.Waiting.InvocationID == ledger.Invocation.InvocationID {
+			nextSnapshot := snapshot
+			nextSnapshot.Waiting = nil
+			mutation, mutationErr := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, nextSnapshot)
+			if mutationErr != nil {
+				return mutationErr
+			}
+			event, eventErr := aggregateEvent(mutation, "snapshot.wait-canceled", commandID, cancelAt, map[string]any{
+				"invocationId":   ledger.Invocation.InvocationID,
+				"waitGeneration": ledger.Invocation.WaitGeneration,
+			})
+			if eventErr != nil {
+				return eventErr
+			}
+			snapshotMutation, snapshotEvent = &mutation, &event
+			snapshot = nextSnapshot
+		}
+		if err := controller.commitInvocationDecision(
+			ctx, record.Revision, decision, commandID, cancelAt, snapshotMutation, snapshotEvent,
+		); err != nil {
 			return err
+		}
+		if snapshotMutation != nil {
+			snapshotRevision++
 		}
 	}
 	return nil

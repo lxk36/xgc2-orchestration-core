@@ -10,7 +10,6 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/durable/filestore"
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
-	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
 	protocol "github.com/lxk36/xgc2-orchestration-core/kernel/node"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
@@ -221,6 +220,10 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	completed, err := orchestrator.GetRun(t.Context(), waiting.RunID)
 	if err != nil || completed.Status != contracts.RunSucceeded {
 		t.Fatalf("resolved external wait = %+v err=%v", completed, err)
+	}
+	completedSnapshot, _, err := orchestrator.GetSnapshot(t.Context(), waiting.RunID)
+	if err != nil || completedSnapshot.Waiting != nil {
+		t.Fatalf("terminal external wait Snapshot = %+v err=%v", completedSnapshot, err)
 	}
 	commitResults := barrier.resolutionResults()
 	if len(commitResults) != 2 {
@@ -534,10 +537,12 @@ func TestOldExternalWaitOccurrenceCannotUnlockSameNamedNewWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	secondSnapshot, secondRevision, err := orchestrator.GetSnapshot(t.Context(), waiting.RunID)
-	if err != nil || secondSnapshot.NextNode != 1 || secondSnapshot.Waiting == nil || secondSnapshot.Waiting.Wait == nil {
+	if err != nil || secondSnapshot.NextNode != 1 || secondSnapshot.Waiting == nil ||
+		secondSnapshot.Waiting.Result.Wait == nil {
 		t.Fatalf("second repeated wait snapshot = %+v revision=%d err=%v", secondSnapshot, secondRevision, err)
 	}
-	if secondSnapshot.Waiting.Wait.SubjectRef != first.SubjectRef || secondSnapshot.Waiting.Wait.ConditionDigest != first.ConditionDigest {
+	if secondSnapshot.Waiting.Result.Wait.SubjectRef != first.SubjectRef ||
+		secondSnapshot.Waiting.Result.Wait.ConditionDigest != first.ConditionDigest {
 		t.Fatal("fixture did not produce a same-named second wait")
 	}
 	if replayed, err := orchestrator.ResolveExternalWait(t.Context(), first); err != nil || replayed.Status != contracts.RunWaiting {
@@ -575,26 +580,14 @@ func currentSignalResolution(
 ) ResolveExternalWaitRequest {
 	t.Helper()
 	snapshot, _, err := orchestrator.GetSnapshot(t.Context(), runID)
-	if err != nil || snapshot.Waiting == nil || snapshot.Waiting.Wait == nil ||
-		snapshot.NextNode < 0 || snapshot.NextNode >= len(snapshot.NodeOrder) {
+	if err != nil || snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
 		t.Fatalf("external wait snapshot = %+v err=%v", snapshot, err)
 	}
-	invocationID, err := execution.StableInvocationID(runID, snapshot.NodeOrder[snapshot.NextNode])
-	if err != nil {
-		t.Fatal(err)
-	}
-	record, err := orchestrator.store.GetAggregate(t.Context(), store.AggregateKey{Type: invocationType, ID: invocationID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ledger, err := decodeLedger(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wait := *snapshot.Waiting.Wait
+	wait := *snapshot.Waiting.Result.Wait
 	return ResolveExternalWaitRequest{
-		RunID: runID, InvocationID: invocationID, WaitGeneration: ledger.Invocation.WaitGeneration,
-		SubjectRef: wait.SubjectRef, ConditionDigest: wait.ConditionDigest,
+		RunID: runID, InvocationID: snapshot.Waiting.InvocationID,
+		WaitGeneration: snapshot.Waiting.WaitGeneration,
+		SubjectRef:     wait.SubjectRef, ConditionDigest: wait.ConditionDigest,
 		Status: contracts.NodeWaitResolvedSucceeded, Payload: map[string]any{"signalId": wait.SubjectRef},
 		ObservedAt: observedAt, CommandID: commandID,
 	}

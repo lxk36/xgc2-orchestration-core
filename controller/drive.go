@@ -253,7 +253,7 @@ func (controller *Controller) executeClaimed(
 	case contracts.NodeResultWaiting:
 		decision, transitionErr := execution.TransitionInvocation(ledger, execution.TransitionInvocationCommand{
 			Fence: fence, To: contracts.InvocationWaiting, AttemptTo: contracts.AttemptWaiting,
-			WaitRef: result.Wait.SubjectRef, WaitGeneration: 1, CommandID: commandID,
+			WaitRef: result.Wait.SubjectRef, WaitGeneration: attempt.Ordinal, CommandID: commandID,
 		})
 		if transitionErr != nil {
 			return contracts.Run{}, transitionErr
@@ -262,7 +262,11 @@ func (controller *Controller) executeClaimed(
 		if effectErr != nil {
 			return contracts.Run{}, effectErr
 		}
-		snapshot.Waiting = &result
+		snapshot.Waiting = &WaitingOccurrence{
+			InvocationID:   decision.Ledger.Invocation.InvocationID,
+			WaitGeneration: decision.Ledger.Invocation.WaitGeneration,
+			Result:         result,
+		}
 		snapshotMutation, mutationErr := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
 		if mutationErr != nil {
 			return contracts.Run{}, mutationErr

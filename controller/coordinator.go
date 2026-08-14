@@ -197,10 +197,10 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 			}
 			continue
 		}
-		if snapshot.Waiting == nil || snapshot.Waiting.Wait == nil {
+		if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
 			return run, errors.New("waiting run has no durable wait in its snapshot")
 		}
-		if snapshot.Waiting.Wait.Kind != contracts.NodeWaitEffect {
+		if snapshot.Waiting.Result.Wait.Kind != contracts.NodeWaitEffect {
 			// Event, approval, and timer waits are resolved by their explicit
 			// ingress/provider authority. Advancing a Run must never invent the
 			// observation merely because a coordinator is active.
@@ -256,10 +256,11 @@ func (coordinator *Coordinator) waitedEffect(ctx context.Context, runID string) 
 	if err != nil {
 		return contracts.EffectRecord{}, err
 	}
-	if snapshot.Waiting == nil || snapshot.Waiting.Wait == nil || snapshot.Waiting.Wait.Kind != contracts.NodeWaitEffect {
+	if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil ||
+		snapshot.Waiting.Result.Wait.Kind != contracts.NodeWaitEffect {
 		return contracts.EffectRecord{}, errors.New("waiting run has no effect wait in its snapshot")
 	}
-	waitRef := snapshot.Waiting.Wait.SubjectRef
+	waitRef := snapshot.Waiting.Result.Wait.SubjectRef
 	after := ""
 	for {
 		effects, listErr := coordinator.controller.ListEffects(ctx, after, 500)

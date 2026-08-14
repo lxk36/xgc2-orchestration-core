@@ -518,3 +518,47 @@ func TestRunOwnerFenceValidation(t *testing.T) {
 		t.Fatal("child Run retained a root owner fence")
 	}
 }
+
+func TestValidateRunActiveOwnerKeyUsesFrozenHistoricalFence(t *testing.T) {
+	fixture := newActiveOwnerFixture(t)
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-owner-validation", "invoke-owner-validation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validated, err := fixture.controller.ValidateRunActiveOwnerKey(t.Context(), fixture.key, invoked.Run.RunID)
+	if err != nil || validated.RunID != invoked.Run.RunID || validated.ActiveOwnerGeneration != 1 {
+		t.Fatalf("active frozen owner validation = %+v err=%v", validated, err)
+	}
+	foreign := fixture.key
+	foreign.Identity = map[string]string{"domain": "default", "resourceId": "experiment-alpha", "branch": "foreign"}
+	if _, err := fixture.controller.ValidateRunActiveOwnerKey(t.Context(), foreign, invoked.Run.RunID); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("foreign frozen owner validation error = %v", err)
+	}
+	manual, err := fixture.base.controller.Invoke(t.Context(), fixture.base.request("run-unowned-validation", "invoke-unowned-validation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.controller.ValidateRunActiveOwnerKey(t.Context(), fixture.key, manual.Run.RunID); !errors.Is(err, ErrReservedIngressDenied) {
+		t.Fatalf("unowned Run validation error = %v", err)
+	}
+	terminal, err := fixture.controller.Drive(t.Context(), invoked.Run.RunID)
+	if err != nil || terminal.Status != contracts.RunSucceeded {
+		t.Fatalf("terminal owner-backed Run = %+v err=%v", terminal, err)
+	}
+	validated, err = fixture.controller.ValidateRunActiveOwnerKey(t.Context(), fixture.key, terminal.RunID)
+	if err != nil || validated.Status != contracts.RunSucceeded || validated.ActiveOwnerGeneration != 1 {
+		t.Fatalf("released historical owner validation = %+v err=%v", validated, err)
+	}
+	owner, err := fixture.controller.GetActiveRunOwner(t.Context(), fixture.key)
+	if err != nil || owner.State != contracts.ActiveRunOwnerReleased {
+		t.Fatalf("released owner after historical validation = %+v err=%v", owner, err)
+	}
+	second, err := fixture.controller.Invoke(t.Context(), fixture.request("run-owner-validation-next", "invoke-owner-validation-next"))
+	if err != nil || second.Run.ActiveOwnerGeneration != 2 {
+		t.Fatalf("next active owner generation = %+v err=%v", second, err)
+	}
+	validated, err = fixture.controller.ValidateRunActiveOwnerKey(t.Context(), fixture.key, terminal.RunID)
+	if err != nil || validated.RunID != terminal.RunID || validated.ActiveOwnerGeneration != 1 {
+		t.Fatalf("historical validation under newer generation = %+v err=%v", validated, err)
+	}
+}

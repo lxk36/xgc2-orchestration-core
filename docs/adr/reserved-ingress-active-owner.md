@@ -51,7 +51,10 @@ Run or Snapshot.
 
 `GetActiveRunOwner` directly reads the exact owner aggregate.
 `ResolveActiveRun` additionally cross-checks its Run, generation, namespace,
-and policy fence. Owner-backed Runs can only be stopped through
+and policy fence. `ValidateRunActiveOwnerKey` instead validates an exact Run's
+frozen historical key, generation, and policy pin without requiring that
+generation to remain current; it is the read-only authorization primitive for
+terminal reads and exact replay. Owner-backed Runs can only be stopped through
 `RequestActiveRunTermination` with the exact canonical key and Run ID; generic
 termination fails closed. The same fence applies to external event, approval,
 and timer waits: generic `ResolveExternalWait` rejects owner-backed Runs, while
@@ -59,6 +62,16 @@ and timer waits: generic `ResolveExternalWait` rejects owner-backed Runs, while
 reading a resolution receipt or mutating the wait. Exact terminal command
 replays remain valid after owner release; a foreign key or changed command is
 rejected.
+
+`RunSnapshot` v2 replaces the old bare waiting result with a typed
+`WaitingOccurrence` containing the original `NodeResult` plus authoritative
+`InvocationID` and `WaitGeneration`. `ResolveExternalWaitRequest` clients must
+copy these values rather than derive them from node order or private ledgers.
+The Invocation transition and occurrence are created, resolved, or canceled in
+the same transaction. `GetSnapshot` uses stable reads to validate the
+projection against both the Run state and current waiting Invocation, failing
+closed on a durable mismatch. Terminal command replay remains receipt-backed
+after the Snapshot occurrence has been cleared.
 
 Every Trigger also carries the canonical digest of the pinned Workflow
 `TriggerSchema`. `Invoke` compares that digest before validating the payload or

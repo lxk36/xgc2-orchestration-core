@@ -80,7 +80,8 @@ type externalWaitOccurrenceConsumption struct {
 // ResolveExternalWait atomically consumes the exact wait occurrence, resumes
 // its pure node, and returns the Run to normal workflow driving. The persisted
 // wait subject and condition digest are mandatory fences; names alone never
-// identify an occurrence.
+// identify an occurrence. InvocationID and WaitGeneration must be copied from
+// RunSnapshot.Waiting, never inferred from node order or history.
 func (controller *Controller) ResolveExternalWait(ctx context.Context, request ResolveExternalWaitRequest) (contracts.Run, error) {
 	return controller.resolveExternalWait(ctx, request, "")
 }
@@ -168,25 +169,21 @@ func (controller *Controller) resolveExternalWait(
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	if snapshot.ActionCall != nil || snapshot.Waiting == nil || snapshot.Waiting.Wait == nil {
+	if snapshot.ActionCall != nil || snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
 		return contracts.Run{}, errors.New("run snapshot has no externally resolvable wait")
 	}
-	wait := *snapshot.Waiting.Wait
+	wait := *snapshot.Waiting.Result.Wait
 	if wait.Kind == contracts.NodeWaitEffect || wait.SubjectRef != request.SubjectRef ||
 		wait.ConditionDigest != request.ConditionDigest {
 		return contracts.Run{}, errors.New("external resolution does not match the exact durable wait")
 	}
-	if snapshot.NextNode < 0 || snapshot.NextNode >= len(snapshot.NodeOrder) {
-		return contracts.Run{}, errors.New("external wait node position is outside the pinned plan")
-	}
-	invocationID, err := execution.StableInvocationID(run.RunID, snapshot.NodeOrder[snapshot.NextNode])
-	if err != nil {
-		return contracts.Run{}, err
-	}
-	if invocationID != request.InvocationID {
+	occurrence := *snapshot.Waiting
+	if occurrence.InvocationID != request.InvocationID || occurrence.WaitGeneration != request.WaitGeneration {
 		return contracts.Run{}, errors.New("external resolution does not match the exact durable wait occurrence")
 	}
-	invocationRecord, err := controller.store.GetAggregate(ctx, store.AggregateKey{Type: invocationType, ID: invocationID})
+	invocationRecord, err := controller.store.GetAggregate(ctx, store.AggregateKey{
+		Type: invocationType, ID: occurrence.InvocationID,
+	})
 	if err != nil {
 		return contracts.Run{}, err
 	}
@@ -196,7 +193,8 @@ func (controller *Controller) resolveExternalWait(
 	}
 	attempt := activeAttempt(ledger)
 	if attempt == nil || ledger.Invocation.Status != contracts.InvocationWaiting ||
-		ledger.Invocation.CurrentWaitRef != wait.SubjectRef || ledger.Invocation.WaitGeneration != request.WaitGeneration {
+		ledger.Invocation.CurrentWaitRef != wait.SubjectRef ||
+		ledger.Invocation.WaitGeneration != occurrence.WaitGeneration {
 		return contracts.Run{}, errors.New("invocation does not own the external wait")
 	}
 	now := request.ObservedAt.UTC()
@@ -300,7 +298,7 @@ func (controller *Controller) resolveExternalWait(
 	invocationDecision, err := execution.ResolveInvocationWait(ledger, execution.ResolveInvocationWaitCommand{
 		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
 		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision,
-		WaitRef: wait.SubjectRef, WaitGeneration: ledger.Invocation.WaitGeneration,
+		WaitRef: wait.SubjectRef, WaitGeneration: occurrence.WaitGeneration,
 		To: to, OutputRefsDigest: outputDigest, Failure: failure, CommandID: commandID, At: now,
 	})
 	if err != nil {

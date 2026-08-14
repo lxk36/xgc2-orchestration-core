@@ -55,9 +55,11 @@ func (controller *Controller) ResolveEffectWait(ctx context.Context, effectID st
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	if snapshot.Waiting == nil || snapshot.Waiting.Wait == nil || snapshot.Waiting.Wait.Kind != contracts.NodeWaitEffect ||
-		snapshot.Waiting.Wait.SubjectRef != currentEffect.Intent.EffectKey ||
-		snapshot.Waiting.Wait.ConditionDigest != currentEffect.Intent.IntentDigest {
+	if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil ||
+		snapshot.Waiting.Result.Wait.Kind != contracts.NodeWaitEffect ||
+		snapshot.Waiting.Result.Wait.SubjectRef != currentEffect.Intent.EffectKey ||
+		snapshot.Waiting.Result.Wait.ConditionDigest != currentEffect.Intent.IntentDigest ||
+		snapshot.Waiting.InvocationID != currentEffect.Intent.InvocationID {
 		return contracts.Run{}, errors.New("run snapshot does not wait for the terminal effect")
 	}
 	invocationRecord, err := controller.store.GetAggregate(ctx, store.AggregateKey{Type: invocationType, ID: currentEffect.Intent.InvocationID})
@@ -70,7 +72,8 @@ func (controller *Controller) ResolveEffectWait(ctx context.Context, effectID st
 	}
 	attempt := activeAttempt(ledger)
 	if attempt == nil || ledger.Invocation.Status != contracts.InvocationWaiting ||
-		ledger.Invocation.CurrentWaitRef != currentEffect.Intent.EffectKey {
+		ledger.Invocation.CurrentWaitRef != currentEffect.Intent.EffectKey ||
+		ledger.Invocation.WaitGeneration != snapshot.Waiting.WaitGeneration {
 		return contracts.Run{}, errors.New("invocation does not own the terminal effect wait")
 	}
 	now := controller.clock.Now().UTC()
@@ -111,7 +114,7 @@ func (controller *Controller) ResolveEffectWait(ctx context.Context, effectID st
 			NodeID: ledger.Invocation.NodeID, TypeRef: ledger.Invocation.TypeRef,
 			DescriptorDigest: ledger.Invocation.DescriptorDigest,
 			AttemptID:        attempt.AttemptID, AttemptOrdinal: attempt.Ordinal,
-			Input: inputs, InputDigest: inputDigest, Wait: *snapshot.Waiting.Wait,
+			Input: inputs, InputDigest: inputDigest, Wait: *snapshot.Waiting.Result.Wait,
 			Resolution: contracts.NodeWaitResolution{
 				Kind: contracts.NodeWaitEffect, SubjectRef: currentEffect.Intent.EffectKey,
 				ConditionDigest: currentEffect.Intent.IntentDigest, Status: contracts.NodeWaitResolvedSucceeded,
@@ -143,7 +146,7 @@ func (controller *Controller) ResolveEffectWait(ctx context.Context, effectID st
 	invocationDecision, err := execution.ResolveInvocationWait(ledger, execution.ResolveInvocationWaitCommand{
 		InvocationID: ledger.Invocation.InvocationID, ExpectedRevision: ledger.Invocation.Revision,
 		AttemptID: attempt.AttemptID, ExpectedAttemptRevision: attempt.Revision,
-		WaitRef: currentEffect.Intent.EffectKey, WaitGeneration: ledger.Invocation.WaitGeneration,
+		WaitRef: currentEffect.Intent.EffectKey, WaitGeneration: snapshot.Waiting.WaitGeneration,
 		To: to, OutputRefsDigest: outputDigest, Failure: failure, CommandID: commandID, At: now,
 	})
 	if err != nil {
