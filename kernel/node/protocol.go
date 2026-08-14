@@ -15,7 +15,11 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
-const DescriptorSchemaVersion = "xgc.node-descriptor/v1"
+const (
+	DescriptorSchemaVersion = "xgc.node-descriptor/v2"
+	InvocationSchemaVersion = "xgc.node-invocation/v2"
+	ResultSchemaVersion     = "xgc.node-result/v2"
+)
 
 func DescriptorDigest(descriptor contracts.NodeDescriptor) (string, error) {
 	descriptor.DescriptorDigest = ""
@@ -95,7 +99,8 @@ func ValidateRequest(descriptor contracts.NodeDescriptor, request contracts.Node
 			return fmt.Errorf("node request %s is invalid", label)
 		}
 	}
-	if request.TypeRef != descriptor.TypeRef || request.DescriptorDigest != descriptor.DescriptorDigest || request.AttemptOrdinal == 0 ||
+	if request.SchemaVersion != InvocationSchemaVersion || request.TypeRef != descriptor.TypeRef ||
+		request.DescriptorDigest != descriptor.DescriptorDigest || request.AttemptOrdinal == 0 ||
 		request.RequestedAt.IsZero() || !request.Deadline.After(request.RequestedAt) {
 		return errors.New("node request descriptor, ordinal, or times are invalid")
 	}
@@ -117,7 +122,7 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 	if err := ValidateRequest(descriptor, request); err != nil {
 		return err
 	}
-	if !result.Status.Valid() || !contracts.ValidDigest(result.EvidenceDigest) {
+	if result.SchemaVersion != ResultSchemaVersion || !result.Status.Valid() || !contracts.ValidDigest(result.EvidenceDigest) {
 		return errors.New("node result status or evidence digest is invalid")
 	}
 	if descriptor.Mode != contracts.NodeEffectful && len(result.Effects) != 0 {
@@ -130,6 +135,9 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 	case contracts.NodeResultSucceeded:
 		if result.Output == nil || result.Wait != nil || result.Failure != nil || len(result.Effects) != 0 {
 			return errors.New("successful node result requires output and no wait, failure, or effect")
+		}
+		if err := validateResultRouting(result.Route, result.SourcePorts); err != nil {
+			return err
 		}
 		canonical, err := canonicaljson.Marshal(result.Output)
 		if err != nil || len(canonical) > descriptor.MaxOutputBytes {
@@ -146,7 +154,8 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 			return errors.New("node output artifact ref is invalid")
 		}
 	case contracts.NodeResultWaiting:
-		if result.Wait == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" || result.Failure != nil {
+		if result.Wait == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" ||
+			result.Route != "" || len(result.SourcePorts) != 0 || result.Failure != nil {
 			return errors.New("waiting node result has invalid output, wait, or failure")
 		}
 		if err := validateWait(*result.Wait, request); err != nil {
@@ -161,7 +170,8 @@ func ValidateResult(descriptor contracts.NodeDescriptor, request contracts.NodeI
 			return errors.New("non-effect wait cannot propose an effect")
 		}
 	case contracts.NodeResultFailed:
-		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" || result.Wait != nil || len(result.Effects) != 0 {
+		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" ||
+			result.Route != "" || len(result.SourcePorts) != 0 || result.Wait != nil || len(result.Effects) != 0 {
 			return errors.New("failed node result requires only a structured failure")
 		}
 		if err := validateFailure(*result.Failure); err != nil {
@@ -229,13 +239,17 @@ func ValidateResumeRequest(descriptor contracts.NodeDescriptor, request contract
 }
 
 func ValidateResumeResult(descriptor contracts.NodeDescriptor, result contracts.NodeResult) error {
-	if !result.Status.Valid() || !contracts.ValidDigest(result.EvidenceDigest) || len(result.Effects) != 0 || result.Wait != nil {
+	if result.SchemaVersion != ResultSchemaVersion || !result.Status.Valid() || !contracts.ValidDigest(result.EvidenceDigest) ||
+		len(result.Effects) != 0 || result.Wait != nil {
 		return errors.New("resumed node result status, evidence, effects, or wait is invalid")
 	}
 	switch result.Status {
 	case contracts.NodeResultSucceeded:
 		if result.Output == nil || result.Failure != nil {
 			return errors.New("successful resumed node requires output and no failure")
+		}
+		if err := validateResultRouting(result.Route, result.SourcePorts); err != nil {
+			return err
 		}
 		canonical, err := canonicaljson.Marshal(result.Output)
 		if err != nil || len(canonical) > descriptor.MaxOutputBytes {
@@ -252,7 +266,8 @@ func ValidateResumeResult(descriptor contracts.NodeDescriptor, result contracts.
 			return errors.New("resumed node output artifact ref is invalid")
 		}
 	case contracts.NodeResultFailed:
-		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" {
+		if result.Failure == nil || result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" ||
+			result.Route != "" || len(result.SourcePorts) != 0 {
 			return errors.New("failed resumed node requires only a failure")
 		}
 		if !result.Failure.Class.Valid() || !contracts.ValidIdentifier(result.Failure.Code) || result.Failure.Message == "" {
@@ -260,6 +275,20 @@ func ValidateResumeResult(descriptor contracts.NodeDescriptor, result contracts.
 		}
 	default:
 		return errors.New("node resumer must terminate instead of waiting again")
+	}
+	return nil
+}
+
+func validateResultRouting(route string, sourcePorts []string) error {
+	if route != "" && !contracts.ValidIdentifier(route) {
+		return errors.New("node result route is invalid")
+	}
+	previous := ""
+	for _, port := range sourcePorts {
+		if !contracts.ValidIdentifier(port) || port == "main" || port == route || port <= previous {
+			return errors.New("node result source ports must be valid, sorted, unique, and distinct from main and route")
+		}
+		previous = port
 	}
 	return nil
 }

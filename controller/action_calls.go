@@ -9,6 +9,7 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
+	nodekernel "github.com/lxk36/xgc2-orchestration-core/kernel/node"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
@@ -324,12 +325,22 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	snapshot.ActionCall = nil
+	handled := false
 	if failure == nil {
-		snapshot.NodeOutputs[wait.NodeID] = output
-		snapshot.NextNode++
+		if err := recordSucceededNode(&snapshot, wait.NodeID, contracts.NodeResult{
+			SchemaVersion: nodekernel.ResultSchemaVersion,
+			Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest,
+		}); err != nil {
+			return contracts.Run{}, err
+		}
 	} else {
-		snapshot.Failure = failure
+		handled, err = recordFailedNode(&snapshot, wait.NodeID, *failure)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		if !handled {
+			snapshot.Failure = failure
+		}
 	}
 	snapshotMutation, err := aggregateMutation(snapshotKey(parent.RunID), snapshotRevision, snapshot)
 	if err != nil {
@@ -339,7 +350,7 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 	payload := map[string]any{"nodeId": wait.NodeID, "childRunId": child.RunID, "outputDigest": outputDigest}
 	if failure != nil {
 		eventType = "snapshot.child-action-failed"
-		payload = map[string]any{"nodeId": wait.NodeID, "childRunId": child.RunID, "failureCode": failure.Code}
+		payload = map[string]any{"nodeId": wait.NodeID, "childRunId": child.RunID, "failureCode": failure.Code, "handled": handled}
 	}
 	snapshotEvent, err := aggregateEvent(snapshotMutation, eventType, commandID, now, payload)
 	if err != nil {
@@ -356,7 +367,7 @@ func (controller *Controller) ResolveActionCall(ctx context.Context, childRunID 
 		RunID: parent.RunID, ExpectedRevision: parent.Revision, To: contracts.RunRunning,
 		CommandID: commandID, At: now,
 	}
-	if failure != nil {
+	if failure != nil && !handled {
 		runCommand.To = contracts.RunStopping
 		runCommand.Termination = &contracts.TerminationIntent{
 			Kind: contracts.TerminationFailed, RequestedRevision: parent.Revision, RequestedBy: controller.ownerRef,

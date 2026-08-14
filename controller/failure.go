@@ -25,9 +25,39 @@ func (controller *Controller) failClaimed(
 	at time.Time,
 ) (contracts.Run, error) {
 	failure := structuredFailure(code, cause)
+	return controller.failClaimedWithFailure(
+		ctx, runRecord, run, snapshot, snapshotRevision, invocationRevision,
+		ledger, leaseToken, failure, at,
+	)
+}
+
+func (controller *Controller) failClaimedWithFailure(
+	ctx context.Context,
+	runRecord store.AggregateRecord,
+	run contracts.Run,
+	snapshot RunSnapshot,
+	snapshotRevision uint64,
+	invocationRevision uint64,
+	ledger contracts.InvocationLedger,
+	leaseToken string,
+	failure contracts.StructuredFailure,
+	at time.Time,
+) (contracts.Run, error) {
 	attempt := activeAttempt(ledger)
 	if attempt == nil {
 		return contracts.Run{}, errors.New("failed invocation has no active attempt")
+	}
+	workflowNode, exists := findWorkflowNode(snapshot.Definition, ledger.Invocation.NodeID)
+	if !exists {
+		return contracts.Run{}, errors.New("failed invocation node disappeared from the pinned workflow")
+	}
+	if failure.Class == contracts.FailureTransient {
+		if delay, retry := retryDelay(retryPolicy(workflowNode), attempt.Ordinal); retry {
+			return controller.scheduleClaimedRetry(
+				ctx, runRecord, run, snapshot, snapshotRevision, invocationRevision,
+				ledger, leaseToken, failure, at.Add(delay), at,
+			)
+		}
 	}
 	commandID := phaseCommand(run.RunID, "fail-"+ledger.Invocation.NodeID, ledger.Invocation.Revision)
 	decision, err := execution.TransitionInvocation(ledger, execution.TransitionInvocationCommand{
@@ -40,21 +70,168 @@ func (controller *Controller) failClaimed(
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	snapshot.Failure = &failure
+	return controller.commitTerminalNodeFailure(
+		ctx, runRecord, run, snapshot, snapshotRevision, invocationRevision,
+		decision, failure, commandID, at,
+	)
+}
+
+func (controller *Controller) scheduleClaimedRetry(
+	ctx context.Context,
+	runRecord store.AggregateRecord,
+	run contracts.Run,
+	snapshot RunSnapshot,
+	snapshotRevision uint64,
+	invocationRevision uint64,
+	ledger contracts.InvocationLedger,
+	leaseToken string,
+	failure contracts.StructuredFailure,
+	retryAt time.Time,
+	at time.Time,
+) (contracts.Run, error) {
+	attempt := activeAttempt(ledger)
+	if attempt == nil || !retryAt.After(at) {
+		return contracts.Run{}, errors.New("retry scheduling requires an active attempt and future deadline")
+	}
+	commandID := phaseCommand(run.RunID, "retry-"+ledger.Invocation.NodeID, ledger.Invocation.Revision)
+	invocationDecision, err := execution.TransitionInvocation(ledger, execution.TransitionInvocationCommand{
+		Fence: execution.AttemptFence{
+			InvocationID: ledger.Invocation.InvocationID, InvocationRevision: ledger.Invocation.Revision,
+			AttemptID: attempt.AttemptID, AttemptRevision: attempt.Revision, LeaseToken: leaseToken, At: at,
+		},
+		To: contracts.InvocationRetryWait, AttemptTo: contracts.AttemptFailed,
+		Failure: &failure, RetryAt: &retryAt, CommandID: commandID,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	snapshot.RetryWait = &RetryWaitOccurrence{
+		InvocationID: ledger.Invocation.InvocationID, AttemptOrdinal: attempt.Ordinal, AvailableAt: retryAt.UTC(),
+	}
+	snapshotMutation, err := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	snapshotEvent, err := aggregateEvent(snapshotMutation, "snapshot.node-retry-waiting", commandID, at, map[string]any{
+		"nodeId": ledger.Invocation.NodeID, "attemptOrdinal": attempt.Ordinal,
+		"retryAt": retryAt.UTC().Format(time.RFC3339Nano), "failureCode": failure.Code,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	runDecision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
+		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunWaiting,
+		CommandID: commandID, At: at,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	invocationMutation, err := aggregateMutation(
+		store.AggregateKey{Type: invocationType, ID: ledger.Invocation.InvocationID},
+		invocationRevision, invocationDecision.Ledger,
+	)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	runMutation, err := aggregateMutation(runKey(run.RunID), runRecord.Revision, runDecision.Run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	expected := []store.ExpectedRevision{
+		{Key: runMutation.Key, Revision: runRecord.Revision},
+		{Key: invocationMutation.Key, Revision: invocationRevision},
+		{Key: snapshotMutation.Key, Revision: snapshotRevision},
+	}
+	mutations := []store.AggregateRecord{runMutation, invocationMutation, snapshotMutation}
+	events := append(append(append([]contracts.DomainEvent(nil), runDecision.Events...), invocationDecision.Events...), snapshotEvent)
+	if err := controller.commit(ctx, commandID, at, expected, mutations, events,
+		append(runDecision.Intents, invocationDecision.Intents...), runDecision.Run,
+	); err != nil {
+		return contracts.Run{}, err
+	}
+	return runDecision.Run, ErrRunWaiting
+}
+
+func (controller *Controller) commitTerminalNodeFailure(
+	ctx context.Context,
+	runRecord store.AggregateRecord,
+	run contracts.Run,
+	snapshot RunSnapshot,
+	snapshotRevision uint64,
+	invocationRevision uint64,
+	invocationDecision execution.InvocationDecision,
+	failure contracts.StructuredFailure,
+	commandID string,
+	at time.Time,
+) (contracts.Run, error) {
+	nodeID := invocationDecision.Ledger.Invocation.NodeID
+	handled, err := recordFailedNode(&snapshot, nodeID, failure)
+	if err != nil {
+		return contracts.Run{}, err
+	}
 	snapshotMutation, err := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
 	if err != nil {
 		return contracts.Run{}, err
 	}
 	snapshotEvent, err := aggregateEvent(snapshotMutation, "snapshot.node-failed", commandID, at, map[string]any{
-		"nodeId": ledger.Invocation.NodeID, "failureCode": failure.Code,
+		"nodeId": nodeID, "failureCode": failure.Code, "handled": handled,
 	})
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	if err := controller.commitInvocationDecision(ctx, invocationRevision, decision, commandID, at, &snapshotMutation, &snapshotEvent); err != nil {
+	if handled {
+		if err := controller.commitInvocationDecision(ctx, invocationRevision, invocationDecision, commandID, at, &snapshotMutation, &snapshotEvent); err != nil {
+			return contracts.Run{}, err
+		}
+		return contracts.Run{}, errContinueDrive
+	}
+	snapshot.Failure = &failure
+	snapshotMutation, err = aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
+	if err != nil {
 		return contracts.Run{}, err
 	}
-	return controller.beginFailure(ctx, runRecord, run, snapshot, snapshotRevision+1, failure, at)
+	snapshotEvent, err = aggregateEvent(snapshotMutation, "snapshot.node-failed", commandID, at, map[string]any{
+		"nodeId": nodeID, "failureCode": failure.Code, "handled": false,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	termination := &contracts.TerminationIntent{
+		Kind: contracts.TerminationFailed, RequestedRevision: run.Revision, RequestedBy: controller.ownerRef,
+		ReasonCode: failure.Code, Reason: failure.Message, PrimaryFailure: &failure,
+		CommandID: commandID, RequestedAt: at,
+	}
+	runDecision, err := execution.TransitionRun(run, execution.RunTransitionCommand{
+		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunStopping,
+		Termination: termination, CommandID: commandID, At: at,
+	})
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	invocationMutation, err := aggregateMutation(
+		store.AggregateKey{Type: invocationType, ID: invocationDecision.Ledger.Invocation.InvocationID},
+		invocationRevision, invocationDecision.Ledger,
+	)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	runMutation, err := aggregateMutation(runKey(run.RunID), runRecord.Revision, runDecision.Run)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	expected := []store.ExpectedRevision{
+		{Key: runMutation.Key, Revision: runRecord.Revision},
+		{Key: invocationMutation.Key, Revision: invocationRevision},
+		{Key: snapshotMutation.Key, Revision: snapshotRevision},
+	}
+	mutations := []store.AggregateRecord{runMutation, invocationMutation, snapshotMutation}
+	events := append(append(append([]contracts.DomainEvent(nil), runDecision.Events...), invocationDecision.Events...), snapshotEvent)
+	if err := controller.commit(ctx, commandID, at, expected, mutations, events,
+		append(runDecision.Intents, invocationDecision.Intents...), runDecision.Run,
+	); err != nil {
+		return contracts.Run{}, err
+	}
+	return controller.Drive(ctx, run.RunID)
 }
 
 func (controller *Controller) failWithoutAttempt(

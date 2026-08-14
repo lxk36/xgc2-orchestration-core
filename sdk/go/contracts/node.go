@@ -74,6 +74,7 @@ type CapabilityGrant struct {
 }
 
 type NodeInvocationRequest struct {
+	SchemaVersion    string            `json:"schemaVersion"`
 	InvocationID     string            `json:"invocationId"`
 	RunID            string            `json:"runId"`
 	NodeID           string            `json:"nodeId"`
@@ -141,10 +142,13 @@ func (status NodeResultStatus) Valid() bool {
 }
 
 type NodeResult struct {
+	SchemaVersion     string             `json:"schemaVersion"`
 	Status            NodeResultStatus   `json:"status"`
 	Output            map[string]any     `json:"output,omitempty"`
 	OutputDigest      string             `json:"outputDigest,omitempty"`
 	OutputArtifactRef string             `json:"outputArtifactRef,omitempty"`
+	Route             string             `json:"route,omitempty"`
+	SourcePorts       []string           `json:"sourcePorts,omitempty"`
 	Effects           []EffectProposal   `json:"effects,omitempty"`
 	Wait              *NodeWait          `json:"wait,omitempty"`
 	Failure           *StructuredFailure `json:"failure,omitempty"`

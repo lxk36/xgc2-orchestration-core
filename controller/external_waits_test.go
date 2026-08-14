@@ -48,7 +48,8 @@ func (executor *signalWaitExecutor) Execute(_ context.Context, request contracts
 		return contracts.NodeResult{}, err
 	}
 	return contracts.NodeResult{
-		Status: contracts.NodeResultWaiting,
+		SchemaVersion: protocol.ResultSchemaVersion,
+		Status:        contracts.NodeResultWaiting,
 		Wait: &contracts.NodeWait{
 			Kind: contracts.NodeWaitEvent, SubjectRef: signalID,
 			ConditionDigest: condition, ExpiresAt: timePointerForWait(request.Deadline),
@@ -69,7 +70,8 @@ func (executor *signalWaitExecutor) Resume(_ context.Context, request contracts.
 		return contracts.NodeResult{}, err
 	}
 	return contracts.NodeResult{
-		Status: contracts.NodeResultSucceeded, Output: output,
+		SchemaVersion: protocol.ResultSchemaVersion,
+		Status:        contracts.NodeResultSucceeded, Output: output,
 		OutputDigest: digest, EvidenceDigest: request.Resolution.PayloadDigest,
 	}, nil
 }

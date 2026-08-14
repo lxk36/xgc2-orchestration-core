@@ -66,7 +66,7 @@ func (executor *countExecutor) Execute(_ context.Context, request contracts.Node
 	if err != nil {
 		return contracts.NodeResult{}, err
 	}
-	return contracts.NodeResult{Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: digest, EvidenceDigest: digest}, nil
+	return contracts.NodeResult{SchemaVersion: node.ResultSchemaVersion, Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: digest, EvidenceDigest: digest}, nil
 }
 
 func (executor *countExecutor) Calls() int {
@@ -1403,7 +1403,8 @@ func (executor *effectExecutor) Execute(_ context.Context, request contracts.Nod
 	}
 	evidence, _ := canonicaljson.DigestValue(proposal)
 	return contracts.NodeResult{
-		Status: contracts.NodeResultWaiting, Effects: []contracts.EffectProposal{proposal},
+		SchemaVersion: node.ResultSchemaVersion,
+		Status:        contracts.NodeResultWaiting, Effects: []contracts.EffectProposal{proposal},
 		Wait:           &contracts.NodeWait{Kind: contracts.NodeWaitEffect, SubjectRef: proposal.EffectKey, ConditionDigest: intentDigest},
 		EvidenceDigest: evidence,
 	}, nil
@@ -1417,7 +1418,8 @@ func (executor *effectExecutor) Resume(_ context.Context, request contracts.Node
 		"subjectRef":       request.Resolution.SubjectRef,
 	})
 	return contracts.NodeResult{
-		Status: contracts.NodeResultSucceeded, Output: output,
+		SchemaVersion: node.ResultSchemaVersion,
+		Status:        contracts.NodeResultSucceeded, Output: output,
 		OutputDigest: digest, EvidenceDigest: evidence,
 	}, nil
 }
@@ -1546,7 +1548,7 @@ func newControllerFixture(t *testing.T) controllerFixture {
 		InputSchema: prepareInput, ResultSchema: textOutput, TriggerSchema: emptyObject, ScopeSchema: emptyObject,
 		Entrypoints: map[string]string{"main": "prepare", "diagnostics": "diagnostics"},
 		Nodes: []contracts.WorkflowNodeDefinition{
-			{NodeID: "prepare", TypeRef: prepare.descriptor.TypeRef, DescriptorDigest: prepare.descriptor.DescriptorDigest, InputSchema: prepareInput, OutputSchema: prepareOutput, Bindings: []contracts.ValueBinding{{Target: "/name", Value: contracts.ValueExpr{Ref: "inputs.name"}}}},
+			{NodeID: "prepare", TypeRef: prepare.descriptor.TypeRef, DescriptorDigest: prepare.descriptor.DescriptorDigest, InputSchema: prepareInput, OutputSchema: prepareOutput, Bindings: []contracts.ValueBinding{{Target: "/name", Value: contracts.ValueExpr{Ref: "inputs.name"}}}, Retry: &contracts.NodeRetryPolicy{MaxAttempts: 2, InitialBackoffMillis: 1000, MaxBackoffMillis: 1000}},
 			{NodeID: "render", TypeRef: render.descriptor.TypeRef, DescriptorDigest: render.descriptor.DescriptorDigest, InputSchema: renderInput, OutputSchema: textOutput, Bindings: []contracts.ValueBinding{{Target: "/message", Value: contracts.ValueExpr{Ref: "nodes.prepare.output.greeting"}}}},
 			{NodeID: "diagnostics", TypeRef: diagnostics.descriptor.TypeRef, DescriptorDigest: diagnostics.descriptor.DescriptorDigest, InputSchema: emptyObject, OutputSchema: textOutput},
 		},

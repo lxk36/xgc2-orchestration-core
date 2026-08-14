@@ -20,7 +20,7 @@ func TestRegistryFreezesDescriptorsAndValidatesStructuredResult(t *testing.T) {
 		Function: func(_ context.Context, request contracts.NodeInvocationRequest) (contracts.NodeResult, error) {
 			output := map[string]any{"message": request.Input["message"]}
 			outputDigest, _ := canonicaljson.DigestValue(output)
-			return contracts.NodeResult{Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest, EvidenceDigest: outputDigest}, nil
+			return contracts.NodeResult{SchemaVersion: ResultSchemaVersion, Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest, EvidenceDigest: outputDigest}, nil
 		},
 	}
 	registry := NewRegistry()
@@ -79,6 +79,7 @@ func TestCapabilitiesAndEffectsFailClosed(t *testing.T) {
 	intent := map[string]any{"tool": "issue.create"}
 	intentDigest, _ := canonicaljson.DigestValue(intent)
 	result := contracts.NodeResult{
+		SchemaVersion: ResultSchemaVersion,
 		Status: contracts.NodeResultWaiting, EvidenceDigest: digest,
 		Effects: []contracts.EffectProposal{{
 			EffectKey: "invoke-tool", Kind: "xgc.mcp-call/v1", TargetRef: "mcp-server-1",
@@ -123,6 +124,7 @@ func TestCapabilitiesAndEffectsFailClosed(t *testing.T) {
 	output := map[string]any{"message": "hello"}
 	outputDigest, _ := canonicaljson.DigestValue(output)
 	succeededWithEffect := contracts.NodeResult{
+		SchemaVersion: ResultSchemaVersion,
 		Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest,
 		EvidenceDigest: digest, Effects: result.Effects,
 	}
@@ -150,11 +152,46 @@ func TestBadOutputDigestAndAmbientGrantAreRejected(t *testing.T) {
 	}
 	request.CapabilityGrants = nil
 	result := contracts.NodeResult{
+		SchemaVersion: ResultSchemaVersion,
 		Status: contracts.NodeResultSucceeded, Output: map[string]any{"message": "hello"},
 		OutputDigest: digest, EvidenceDigest: digest,
 	}
 	if err := ValidateResult(descriptor, request, result); err == nil {
 		t.Fatal("bad structured output digest was accepted")
+	}
+}
+
+func TestSuccessfulResultRoutingIsCanonicalAndFailureCannotRoute(t *testing.T) {
+	descriptor := pureDescriptor(t)
+	request := requestFor(t, descriptor)
+	output := map[string]any{"message": "hello"}
+	outputDigest, _ := canonicaljson.DigestValue(output)
+	valid := contracts.NodeResult{
+		SchemaVersion: ResultSchemaVersion,
+		Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: outputDigest,
+		Route: "selected", SourcePorts: []string{"left", "right"}, EvidenceDigest: digest,
+	}
+	if err := ValidateResult(descriptor, request, valid); err != nil {
+		t.Fatal(err)
+	}
+	invalid := valid
+	invalid.SourcePorts = []string{"right", "left"}
+	if err := ValidateResult(descriptor, request, invalid); err == nil {
+		t.Fatal("unsorted source ports were accepted")
+	}
+	invalid = valid
+	invalid.SourcePorts = []string{"main"}
+	if err := ValidateResult(descriptor, request, invalid); err == nil {
+		t.Fatal("reserved main source port was accepted")
+	}
+	invalid = contracts.NodeResult{
+		SchemaVersion: ResultSchemaVersion,
+		Status: contracts.NodeResultFailed,
+		Failure: &contracts.StructuredFailure{Class: contracts.FailurePermanent, Code: "node.failed", Message: "failed"},
+		Route: "error", EvidenceDigest: digest,
+	}
+	if err := ValidateResult(descriptor, request, invalid); err == nil {
+		t.Fatal("failed node result carrying a route was accepted")
 	}
 }
 
@@ -183,6 +220,7 @@ func requestFor(t *testing.T, descriptor contracts.NodeDescriptor) contracts.Nod
 	}
 	t0 := time.Date(2026, 8, 13, 1, 0, 0, 0, time.UTC)
 	return contracts.NodeInvocationRequest{
+		SchemaVersion: InvocationSchemaVersion,
 		InvocationID: "invocation-1", RunID: "run-1", NodeID: "echo", TypeRef: descriptor.TypeRef,
 		DescriptorDigest: descriptor.DescriptorDigest, AttemptID: "attempt-1", AttemptOrdinal: 1,
 		Input: input, InputDigest: inputDigest, RequestedAt: t0, Deadline: t0.Add(time.Minute),

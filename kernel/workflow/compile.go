@@ -13,7 +13,12 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
 
-const SchemaVersion = "xgc.workflow/v1"
+const SchemaVersion = "xgc.workflow/v2"
+
+const (
+	maxNodeAttempts       = uint32(100)
+	maxRetryBackoffMillis = uint64(24 * 60 * 60 * 1000)
+)
 
 func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflowPlan, error) {
 	if err := validateIdentityAndSchemas(definition); err != nil {
@@ -23,7 +28,7 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, err
 	}
-	graph, dataEdges, controlEdges, err := buildGraph(definition, nodes)
+	graph, dataEdges, controlEdges, edges, err := buildGraph(definition, nodes)
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, err
 	}
@@ -89,19 +94,20 @@ func Compile(definition contracts.WorkflowDefinition) (contracts.CompiledWorkflo
 		entrypointOrders[name] = entryOrder
 	}
 	unsigned := struct {
-		WorkflowID          string              `json:"workflowId"`
-		Version             string              `json:"version"`
-		DefinitionDigest    string              `json:"definitionDigest"`
-		NodeOrder           []string            `json:"nodeOrder"`
-		EntrypointNodeOrder map[string][]string `json:"entrypointNodeOrder"`
-	}{definition.WorkflowID, definition.Version, definitionDigest, order, entrypointOrders}
+		WorkflowID          string                   `json:"workflowId"`
+		Version             string                   `json:"version"`
+		DefinitionDigest    string                   `json:"definitionDigest"`
+		NodeOrder           []string                 `json:"nodeOrder"`
+		EntrypointNodeOrder map[string][]string      `json:"entrypointNodeOrder"`
+		Edges               []contracts.WorkflowEdge `json:"edges"`
+	}{definition.WorkflowID, definition.Version, definitionDigest, order, entrypointOrders, edges}
 	planDigest, err := canonicaljson.DigestValue(unsigned)
 	if err != nil {
 		return contracts.CompiledWorkflowPlan{}, fmt.Errorf("plan digest: %w", err)
 	}
 	return contracts.CompiledWorkflowPlan{
 		WorkflowID: definition.WorkflowID, Version: definition.Version, DefinitionDigest: definitionDigest,
-		NodeOrder: order, EntrypointNodeOrder: entrypointOrders, PlanDigest: planDigest,
+		NodeOrder: order, EntrypointNodeOrder: entrypointOrders, Edges: edges, PlanDigest: planDigest,
 	}, nil
 }
 
@@ -192,6 +198,9 @@ func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]cont
 		if node.OutputSchema.ContainsFormat(contracts.FormatSecretHandle) {
 			return nil, fmt.Errorf("node %q output schema cannot expose secret handles", node.NodeID)
 		}
+		if err := validateRetryPolicy(node.NodeID, node.Retry); err != nil {
+			return nil, err
+		}
 		nodes[node.NodeID] = node
 	}
 	return nodes, nil
@@ -199,7 +208,7 @@ func indexNodes(definitions []contracts.WorkflowNodeDefinition) (map[string]cont
 
 type dependencyGraph map[string]map[string]struct{}
 
-func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contracts.WorkflowNodeDefinition) (dependencyGraph, map[string]map[string]bool, map[string]map[string]bool, error) {
+func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contracts.WorkflowNodeDefinition) (dependencyGraph, map[string]map[string]bool, map[string]map[string]bool, []contracts.WorkflowEdge, error) {
 	graph := make(dependencyGraph, len(nodes))
 	dataEdges := make(map[string]map[string]bool)
 	controlEdges := make(map[string]map[string]bool)
@@ -207,24 +216,42 @@ func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contra
 		graph[nodeID] = make(map[string]struct{})
 	}
 	seen := make(map[string]struct{})
+	edges := make([]contracts.WorkflowEdge, 0, len(definition.Edges))
 	for _, edge := range definition.Edges {
 		if !edge.Kind.Valid() {
-			return nil, nil, nil, fmt.Errorf("edge %s -> %s has invalid kind %q", edge.From, edge.To, edge.Kind)
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s has invalid kind %q", edge.From, edge.To, edge.Kind)
 		}
 		if _, exists := nodes[edge.From]; !exists {
-			return nil, nil, nil, fmt.Errorf("edge source %q does not exist", edge.From)
+			return nil, nil, nil, nil, fmt.Errorf("edge source %q does not exist", edge.From)
 		}
 		if _, exists := nodes[edge.To]; !exists {
-			return nil, nil, nil, fmt.Errorf("edge target %q does not exist", edge.To)
+			return nil, nil, nil, nil, fmt.Errorf("edge target %q does not exist", edge.To)
 		}
 		if edge.From == edge.To {
-			return nil, nil, nil, fmt.Errorf("node %q cannot depend on itself", edge.From)
+			return nil, nil, nil, nil, fmt.Errorf("node %q cannot depend on itself", edge.From)
 		}
-		identity := edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind)
+		if edge.Condition == "" {
+			edge.Condition = contracts.EdgeSuccess
+		}
+		if !edge.Condition.Valid() {
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s has invalid condition %q", edge.From, edge.To, edge.Condition)
+		}
+		if edge.Route != "" && !contracts.ValidIdentifier(edge.Route) {
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s route %q is invalid", edge.From, edge.To, edge.Route)
+		}
+		if edge.SourcePort != "" && !contracts.ValidIdentifier(edge.SourcePort) {
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s source port %q is invalid", edge.From, edge.To, edge.SourcePort)
+		}
+		if edge.Condition != contracts.EdgeSuccess && (edge.Route != "" || edge.SourcePort != "") {
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s route and sourcePort require success condition", edge.From, edge.To)
+		}
+		identity := edge.From + "\x00" + edge.To + "\x00" + string(edge.Kind) + "\x00" +
+			string(edge.Condition) + "\x00" + edge.Route + "\x00" + edge.SourcePort
 		if _, duplicate := seen[identity]; duplicate {
-			return nil, nil, nil, fmt.Errorf("edge %s -> %s (%s) is duplicated", edge.From, edge.To, edge.Kind)
+			return nil, nil, nil, nil, fmt.Errorf("edge %s -> %s (%s/%s) is duplicated", edge.From, edge.To, edge.Kind, edge.Condition)
 		}
 		seen[identity] = struct{}{}
+		edges = append(edges, edge)
 		graph[edge.From][edge.To] = struct{}{}
 		if edge.Kind == contracts.EdgeData {
 			if dataEdges[edge.To] == nil {
@@ -238,7 +265,45 @@ func buildGraph(definition contracts.WorkflowDefinition, nodes map[string]contra
 			controlEdges[edge.To][edge.From] = true
 		}
 	}
-	return graph, dataEdges, controlEdges, nil
+	sort.Slice(edges, func(left, right int) bool {
+		l, r := edges[left], edges[right]
+		if l.From != r.From {
+			return l.From < r.From
+		}
+		if l.To != r.To {
+			return l.To < r.To
+		}
+		if l.Kind != r.Kind {
+			return l.Kind < r.Kind
+		}
+		if l.Condition != r.Condition {
+			return l.Condition < r.Condition
+		}
+		if l.Route != r.Route {
+			return l.Route < r.Route
+		}
+		return l.SourcePort < r.SourcePort
+	})
+	return graph, dataEdges, controlEdges, edges, nil
+}
+
+func validateRetryPolicy(nodeID string, policy *contracts.NodeRetryPolicy) error {
+	if policy == nil {
+		return nil
+	}
+	if policy.MaxAttempts == 0 || policy.MaxAttempts > maxNodeAttempts {
+		return fmt.Errorf("node %q retry maxAttempts must be between 1 and %d", nodeID, maxNodeAttempts)
+	}
+	if policy.MaxAttempts == 1 && (policy.InitialBackoffMillis != 0 || policy.MaxBackoffMillis != 0) {
+		return fmt.Errorf("node %q retry backoff requires more than one attempt", nodeID)
+	}
+	if policy.MaxAttempts > 1 && (policy.InitialBackoffMillis == 0 ||
+		policy.InitialBackoffMillis > maxRetryBackoffMillis ||
+		policy.MaxBackoffMillis < policy.InitialBackoffMillis ||
+		policy.MaxBackoffMillis > maxRetryBackoffMillis) {
+		return fmt.Errorf("node %q retry backoff bounds must be ordered between 1 and %d milliseconds", nodeID, maxRetryBackoffMillis)
+	}
+	return nil
 }
 
 func validateEntrypoints(entrypoints map[string]string, nodes map[string]contracts.WorkflowNodeDefinition) ([]string, error) {

@@ -329,12 +329,19 @@ func (controller *Controller) resolveExternalWait(
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	snapshot.Waiting = nil
+	handled := false
 	if failure == nil {
-		snapshot.NodeOutputs[ledger.Invocation.NodeID] = result.Output
-		snapshot.NextNode++
+		if err := recordSucceededNode(&snapshot, ledger.Invocation.NodeID, result); err != nil {
+			return contracts.Run{}, err
+		}
 	} else {
-		snapshot.Failure = failure
+		handled, err = recordFailedNode(&snapshot, ledger.Invocation.NodeID, *failure)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		if !handled {
+			snapshot.Failure = failure
+		}
 	}
 	snapshotMutation, err := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
 	if err != nil {
@@ -349,7 +356,7 @@ func (controller *Controller) resolveExternalWait(
 		eventType = "snapshot.node-failed"
 		eventPayload = map[string]any{
 			"nodeId": ledger.Invocation.NodeID, "waitSubjectRef": wait.SubjectRef,
-			"failureCode": failure.Code, "resolutionIdentityDigest": requestIdentityDigest,
+			"failureCode": failure.Code, "handled": handled, "resolutionIdentityDigest": requestIdentityDigest,
 		}
 	}
 	snapshotEvent, err := aggregateEvent(snapshotMutation, eventType, commandID, now, eventPayload)
@@ -364,7 +371,7 @@ func (controller *Controller) resolveExternalWait(
 		RunID: run.RunID, ExpectedRevision: run.Revision, To: contracts.RunRunning,
 		CommandID: commandID, At: now,
 	}
-	if failure != nil {
+	if failure != nil && !handled {
 		runCommand.To = contracts.RunStopping
 		runCommand.Termination = &contracts.TerminationIntent{
 			Kind: contracts.TerminationFailed, RequestedRevision: run.Revision, RequestedBy: controller.ownerRef,

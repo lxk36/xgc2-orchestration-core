@@ -36,7 +36,7 @@ const (
 	commandLedgerType        = "command-ledger"
 	ownershipGraphType       = "ownership-graph"
 	activeOwnerAggregateType = "active-run-owner"
-	RunSnapshotSchemaVersion = "xgc.run-snapshot/v2"
+	RunSnapshotSchemaVersion = "xgc.run-snapshot/v3"
 	eventSchemaDigest        = "sha256:90b2f52b665b9a8e896a5708d6bf7b2083b47e45992498a57268edbbc2e8f49a"
 )
 
@@ -143,12 +143,34 @@ type RunSnapshot struct {
 	Scope         map[string]any                   `json:"scope"`
 	Provenance    []contracts.InputFieldProvenance `json:"provenance"`
 	NodeOutputs   map[string]map[string]any        `json:"nodeOutputs"`
+	NodeOutcomes  map[string]NodeOutcome           `json:"nodeOutcomes"`
 	NextNode      int                              `json:"nextNode"`
 	Waiting       *WaitingOccurrence               `json:"waiting,omitempty"`
 	ActionCall    *ActionCallWait                  `json:"actionCall,omitempty"`
+	RetryWait     *RetryWaitOccurrence             `json:"retryWait,omitempty"`
 	Failure       *contracts.StructuredFailure     `json:"failure,omitempty"`
 	Result        map[string]any                   `json:"result,omitempty"`
 	ResultDigest  string                           `json:"resultDigest,omitempty"`
+}
+
+// NodeOutcome is the durable routing receipt for one terminal occurrence. It
+// is committed atomically with the terminal Invocation transition and is the
+// sole source for later edge decisions after restart.
+type NodeOutcome struct {
+	Status       contracts.InvocationStatus   `json:"status"`
+	OutputDigest string                       `json:"outputDigest,omitempty"`
+	Route        string                       `json:"route,omitempty"`
+	SourcePorts  []string                     `json:"sourcePorts,omitempty"`
+	Failure      *contracts.StructuredFailure `json:"failure,omitempty"`
+}
+
+// RetryWaitOccurrence projects the exact retry-wait Invocation and its frozen
+// authored exponential-backoff deadline. It is mutually exclusive with every
+// external wait and child Action join.
+type RetryWaitOccurrence struct {
+	InvocationID   string    `json:"invocationId"`
+	AttemptOrdinal uint32    `json:"attemptOrdinal"`
+	AvailableAt    time.Time `json:"availableAt"`
 }
 
 // WaitingOccurrence is the authoritative public fence for the exact durable
@@ -417,6 +439,7 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 			Definition: request.Definition, Plan: plan, Entrypoint: request.Action.Entrypoint, NodeOrder: nodeOrder,
 			Inputs: admission.Inputs, Trigger: admission.Trigger.Payload, Scope: request.Scope,
 			Provenance: admission.FieldProvenance, NodeOutputs: map[string]map[string]any{},
+			NodeOutcomes: map[string]NodeOutcome{},
 		}
 		runMutation, mutationErr := aggregateMutation(runKey(request.RunID), 0, decision.Run)
 		if mutationErr != nil {
@@ -571,9 +594,17 @@ func (controller *Controller) GetSnapshot(ctx context.Context, runID string) (Ru
 		}
 		var invocationRecord store.AggregateRecord
 		var ledger contracts.InvocationLedger
+		projectedInvocationID := ""
 		if snapshot.Waiting != nil {
+			projectedInvocationID = snapshot.Waiting.InvocationID
+		} else if snapshot.ActionCall != nil {
+			projectedInvocationID = snapshot.ActionCall.InvocationID
+		} else if snapshot.RetryWait != nil {
+			projectedInvocationID = snapshot.RetryWait.InvocationID
+		}
+		if projectedInvocationID != "" {
 			invocationRecord, err = controller.store.GetAggregate(ctx, store.AggregateKey{
-				Type: invocationType, ID: snapshot.Waiting.InvocationID,
+				Type: invocationType, ID: projectedInvocationID,
 			})
 			if err != nil {
 				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
@@ -598,7 +629,7 @@ func (controller *Controller) GetSnapshot(ctx context.Context, runID string) (Ru
 		if !sameAggregateVersion(snapshotRecord, latestSnapshot) || !sameAggregateVersion(runRecord, latestRun) {
 			continue
 		}
-		if snapshot.Waiting != nil {
+		if projectedInvocationID != "" {
 			latestInvocation, invocationErr := controller.store.GetAggregate(ctx, invocationRecord.Key)
 			if invocationErr != nil {
 				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, invocationErr)
@@ -614,6 +645,14 @@ func (controller *Controller) GetSnapshot(ctx context.Context, runID string) (Ru
 			if err := validateSnapshotWaitingOccurrence(snapshot, ledger); err != nil {
 				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
 			}
+		} else if snapshot.ActionCall != nil {
+			if err := validateSnapshotActionCall(snapshot, ledger); err != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+			}
+		} else if snapshot.RetryWait != nil {
+			if err := validateSnapshotRetryWait(snapshot, ledger); err != nil {
+				return RunSnapshot{}, 0, errors.Join(store.ErrCorrupt, err)
+			}
 		}
 		return snapshot, snapshotRecord.Revision, nil
 	}
@@ -626,8 +665,74 @@ func sameAggregateVersion(left, right store.AggregateRecord) bool {
 
 func validateRunSnapshot(snapshot RunSnapshot) error {
 	if snapshot.SchemaVersion != RunSnapshotSchemaVersion || !contracts.ValidIdentifier(snapshot.RunID) ||
-		snapshot.NextNode < 0 || snapshot.NextNode > len(snapshot.NodeOrder) {
+		snapshot.NextNode < 0 || snapshot.NextNode > len(snapshot.NodeOrder) ||
+		snapshot.NodeOutputs == nil || snapshot.NodeOutcomes == nil {
 		return errors.New("Run snapshot schema, identity, or node position is invalid")
+	}
+	compiled, err := workflowkernel.Compile(snapshot.Definition)
+	if err != nil {
+		return fmt.Errorf("Run snapshot pinned workflow: %w", err)
+	}
+	compiledDigest, err := canonicaljson.DigestValue(compiled)
+	if err != nil {
+		return err
+	}
+	pinnedPlanDigest, err := canonicaljson.DigestValue(snapshot.Plan)
+	if err != nil || compiledDigest != pinnedPlanDigest {
+		return errors.New("Run snapshot compiled plan differs from its pinned workflow")
+	}
+	entryOrder, exists := snapshot.Plan.EntrypointNodeOrder[snapshot.Entrypoint]
+	if !exists || !sameStrings(entryOrder, snapshot.NodeOrder) {
+		return errors.New("Run snapshot node order differs from its selected entrypoint plan")
+	}
+	if len(snapshot.NodeOutcomes) != snapshot.NextNode {
+		return errors.New("Run snapshot terminal outcome prefix differs from its node position")
+	}
+	seenNodes := make(map[string]bool, len(snapshot.NodeOrder))
+	for index, nodeID := range snapshot.NodeOrder {
+		if !contracts.ValidIdentifier(nodeID) || seenNodes[nodeID] {
+			return errors.New("Run snapshot node order is invalid or duplicated")
+		}
+		seenNodes[nodeID] = true
+		outcome, terminal := snapshot.NodeOutcomes[nodeID]
+		if terminal != (index < snapshot.NextNode) {
+			return errors.New("Run snapshot outcomes are not an exact node-order prefix")
+		}
+		if terminal {
+			if err := validateNodeOutcome(outcome, snapshot.NodeOutputs[nodeID]); err != nil {
+				return fmt.Errorf("Run snapshot node %q outcome: %w", nodeID, err)
+			}
+		}
+	}
+	for nodeID := range snapshot.NodeOutputs {
+		outcome, exists := snapshot.NodeOutcomes[nodeID]
+		if !exists || outcome.Status != contracts.InvocationSucceeded {
+			return errors.New("Run snapshot output lacks a succeeded node outcome")
+		}
+	}
+	projectionCount := 0
+	if snapshot.Waiting != nil {
+		projectionCount++
+	}
+	if snapshot.ActionCall != nil {
+		projectionCount++
+	}
+	if snapshot.RetryWait != nil {
+		projectionCount++
+	}
+	if projectionCount > 1 {
+		return errors.New("Run snapshot contains competing wait projections")
+	}
+	if snapshot.RetryWait != nil {
+		if snapshot.NextNode >= len(snapshot.NodeOrder) ||
+			!contracts.ValidIdentifier(snapshot.RetryWait.InvocationID) ||
+			snapshot.RetryWait.AttemptOrdinal == 0 || snapshot.RetryWait.AvailableAt.IsZero() {
+			return errors.New("Run snapshot retry wait projection is invalid")
+		}
+		expectedInvocationID, err := execution.StableInvocationID(snapshot.RunID, snapshot.NodeOrder[snapshot.NextNode])
+		if err != nil || expectedInvocationID != snapshot.RetryWait.InvocationID {
+			return errors.New("Run snapshot retry wait is not the current node invocation")
+		}
 	}
 	if snapshot.Waiting == nil {
 		return nil
@@ -635,7 +740,9 @@ func validateRunSnapshot(snapshot RunSnapshot) error {
 	result := snapshot.Waiting.Result
 	if snapshot.ActionCall != nil || snapshot.NextNode >= len(snapshot.NodeOrder) ||
 		result.Status != contracts.NodeResultWaiting || result.Wait == nil ||
-		result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" || result.Failure != nil ||
+		result.SchemaVersion != node.ResultSchemaVersion ||
+		result.Output != nil || result.OutputDigest != "" || result.OutputArtifactRef != "" ||
+		result.Route != "" || len(result.SourcePorts) != 0 || result.Failure != nil ||
 		!result.Wait.Kind.Valid() || !contracts.ValidIdentifier(result.Wait.SubjectRef) ||
 		!contracts.ValidDigest(result.Wait.ConditionDigest) ||
 		!contracts.ValidDigest(result.EvidenceDigest) ||
@@ -658,26 +765,108 @@ func validateRunSnapshot(snapshot RunSnapshot) error {
 	return nil
 }
 
+func sameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateNodeOutcome(outcome NodeOutcome, output map[string]any) error {
+	switch outcome.Status {
+	case contracts.InvocationSucceeded:
+		if output == nil || !contracts.ValidDigest(outcome.OutputDigest) || outcome.Failure != nil {
+			return errors.New("succeeded outcome lacks output or carries failure")
+		}
+		digest, err := canonicaljson.DigestValue(output)
+		if err != nil || digest != outcome.OutputDigest {
+			return errors.New("succeeded outcome output digest differs from its frozen output")
+		}
+		if outcome.Route != "" && !contracts.ValidIdentifier(outcome.Route) {
+			return errors.New("succeeded outcome route is invalid")
+		}
+		previous := ""
+		for _, port := range outcome.SourcePorts {
+			if !contracts.ValidIdentifier(port) || port == "main" || port == outcome.Route || port <= previous {
+				return errors.New("succeeded outcome source ports are invalid")
+			}
+			previous = port
+		}
+	case contracts.InvocationFailed:
+		if output != nil || outcome.OutputDigest != "" || outcome.Route != "" || len(outcome.SourcePorts) != 0 ||
+			outcome.Failure == nil || !outcome.Failure.Class.Valid() ||
+			!contracts.ValidIdentifier(outcome.Failure.Code) || outcome.Failure.Message == "" ||
+			(outcome.Failure.EvidenceRef != "" && !contracts.ValidIdentifier(outcome.Failure.EvidenceRef)) {
+			return errors.New("failed outcome shape is invalid")
+		}
+	case contracts.InvocationSkipped:
+		if output != nil || outcome.OutputDigest != "" || outcome.Route != "" || len(outcome.SourcePorts) != 0 || outcome.Failure != nil {
+			return errors.New("skipped outcome carries terminal data")
+		}
+	default:
+		return errors.New("node outcome is not terminal")
+	}
+	return nil
+}
+
 func validateSnapshotRunState(snapshot RunSnapshot, run contracts.Run) error {
 	if run.RunID != snapshot.RunID {
 		return errors.New("Run snapshot and Run identities differ")
 	}
 	switch run.Status {
 	case contracts.RunWaiting:
-		if (snapshot.Waiting == nil) == (snapshot.ActionCall == nil) {
-			return errors.New("waiting Run requires exactly one ordinary or child Action wait")
+		count := 0
+		if snapshot.Waiting != nil {
+			count++
+		}
+		if snapshot.ActionCall != nil {
+			count++
+		}
+		if snapshot.RetryWait != nil {
+			count++
+		}
+		if count != 1 {
+			return errors.New("waiting Run requires exactly one ordinary, child Action, or retry wait")
 		}
 	case contracts.RunStopping:
 		// The stopping Run may still project its wait until cancellation, and an
 		// ActionCall join remains durable for termination intent settlement.
 	case contracts.RunAccepted, contracts.RunQueued, contracts.RunRunning:
-		if snapshot.Waiting != nil || snapshot.ActionCall != nil {
+		if snapshot.Waiting != nil || snapshot.ActionCall != nil || snapshot.RetryWait != nil {
 			return errors.New("active non-waiting Run retains a wait projection")
 		}
 	default:
-		if run.Status.Terminal() && snapshot.Waiting != nil {
-			return errors.New("terminal Run retains an ordinary wait occurrence")
+		if run.Status.Terminal() && (snapshot.Waiting != nil || snapshot.ActionCall != nil || snapshot.RetryWait != nil) {
+			return errors.New("terminal Run retains a wait occurrence")
 		}
+	}
+	return nil
+}
+
+func validateSnapshotActionCall(snapshot RunSnapshot, ledger contracts.InvocationLedger) error {
+	wait := snapshot.ActionCall
+	if wait == nil || snapshot.NextNode >= len(snapshot.NodeOrder) ||
+		ledger.Invocation.RunID != snapshot.RunID || ledger.Invocation.NodeID != snapshot.NodeOrder[snapshot.NextNode] ||
+		ledger.Invocation.InvocationID != wait.InvocationID || ledger.Invocation.Status != contracts.InvocationWaiting ||
+		ledger.Invocation.CurrentWaitRef != wait.ChildRunID {
+		return errors.New("Run snapshot child Action wait differs from its invocation ledger")
+	}
+	return nil
+}
+
+func validateSnapshotRetryWait(snapshot RunSnapshot, ledger contracts.InvocationLedger) error {
+	wait := snapshot.RetryWait
+	if wait == nil || snapshot.NextNode >= len(snapshot.NodeOrder) ||
+		ledger.Invocation.RunID != snapshot.RunID || ledger.Invocation.NodeID != snapshot.NodeOrder[snapshot.NextNode] ||
+		ledger.Invocation.InvocationID != wait.InvocationID || ledger.Invocation.Status != contracts.InvocationRetryWait ||
+		ledger.Invocation.ExecutionAttemptCount != wait.AttemptOrdinal || ledger.Invocation.NextAttemptAt == nil ||
+		!ledger.Invocation.NextAttemptAt.Equal(wait.AvailableAt) {
+		return errors.New("Run snapshot retry wait differs from its invocation ledger")
 	}
 	return nil
 }

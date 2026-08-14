@@ -66,6 +66,70 @@ func TestCompileReferenceWorkflowIsDeterministic(t *testing.T) {
 	if strings.Join(left.EntrypointNodeOrder["main"], ",") != "prepare,render" {
 		t.Fatalf("main entrypoint order = %#v", left.EntrypointNodeOrder["main"])
 	}
+	if len(left.Edges) != 1 || left.Edges[0].Condition != contracts.EdgeSuccess {
+		t.Fatalf("compiled edges were not normalized: %#v", left.Edges)
+	}
+}
+
+func TestCompilePinsRoutingAndAuthoredRetryInV2Digest(t *testing.T) {
+	definition := baseDefinition()
+	definition.Nodes[0].Retry = &contracts.NodeRetryPolicy{
+		MaxAttempts: 4, InitialBackoffMillis: 250, MaxBackoffMillis: 4000,
+	}
+	definition.Edges[0].Condition = contracts.EdgeAlways
+	first, err := Compile(definition)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := definition
+	changed.Nodes = append([]contracts.WorkflowNodeDefinition(nil), definition.Nodes...)
+	changed.Nodes[0].Retry = &contracts.NodeRetryPolicy{
+		MaxAttempts: 4, InitialBackoffMillis: 500, MaxBackoffMillis: 4000,
+	}
+	second, err := Compile(changed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.DefinitionDigest == second.DefinitionDigest || first.PlanDigest == second.PlanDigest {
+		t.Fatal("authored retry did not change immutable definition and plan identities")
+	}
+	routed := baseDefinition()
+	routed.Edges[0].Route = "ready"
+	routed.Edges[0].SourcePort = "payload"
+	plan, err := Compile(routed)
+	if err != nil || plan.Edges[0].Route != "ready" || plan.Edges[0].SourcePort != "payload" {
+		t.Fatalf("routed plan = %#v, err=%v", plan, err)
+	}
+}
+
+func TestCompileRejectsInvalidRoutingAndRetryCombinations(t *testing.T) {
+	tests := []struct {
+		name string
+		edit func(*contracts.WorkflowDefinition)
+		want string
+	}{
+		{name: "failure route", edit: func(value *contracts.WorkflowDefinition) {
+			value.Edges[0].Condition, value.Edges[0].Route = contracts.EdgeFailure, "error"
+		}, want: "require success condition"},
+		{name: "invalid condition", edit: func(value *contracts.WorkflowDefinition) {
+			value.Edges[0].Condition = "sometimes"
+		}, want: "invalid condition"},
+		{name: "zero attempts", edit: func(value *contracts.WorkflowDefinition) {
+			value.Nodes[0].Retry = &contracts.NodeRetryPolicy{}
+		}, want: "maxAttempts"},
+		{name: "unordered backoff", edit: func(value *contracts.WorkflowDefinition) {
+			value.Nodes[0].Retry = &contracts.NodeRetryPolicy{MaxAttempts: 3, InitialBackoffMillis: 2000, MaxBackoffMillis: 1000}
+		}, want: "backoff bounds"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			definition := baseDefinition()
+			test.edit(&definition)
+			if _, err := Compile(definition); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Compile() error=%v, want %q", err, test.want)
+			}
+		})
+	}
 }
 
 func TestCompilePinsIndependentNodeOrderForEveryEntrypoint(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/canonicaljson"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
+	nodekernel "github.com/lxk36/xgc2-orchestration-core/kernel/node"
 	workflowkernel "github.com/lxk36/xgc2-orchestration-core/kernel/workflow"
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
 )
@@ -48,7 +49,14 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			}
 			continue
 		case contracts.RunWaiting:
-			return run, ErrRunWaiting
+			if snapshot.RetryWait == nil {
+				return run, ErrRunWaiting
+			}
+			resumed, resumeErr := controller.resumeRetryWait(ctx, runRecord, run, snapshot, snapshotRevision, now)
+			if resumeErr != nil {
+				return resumed, resumeErr
+			}
+			continue
 		case contracts.RunStopping:
 			return controller.finalizeStoppingRun(ctx, runRecord, run, now)
 		case contracts.RunRunning:
@@ -60,16 +68,26 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			return controller.succeedRun(ctx, runRecord, run, snapshot, snapshotRevision, now)
 		}
 		nodeID := snapshot.NodeOrder[snapshot.NextNode]
+		disposition, err := currentNodeDisposition(snapshot)
+		if err != nil {
+			return contracts.Run{}, err
+		}
+		if disposition == nodeBlocked {
+			return contracts.Run{}, errors.New("current workflow node has unresolved predecessors despite stable topological order")
+		}
 		workflowNode, ok := findWorkflowNode(snapshot.Definition, nodeID)
 		if !ok {
 			return contracts.Run{}, fmt.Errorf("pinned node %q disappeared from snapshot", nodeID)
 		}
 		descriptor := controller.descriptors[workflowNode.TypeRef]
-		inputs, err := workflowkernel.ResolveNodeInputs(
-			snapshot.Definition, nodeID, snapshot.Inputs, snapshot.Trigger, snapshot.Scope, snapshot.NodeOutputs, nil,
-		)
-		if err != nil {
-			return controller.failWithoutAttempt(ctx, runRecord, run, snapshot, snapshotRevision, "node.input-resolution", err, now)
+		inputs := map[string]any{}
+		if disposition == nodeReady {
+			inputs, err = workflowkernel.ResolveNodeInputs(
+				snapshot.Definition, nodeID, snapshot.Inputs, snapshot.Trigger, snapshot.Scope, snapshot.NodeOutputs, nil,
+			)
+			if err != nil {
+				return controller.failWithoutAttempt(ctx, runRecord, run, snapshot, snapshotRevision, "node.input-resolution", err, now)
+			}
 		}
 		inputDigest, err := canonicaljson.DigestValue(inputs)
 		if err != nil {
@@ -99,6 +117,33 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 		ledger, err := decodeLedger(invocationRecord)
 		if err != nil {
 			return contracts.Run{}, err
+		}
+		if disposition == nodeSkipped {
+			if ledger.Invocation.Status != contracts.InvocationReady {
+				return contracts.Run{}, fmt.Errorf("skipped node invocation %s is %s", nodeID, ledger.Invocation.Status)
+			}
+			decision, resolveErr := execution.ResolveUnleasedInvocation(ledger, execution.ResolveUnleasedInvocationCommand{
+				InvocationID: invocationID, ExpectedRevision: ledger.Invocation.Revision, To: contracts.InvocationSkipped,
+				CommandID: phaseCommand(runID, "skip-"+nodeID, ledger.Invocation.Revision), At: now,
+			})
+			if resolveErr != nil {
+				return contracts.Run{}, resolveErr
+			}
+			if err := recordSkippedNode(&snapshot, nodeID); err != nil {
+				return contracts.Run{}, err
+			}
+			snapshotMutation, mutationErr := aggregateMutation(snapshotKey(runID), snapshotRevision, snapshot)
+			if mutationErr != nil {
+				return contracts.Run{}, mutationErr
+			}
+			snapshotEvent, eventErr := aggregateEvent(snapshotMutation, "snapshot.node-skipped", decision.Events[0].CommandID, now, map[string]any{"nodeId": nodeID})
+			if eventErr != nil {
+				return contracts.Run{}, eventErr
+			}
+			if err := controller.commitInvocationDecision(ctx, invocationRecord.Revision, decision, decision.Events[0].CommandID, now, &snapshotMutation, &snapshotEvent); err != nil {
+				return contracts.Run{}, err
+			}
+			continue
 		}
 		claimedNow := false
 		leaseToken := ""
@@ -134,8 +179,10 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			}
 			// A child Action call is retryable because both its Run and trigger
 			// identities are derived from this immutable parent invocation.
-			retry := workflowNode.CallAction != nil ||
-				(descriptor.Mode == contracts.NodePure && descriptor.Determinism == contracts.NodeDeterministic)
+			policy := retryPolicy(workflowNode)
+			retry := ledger.Invocation.ExecutionAttemptCount < policy.MaxAttempts &&
+				(workflowNode.CallAction != nil ||
+					descriptor.Mode == contracts.NodePure && descriptor.Determinism == contracts.NodeDeterministic)
 			failure := contracts.StructuredFailure{Class: contracts.FailureUncertain, Code: "worker.lease-expired", Message: "worker lease expired before a durable node result"}
 			expired, expireErr := execution.ExpireInvocationAttempt(ledger, execution.ExpireInvocationAttemptCommand{
 				InvocationID: invocationID, ExpectedRevision: ledger.Invocation.Revision,
@@ -145,13 +192,20 @@ func (controller *Controller) Drive(ctx context.Context, runID string) (contract
 			if expireErr != nil {
 				return contracts.Run{}, expireErr
 			}
-			if err := controller.commitInvocationDecision(ctx, invocationRecord.Revision, expired, expired.Events[0].CommandID, now, nil, nil); err != nil {
-				return contracts.Run{}, err
+			if retry {
+				if err := controller.commitInvocationDecision(ctx, invocationRecord.Revision, expired, expired.Events[0].CommandID, now, nil, nil); err != nil {
+					return contracts.Run{}, err
+				}
+				continue
 			}
-			if !retry {
-				return controller.beginFailure(ctx, runRecord, run, snapshot, snapshotRevision, failure, now)
+			resolved, resolveErr := controller.commitTerminalNodeFailure(
+				ctx, runRecord, run, snapshot, snapshotRevision, invocationRecord.Revision,
+				expired, failure, expired.Events[0].CommandID, now,
+			)
+			if errors.Is(resolveErr, errContinueDrive) {
+				continue
 			}
-			continue
+			return resolved, resolveErr
 		}
 		if ledger.Invocation.Status != contracts.InvocationRunning {
 			if ledger.Invocation.Status == contracts.InvocationWaiting {
@@ -206,6 +260,7 @@ func (controller *Controller) executeClaimed(
 	}
 	inputDigest, _ := canonicaljson.DigestValue(inputs)
 	request := contracts.NodeInvocationRequest{
+		SchemaVersion: nodekernel.InvocationSchemaVersion,
 		InvocationID: ledger.Invocation.InvocationID, RunID: run.RunID, NodeID: ledger.Invocation.NodeID,
 		TypeRef: ledger.Invocation.TypeRef, DescriptorDigest: ledger.Invocation.DescriptorDigest,
 		AttemptID: attempt.AttemptID, AttemptOrdinal: attempt.Ordinal, Input: inputs, InputDigest: inputDigest,
@@ -233,9 +288,9 @@ func (controller *Controller) executeClaimed(
 		if transitionErr != nil {
 			return contracts.Run{}, transitionErr
 		}
-		snapshot.NodeOutputs[ledger.Invocation.NodeID] = result.Output
-		snapshot.NextNode++
-		snapshot.Waiting = nil
+		if err := recordSucceededNode(&snapshot, ledger.Invocation.NodeID, result); err != nil {
+			return contracts.Run{}, err
+		}
 		snapshotMutation, mutationErr := aggregateMutation(snapshotKey(run.RunID), snapshotRevision, snapshot)
 		if mutationErr != nil {
 			return contracts.Run{}, mutationErr
@@ -279,7 +334,11 @@ func (controller *Controller) executeClaimed(
 		}
 		return runDecision.Run, controller.commitWaiting(ctx, runRecord.Revision, invocationRevision, snapshotRevision, decision, runDecision, snapshotMutation, effectMutations, effectEvents, commandID, completedAt)
 	case contracts.NodeResultFailed:
-		return controller.failClaimed(ctx, runRecord, run, snapshot, snapshotRevision, invocationRevision, ledger, leaseToken, result.Failure.Code, errors.New(result.Failure.Message), completedAt)
+		failure, failureErr := requireFailure(result.Failure)
+		if failureErr != nil {
+			return contracts.Run{}, failureErr
+		}
+		return controller.failClaimedWithFailure(ctx, runRecord, run, snapshot, snapshotRevision, invocationRevision, ledger, leaseToken, failure, completedAt)
 	default:
 		return contracts.Run{}, errors.New("validated node returned an unknown status")
 	}
