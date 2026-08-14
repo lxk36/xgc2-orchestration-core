@@ -246,10 +246,7 @@ func (fileStore *Store) Commit(ctx context.Context, transaction store.Transactio
 	if transaction.At.IsZero() {
 		return store.CommitResult{}, errors.New("transaction time is required")
 	}
-	next, err := cloneState(fileStore.state)
-	if err != nil {
-		return store.CommitResult{}, err
-	}
+	next := forkState(fileStore.state)
 	outcome, outcomeDigest, err := normalizeRaw(transaction.Outcome)
 	if err != nil {
 		return store.CommitResult{}, fmt.Errorf("transaction outcome: %w", err)
@@ -393,10 +390,7 @@ func (fileStore *Store) ClaimIntents(ctx context.Context, request store.ClaimReq
 	if len(candidates) == 0 {
 		return []store.ClaimedIntent{}, nil
 	}
-	next, err := cloneState(fileStore.state)
-	if err != nil {
-		return nil, err
-	}
+	next := forkState(fileStore.state)
 	claimed := make([]store.ClaimedIntent, 0, len(candidates))
 	for _, item := range candidates {
 		record := next.Intents[item.id]
@@ -483,10 +477,7 @@ func (fileStore *Store) RecordInbox(ctx context.Context, record store.InboxRecor
 		}
 		return true, nil
 	}
-	next, err := cloneState(fileStore.state)
-	if err != nil {
-		return false, err
-	}
+	next := forkState(fileStore.state)
 	record.ObservedAt = record.ObservedAt.UTC()
 	next.Inbox[key] = record
 	if err := fileStore.append(next); err != nil {
@@ -515,10 +506,7 @@ func (fileStore *Store) foldIntent(ctx context.Context, fence store.IntentFence,
 		fence.At.IsZero() || !fence.At.Before(*record.LeaseExpiresAt) {
 		return store.IntentRecord{}, store.ErrLeaseConflict
 	}
-	next, err := cloneState(fileStore.state)
-	if err != nil {
-		return store.IntentRecord{}, err
-	}
+	next := forkState(fileStore.state)
 	nextRecord := next.Intents[fence.IntentID]
 	if err := fold(&nextRecord); err != nil {
 		return store.IntentRecord{}, err
@@ -728,7 +716,14 @@ func (fileStore *Store) append(state diskState) error {
 }
 
 func encodeFrame(state diskState) ([]byte, error) {
-	payload, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
+	// State components have already crossed their canonical validation boundary:
+	// aggregate payloads are stored as canonical RawMessage values and event /
+	// intent maps are digest-validated before publication. The checkpoint itself
+	// is not a content identity, so reparsing the complete state merely to emit a
+	// second canonical spelling adds no integrity. encoding/json remains
+	// deterministic for string-keyed maps and the frame digest authenticates the
+	// exact bytes that recovery reads.
+	payload, err := json.Marshal(state)
 	if err != nil {
 		return nil, err
 	}
@@ -1320,16 +1315,37 @@ func emptyState() diskState {
 	}
 }
 
-func cloneState(state diskState) (diskState, error) {
-	raw, err := canonicaljson.MarshalWithLimits(state, frameJSONLimits())
-	if err != nil {
-		return diskState{}, err
+func forkState(state diskState) diskState {
+	// Published records are immutable. Every read API returns a defensive copy,
+	// and every write path replaces the complete record it changes. A new state
+	// therefore only needs fresh map indexes; unchanged opaque payloads can be
+	// shared safely until the old state becomes unreachable. This is the same
+	// copy-on-write rule used by persistent maps, and avoids serializing and
+	// reparsing the complete durable state before every transaction.
+	clone := diskState{
+		Version:    state.Version,
+		Aggregates: make(map[string]store.AggregateRecord, len(state.Aggregates)),
+		Events:     make(map[string]contracts.DomainEvent, len(state.Events)),
+		Commands:   make(map[string]commandRecord, len(state.Commands)),
+		Intents:    make(map[string]store.IntentRecord, len(state.Intents)),
+		Inbox:      make(map[string]store.InboxRecord, len(state.Inbox)),
 	}
-	var clone diskState
-	if err := canonicaljson.UnmarshalStrictWithLimits(raw, &clone, frameJSONLimits()); err != nil {
-		return diskState{}, err
+	for key, record := range state.Aggregates {
+		clone.Aggregates[key] = record
 	}
-	return clone, nil
+	for key, event := range state.Events {
+		clone.Events[key] = event
+	}
+	for key, command := range state.Commands {
+		clone.Commands[key] = command
+	}
+	for key, record := range state.Intents {
+		clone.Intents[key] = record
+	}
+	for key, record := range state.Inbox {
+		clone.Inbox[key] = record
+	}
+	return clone
 }
 
 func frameJSONLimits() canonicaljson.Limits {

@@ -1251,6 +1251,150 @@ func TestDurableFrameExceedsSingleProtocolValueLimitAndRecovers(t *testing.T) {
 	}
 }
 
+func TestForkStateUsesCopyOnWriteIndexes(t *testing.T) {
+	original := emptyState()
+	original.Aggregates["fixture\x00frozen"] = store.AggregateRecord{
+		Key: store.AggregateKey{Type: "fixture", ID: "frozen"}, Revision: 1,
+		PayloadDigest: fixtureDigest, Payload: json.RawMessage(`{"value":"frozen"}`),
+	}
+	original.Events["event-frozen"] = contracts.DomainEvent{EventID: "event-frozen"}
+	original.Commands["command-frozen"] = commandRecord{IdentityDigest: fixtureDigest}
+	original.Intents["intent-frozen"] = store.IntentRecord{Revision: 1}
+	original.Inbox["source\x00message"] = store.InboxRecord{SourceRef: "source", MessageID: "message"}
+
+	next := forkState(original)
+	delete(next.Aggregates, "fixture\x00frozen")
+	delete(next.Events, "event-frozen")
+	delete(next.Commands, "command-frozen")
+	delete(next.Intents, "intent-frozen")
+	delete(next.Inbox, "source\x00message")
+	next.Aggregates["fixture\x00mutable"] = store.AggregateRecord{
+		Key: store.AggregateKey{Type: "fixture", ID: "mutable"}, Revision: 1,
+	}
+
+	if len(original.Aggregates) != 1 || original.Aggregates["fixture\x00frozen"].Key.ID != "frozen" ||
+		len(original.Events) != 1 || len(original.Commands) != 1 || len(original.Intents) != 1 || len(original.Inbox) != 1 {
+		t.Fatalf("fork mutated published state: %#v", original)
+	}
+	if _, exists := original.Aggregates["fixture\x00mutable"]; exists {
+		t.Fatal("forked aggregate index aliases the published index")
+	}
+}
+
+func TestCheckpointEncodingPreservesCanonicalRecordIdentityAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "record-identity.wal")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := canonicaljson.Marshal(map[string]any{"value": "<>&\u2028"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payloadDigest, err := canonicaljson.Digest(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventPayload := map[string]any{"fixtureId": "record-identity"}
+	eventPayloadDigest, err := canonicaljson.DigestValue(eventPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := store.AggregateKey{Type: "fixture", ID: "record-identity"}
+	eventID, err := execution.StableEventID(key.Type, key.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := store.Transaction{
+		CommandID: "persist-record-identity", IdentityDigest: fixtureDigest,
+		Expected: []store.ExpectedRevision{{Key: key}},
+		Mutations: []store.AggregateRecord{{
+			Key: key, Revision: 1, PayloadDigest: payloadDigest, Payload: payload,
+		}},
+		Events: []contracts.DomainEvent{{
+			EventID: eventID, AggregateType: key.Type, AggregateID: key.ID, AggregateRevision: 1,
+			Type: "fixture.created", CommandID: "persist-record-identity",
+			PayloadSchemaDigest: fixtureDigest, PayloadDigest: eventPayloadDigest, Payload: eventPayload,
+			OccurredAt: time.Date(2026, 8, 13, 23, 0, 0, 0, time.UTC),
+		}},
+		Outcome: json.RawMessage(`{"stored":true}`), At: time.Date(2026, 8, 13, 23, 0, 0, 0, time.UTC),
+	}
+	if _, err := durable.Commit(t.Context(), transaction); err != nil {
+		t.Fatal(err)
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	durable, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	recovered, err := durable.GetAggregate(t.Context(), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveredDigest, err := canonicaljson.Digest(recovered.Payload)
+	if err != nil || recovered.PayloadDigest != payloadDigest || recoveredDigest != payloadDigest {
+		t.Fatalf("recovered identity payload=%s envelope=%s calculated=%s err=%v", recovered.Payload, recovered.PayloadDigest, recoveredDigest, err)
+	}
+}
+
+var benchmarkDiskState diskState
+
+func BenchmarkForkStateWithLargeFrozenAggregate(b *testing.B) {
+	state := largeBenchmarkState(b)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(state.Aggregates["fixture\x00frozen"].Payload)))
+	for b.Loop() {
+		next := forkState(state)
+		next.Inbox["source\x00message"] = store.InboxRecord{SourceRef: "source", MessageID: "message"}
+		benchmarkDiskState = next
+	}
+}
+
+func BenchmarkEncodeFrameWithLargeFrozenAggregate(b *testing.B) {
+	state := largeBenchmarkState(b)
+	frame, err := encodeFrame(state)
+	if err != nil {
+		b.Fatal(err)
+	}
+	frameBytes := len(frame)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(state.Aggregates["fixture\x00frozen"].Payload)))
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := encodeFrame(state); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(frameBytes), "frame-bytes")
+}
+
+func largeBenchmarkState(tb testing.TB) diskState {
+	tb.Helper()
+	payload, err := canonicaljson.MarshalWithLimits(
+		map[string]any{"definition": []any{
+			strings.Repeat("frozen-workflow-spec-", 30_000),
+			strings.Repeat("frozen-workflow-spec-", 30_000),
+			strings.Repeat("frozen-workflow-spec-", 30_000),
+			strings.Repeat("frozen-workflow-spec-", 30_000),
+		}},
+		frameJSONLimits(),
+	)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	payloadSum := sha256.Sum256(payload)
+	payloadDigest := "sha256:" + fmt.Sprintf("%x", payloadSum[:])
+	state := emptyState()
+	state.Aggregates["fixture\x00frozen"] = store.AggregateRecord{
+		Key: store.AggregateKey{Type: "fixture", ID: "frozen"}, Revision: 1,
+		PayloadDigest: payloadDigest, Payload: payload,
+	}
+	return state
+}
+
 func runTransaction(t *testing.T, decision execution.RunDecision, expected uint64, commandID string, at time.Time) store.Transaction {
 	t.Helper()
 	payload, err := canonicaljson.Marshal(decision.Run)
