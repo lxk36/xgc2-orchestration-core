@@ -21,6 +21,12 @@ seal against the policies currently registered for the namespace. A generic
 record that predates reservation, or a record admitted under an older policy
 ref or digest, is not grandfathered and has no dual-read fallback.
 
+Reserved catalog installs and Run ingress also derive their durable v3 command
+scope from that verified policy ref/digest. Ordinary request fields cannot
+select this authority scope. The same command ID may be used independently in
+another namespace or API operation, while an exact same-scope replay remains
+identity checked. Former global `commandId` ledgers are not read.
+
 The policy freezes namespace, trigger kind/version, source, candidate origin,
 root-only behavior, and—when requested—the active-owner kind and exact sorted
 identity field set. The canonical policy digest is persisted on the Run.
@@ -65,7 +71,9 @@ and timer waits: generic `ResolveExternalWait` rejects owner-backed Runs, while
 `ResolveActiveExternalWait` authorizes the exact canonical key and Run before
 reading a resolution receipt or mutating the wait. Exact terminal command
 replays remain valid after owner release; a foreign key or changed command is
-rejected.
+rejected. The additive `ResolveExternalWaitResult` and
+`ResolveActiveExternalWaitResult` methods expose whether that exact durable
+resolution was a replay; the older Run-only methods remain source compatible.
 
 `RunSnapshot` v2 replaces the old bare waiting result with a typed
 `WaitingOccurrence` containing the original `NodeResult` plus authoritative

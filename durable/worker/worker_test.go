@@ -44,7 +44,10 @@ func TestWorkerRequiresExplicitSafeDisposition(t *testing.T) {
 	}
 	outcome, _ := json.Marshal(map[string]any{"runId": decision.Run.RunID})
 	_, err = durable.Commit(ctx, store.Transaction{
-		CommandID: "admit-worker", IdentityDigest: identityDigest,
+		CommandScope: store.CommandScope{
+			SchemaVersion: store.CommandScopeSchemaVersion, Operation: "fixture.commit",
+			NamespaceID: "lab", ResourceType: "run", ResourceID: decision.Run.RunID,
+		}, CommandID: "admit-worker", IdentityDigest: identityDigest,
 		Expected:  []store.ExpectedRevision{{Key: store.AggregateKey{Type: "run", ID: decision.Run.RunID}, Revision: 0}},
 		Mutations: []store.AggregateRecord{{Key: store.AggregateKey{Type: "run", ID: decision.Run.RunID}, Revision: 1, PayloadDigest: payloadDigest, Payload: payload}},
 		Events:    decision.Events, Intents: seeds, Outcome: outcome, At: t0,

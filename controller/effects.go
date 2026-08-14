@@ -97,7 +97,71 @@ func (controller *Controller) ListEffects(ctx context.Context, afterEffectID str
 }
 
 func (controller *Controller) GetCommandLedger(ctx context.Context, commandID string) (contracts.CommandLedger, error) {
-	record, err := controller.store.GetAggregate(ctx, commandLedgerKey(commandID))
+	if ctx == nil || !contracts.ValidIdentifier(commandID) {
+		return contracts.CommandLedger{}, errors.New("command ledger identity is invalid")
+	}
+	records, err := listAllAggregates(ctx, controller.store, commandLedgerType)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	var result contracts.CommandLedger
+	found := false
+	for _, record := range records {
+		ledger, decodeErr := decodeCommandLedger(record)
+		if decodeErr != nil {
+			return contracts.CommandLedger{}, decodeErr
+		}
+		if ledger.Envelope.CommandID != commandID {
+			continue
+		}
+		if found {
+			return contracts.CommandLedger{}, errors.New("command id is ambiguous across durable scopes")
+		}
+		result, found = ledger, true
+	}
+	if !found {
+		return contracts.CommandLedger{}, store.ErrNotFound
+	}
+	return result, nil
+}
+
+// GetEffectCommandLedger resolves the ledger in the exact Effect operation
+// scope. Use this method when command IDs may be reused by another Effect.
+func (controller *Controller) GetEffectCommandLedger(
+	ctx context.Context, effectID, commandID string,
+) (contracts.CommandLedger, error) {
+	current, err := controller.GetEffect(ctx, effectID)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	primary := current.CommandID == commandID
+	compensation := current.CompensationCommandID == commandID
+	if primary && compensation {
+		return contracts.CommandLedger{}, errors.New("command id is ambiguous across Effect operation scopes")
+	}
+	operation := ""
+	if compensation {
+		operation = "effect.compensation.begin"
+	} else if primary {
+		operation = "effect.begin"
+	} else {
+		return contracts.CommandLedger{}, store.ErrNotFound
+	}
+	return controller.getScopedEffectCommandLedger(ctx, current, operation, commandID)
+}
+
+func (controller *Controller) getScopedEffectCommandLedger(
+	ctx context.Context, current contracts.EffectRecord, operation, commandID string,
+) (contracts.CommandLedger, error) {
+	scope, err := controller.effectCommandScope(ctx, operation, current)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	key, err := commandLedgerKey(scope, commandID)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	record, err := controller.store.GetAggregate(ctx, key)
 	if err != nil {
 		return contracts.CommandLedger{}, err
 	}
@@ -119,13 +183,17 @@ func (controller *Controller) BeginEffect(ctx context.Context, request BeginEffe
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
+	commandScope, err := controller.effectCommandScope(ctx, "effect.begin", current)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
 	at := controller.clock.Now().UTC()
 	envelope, err := buildCommandEnvelope(current.Intent, request)
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
 	if current.CommandID == request.CommandID {
-		ledger, replayErr := controller.GetCommandLedger(ctx, request.CommandID)
+		ledger, replayErr := controller.getScopedEffectCommandLedger(ctx, current, "effect.begin", request.CommandID)
 		if replayErr != nil {
 			return BeginEffectResult{}, replayErr
 		}
@@ -148,7 +216,11 @@ func (controller *Controller) BeginEffect(ctx context.Context, request BeginEffe
 	durableLedger := *decision.Ledger
 	durableLedger.Envelope.IdempotencyKey = ""
 	durableLedger.Envelope.CapabilityToken = ""
-	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.CommandID), 0, durableLedger)
+	ledgerKey, err := commandLedgerKey(commandScope, request.CommandID)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	ledgerMutation, err := aggregateMutation(ledgerKey, 0, durableLedger)
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
@@ -171,7 +243,7 @@ func (controller *Controller) BeginEffect(ctx context.Context, request BeginEffe
 		return BeginEffectResult{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identity,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identity,
 		Expected: []store.ExpectedRevision{
 			{Key: effectMutation.Key, Revision: effectRecord.Revision},
 			{Key: ledgerMutation.Key, Revision: 0},
@@ -207,7 +279,19 @@ func (controller *Controller) ObserveEffect(ctx context.Context, request Observe
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
-	ledgerRecord, err := controller.store.GetAggregate(ctx, commandLedgerKey(request.Receipt.CommandID))
+	ledgerScope, err := controller.effectCommandScope(ctx, "effect.begin", current)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	commandScope, err := controller.effectCommandScope(ctx, "effect.observe", current)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerKey, err := commandLedgerKey(ledgerScope, request.Receipt.CommandID)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerRecord, err := controller.store.GetAggregate(ctx, ledgerKey)
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
@@ -235,7 +319,7 @@ func (controller *Controller) ObserveEffect(ctx context.Context, request Observe
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
-	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.Receipt.CommandID), ledgerRecord.Revision, *decision.Ledger)
+	ledgerMutation, err := aggregateMutation(ledgerKey, ledgerRecord.Revision, *decision.Ledger)
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
@@ -263,7 +347,7 @@ func (controller *Controller) ObserveEffect(ctx context.Context, request Observe
 		return ObserveEffectResult{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identity,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identity,
 		Expected: []store.ExpectedRevision{
 			{Key: effectMutation.Key, Revision: effectRecord.Revision},
 			{Key: ledgerMutation.Key, Revision: ledgerRecord.Revision},
@@ -300,6 +384,10 @@ func (controller *Controller) BeginEffectCompensation(ctx context.Context, reque
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
+	commandScope, err := controller.effectCommandScope(ctx, "effect.compensation.begin", current)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
 	compensationIntent := current.Intent
 	compensationIntent.TargetRef = current.ExternalIdentity
 	compensationIntent.Intent = map[string]any{
@@ -316,7 +404,7 @@ func (controller *Controller) BeginEffectCompensation(ctx context.Context, reque
 		return BeginEffectResult{}, err
 	}
 	if current.CompensationCommandID == request.CommandID {
-		ledger, replayErr := controller.GetCommandLedger(ctx, request.CommandID)
+		ledger, replayErr := controller.getScopedEffectCommandLedger(ctx, current, "effect.compensation.begin", request.CommandID)
 		if replayErr != nil {
 			return BeginEffectResult{}, replayErr
 		}
@@ -347,7 +435,11 @@ func (controller *Controller) BeginEffectCompensation(ctx context.Context, reque
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
-	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.CommandID), 0, durableLedger)
+	ledgerKey, err := commandLedgerKey(commandScope, request.CommandID)
+	if err != nil {
+		return BeginEffectResult{}, err
+	}
+	ledgerMutation, err := aggregateMutation(ledgerKey, 0, durableLedger)
 	if err != nil {
 		return BeginEffectResult{}, err
 	}
@@ -369,7 +461,7 @@ func (controller *Controller) BeginEffectCompensation(ctx context.Context, reque
 		return BeginEffectResult{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identity,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identity,
 		Expected: []store.ExpectedRevision{
 			{Key: effectMutation.Key, Revision: effectRecord.Revision},
 			{Key: ledgerMutation.Key, Revision: 0},
@@ -403,7 +495,19 @@ func (controller *Controller) ObserveEffectCompensation(ctx context.Context, req
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
-	ledgerRecord, err := controller.store.GetAggregate(ctx, commandLedgerKey(request.Receipt.CommandID))
+	ledgerScope, err := controller.effectCommandScope(ctx, "effect.compensation.begin", current)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	commandScope, err := controller.effectCommandScope(ctx, "effect.compensation.observe", current)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerKey, err := commandLedgerKey(ledgerScope, request.Receipt.CommandID)
+	if err != nil {
+		return ObserveEffectResult{}, err
+	}
+	ledgerRecord, err := controller.store.GetAggregate(ctx, ledgerKey)
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
@@ -431,7 +535,7 @@ func (controller *Controller) ObserveEffectCompensation(ctx context.Context, req
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
-	ledgerMutation, err := aggregateMutation(commandLedgerKey(request.Receipt.CommandID), ledgerRecord.Revision, *decision.Ledger)
+	ledgerMutation, err := aggregateMutation(ledgerKey, ledgerRecord.Revision, *decision.Ledger)
 	if err != nil {
 		return ObserveEffectResult{}, err
 	}
@@ -454,7 +558,7 @@ func (controller *Controller) ObserveEffectCompensation(ctx context.Context, req
 		return ObserveEffectResult{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identity,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identity,
 		Expected: []store.ExpectedRevision{
 			{Key: effectMutation.Key, Revision: effectRecord.Revision},
 			{Key: ledgerMutation.Key, Revision: ledgerRecord.Revision},
@@ -491,6 +595,10 @@ func (controller *Controller) ReconcileEffectCompensation(
 		return ReconcileEffectCompensationResult{}, err
 	}
 	current, err := decodeEffect(record)
+	if err != nil {
+		return ReconcileEffectCompensationResult{}, err
+	}
+	commandScope, err := controller.effectCommandScope(ctx, "effect.compensation.reconcile", current)
 	if err != nil {
 		return ReconcileEffectCompensationResult{}, err
 	}
@@ -539,7 +647,7 @@ func (controller *Controller) ReconcileEffectCompensation(
 		return ReconcileEffectCompensationResult{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identity,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identity,
 		Expected:  []store.ExpectedRevision{{Key: mutation.Key, Revision: record.Revision}},
 		Mutations: []store.AggregateRecord{mutation}, Events: decision.Events, Outcome: outcome, At: at,
 	})

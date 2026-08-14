@@ -213,6 +213,29 @@ func TestCatalogPersistsAndResolvesOnlyExactNamespaceActionPin(t *testing.T) {
 	}
 }
 
+func TestSameCommandIDIsIndependentAcrossActionNamespaces(t *testing.T) {
+	durable, err := filestore.Open(t.TempDir() + "/scoped-actions.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = durable.Close() })
+	catalog, err := New(durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 8, 14, 2, 0, 0, 0, time.UTC)
+	for index, namespace := range []string{"team-a", "team-b"} {
+		definition, version := namedFixture(t, "shared-action")
+		result, installErr := catalog.Install(t.Context(), InstallRequest{
+			NamespaceID: namespace, Action: version, Definition: definition,
+			CommandID: "shared-install-command", At: at.Add(time.Duration(index) * time.Second),
+		})
+		if installErr != nil || result.Replay || result.Record.NamespaceID != namespace {
+			t.Fatalf("namespace %s install = %#v err=%v", namespace, result, installErr)
+		}
+	}
+}
+
 func TestCatalogListsBoundedNamespaceMetadataAndGetsExactDefinition(t *testing.T) {
 	durable, err := filestore.Open(t.TempDir() + "/actions.db")
 	if err != nil {

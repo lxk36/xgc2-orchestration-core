@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lxk36/xgc2-orchestration-core/catalog/actioncatalog"
 	"github.com/lxk36/xgc2-orchestration-core/durable/filestore"
 	"github.com/lxk36/xgc2-orchestration-core/durable/store"
 	"github.com/lxk36/xgc2-orchestration-core/kernel/execution"
@@ -283,6 +284,47 @@ func TestConcurrentExactStartCommandReplaysOneAcceptedOutcome(t *testing.T) {
 	if len(values) != 2 || values[0].Run.RunID != request.RunID || values[1].Run.RunID != request.RunID ||
 		values[0].Run.Revision != 1 || values[1].Run.Revision != 1 || values[0].Replay == values[1].Replay {
 		t.Fatalf("exact concurrent results = %#v", values)
+	}
+}
+
+func TestSameCommandIDCannotCrossReservedAndOrdinaryRunScopes(t *testing.T) {
+	fixture := newActiveOwnerFixture(t)
+	commandID := "shared-public-command"
+	ordinary := fixture.base.request("run-ordinary-scope", commandID)
+	ordinaryResult, err := fixture.controller.Invoke(t.Context(), ordinary)
+	if err != nil || ordinaryResult.Replay {
+		t.Fatalf("ordinary scope invoke = %#v err=%v", ordinaryResult, err)
+	}
+	reserved := fixture.request("run-reserved-scope", commandID)
+	reservedResult, err := fixture.controller.Invoke(t.Context(), reserved)
+	if err != nil || reservedResult.Replay || reservedResult.Run.AdmissionPolicyDigest != fixture.policy.Digest() {
+		t.Fatalf("reserved scope invoke = %#v err=%v", reservedResult, err)
+	}
+	replay, err := fixture.controller.Invoke(t.Context(), reserved)
+	if err != nil || !replay.Replay || replay.Run.RunID != reserved.RunID {
+		t.Fatalf("reserved exact replay = %#v err=%v", replay, err)
+	}
+}
+
+func TestSameCommandIDIsIndependentAcrossReservedCatalogAndRunIngress(t *testing.T) {
+	fixture := newActiveOwnerFixture(t)
+	catalog, err := actioncatalog.NewWithConfig(actioncatalog.Config{
+		Store: fixture.base.store, ReservedIngressPolicies: []*ReservedIngressPolicy{fixture.policy},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fixture.request("run-reserved-cross-api", "shared-reserved-command")
+	installed, err := catalog.Install(t.Context(), actioncatalog.InstallRequest{
+		NamespaceID: request.NamespaceID, Action: request.Action, Definition: request.Definition,
+		IngressPermit: fixture.permit, CommandID: request.CommandID, At: fixture.base.clock.Now(),
+	})
+	if err != nil || installed.Replay {
+		t.Fatalf("reserved catalog install = %#v err=%v", installed, err)
+	}
+	invoked, err := fixture.controller.Invoke(t.Context(), request)
+	if err != nil || invoked.Replay || invoked.Run.AdmissionPolicyDigest != fixture.policy.Digest() {
+		t.Fatalf("reserved Run ingress after same-ID catalog install = %#v err=%v", invoked, err)
 	}
 }
 

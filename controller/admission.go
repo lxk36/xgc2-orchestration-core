@@ -18,7 +18,7 @@ import (
 
 const (
 	runAdmissionReceiptType   = "run-admission-receipt"
-	runAdmissionReceiptSchema = "xgc.run-admission-receipt/v1"
+	runAdmissionReceiptSchema = "xgc.run-admission-receipt/v2"
 )
 
 var (
@@ -155,20 +155,31 @@ func activeOwnerKey(ownerRef string) store.AggregateKey {
 }
 
 type runAdmissionReceipt struct {
-	SchemaVersion         string        `json:"schemaVersion"`
-	CommandID             string        `json:"commandId"`
-	RequestIdentityDigest string        `json:"requestIdentityDigest"`
-	AcceptedRun           contracts.Run `json:"acceptedRun"`
-	OwnerRef              string        `json:"ownerRef"`
-	OwnerGeneration       uint64        `json:"ownerGeneration"`
+	SchemaVersion         string             `json:"schemaVersion"`
+	CommandScope          store.CommandScope `json:"commandScope"`
+	CommandID             string             `json:"commandId"`
+	RequestIdentityDigest string             `json:"requestIdentityDigest"`
+	AcceptedRun           contracts.Run      `json:"acceptedRun"`
+	OwnerRef              string             `json:"ownerRef"`
+	OwnerGeneration       uint64             `json:"ownerGeneration"`
 }
 
-func runAdmissionReceiptKey(commandID string) store.AggregateKey {
-	return store.AggregateKey{Type: runAdmissionReceiptType, ID: commandID}
+func runAdmissionReceiptKey(scope store.CommandScope, commandID string) (store.AggregateKey, error) {
+	id, err := store.CommandIdentityKey(scope, commandID)
+	if err != nil {
+		return store.AggregateKey{}, err
+	}
+	return store.AggregateKey{Type: runAdmissionReceiptType, ID: id}, nil
 }
 
-func (controller *Controller) getRunAdmissionReceipt(ctx context.Context, commandID string) (runAdmissionReceipt, bool, error) {
-	record, err := controller.store.GetAggregate(ctx, runAdmissionReceiptKey(commandID))
+func (controller *Controller) getRunAdmissionReceipt(
+	ctx context.Context, scope store.CommandScope, commandID string,
+) (runAdmissionReceipt, bool, error) {
+	key, err := runAdmissionReceiptKey(scope, commandID)
+	if err != nil {
+		return runAdmissionReceipt{}, false, err
+	}
+	record, err := controller.store.GetAggregate(ctx, key)
 	if errors.Is(err, store.ErrNotFound) {
 		return runAdmissionReceipt{}, false, nil
 	}
@@ -182,7 +193,8 @@ func (controller *Controller) getRunAdmissionReceipt(ctx context.Context, comman
 	if err := canonicaljson.UnmarshalStrict(record.Payload, &receipt); err != nil {
 		return runAdmissionReceipt{}, false, errors.Join(store.ErrCorrupt, err)
 	}
-	if receipt.SchemaVersion != runAdmissionReceiptSchema || !contracts.ValidIdentifier(receipt.CommandID) ||
+	if receipt.SchemaVersion != runAdmissionReceiptSchema || receipt.CommandScope != scope || receipt.CommandScope.Validate() != nil ||
+		!contracts.ValidIdentifier(receipt.CommandID) ||
 		receipt.CommandID != commandID || !contracts.ValidDigest(receipt.RequestIdentityDigest) ||
 		!contracts.ValidIdentifier(receipt.OwnerRef) || receipt.OwnerGeneration == 0 ||
 		receipt.AcceptedRun.Status != contracts.RunAccepted || receipt.AcceptedRun.Revision != 1 ||

@@ -34,8 +34,8 @@ type ResolveExternalWaitRequest struct {
 }
 
 const (
-	externalWaitResolutionSchema = "xgc.external-wait-resolution/v1"
-	externalWaitOccurrenceSchema = "xgc.external-wait-occurrence/v1"
+	externalWaitResolutionSchema = "xgc.external-wait-resolution/v2"
+	externalWaitOccurrenceSchema = "xgc.external-wait-occurrence/v2"
 	externalWaitResolutionType   = "external-wait-resolution"
 	externalWaitOccurrenceType   = "external-wait-occurrence"
 )
@@ -48,6 +48,7 @@ var ErrExternalWaitConsumed = errors.New("external wait occurrence is already co
 // state after the occurrence has been consumed.
 type externalWaitResolutionReceipt struct {
 	SchemaVersion         string                             `json:"schemaVersion"`
+	CommandScope          store.CommandScope                 `json:"commandScope"`
 	RunID                 string                             `json:"runId"`
 	InvocationID          string                             `json:"invocationId"`
 	WaitGeneration        uint32                             `json:"waitGeneration"`
@@ -69,12 +70,18 @@ type externalWaitResolutionReceipt struct {
 // fail as consumed without scanning event history, even when a later wait has
 // the same subject and condition.
 type externalWaitOccurrenceConsumption struct {
-	SchemaVersion         string `json:"schemaVersion"`
-	RunID                 string `json:"runId"`
-	InvocationID          string `json:"invocationId"`
-	WaitGeneration        uint32 `json:"waitGeneration"`
-	CommandID             string `json:"commandId"`
-	RequestIdentityDigest string `json:"requestIdentityDigest"`
+	SchemaVersion         string             `json:"schemaVersion"`
+	CommandScope          store.CommandScope `json:"commandScope"`
+	RunID                 string             `json:"runId"`
+	InvocationID          string             `json:"invocationId"`
+	WaitGeneration        uint32             `json:"waitGeneration"`
+	CommandID             string             `json:"commandId"`
+	RequestIdentityDigest string             `json:"requestIdentityDigest"`
+}
+
+type ResolveExternalWaitResult struct {
+	Run    contracts.Run `json:"run"`
+	Replay bool          `json:"replay"`
 }
 
 // ResolveExternalWait atomically consumes the exact wait occurrence, resumes
@@ -83,7 +90,17 @@ type externalWaitOccurrenceConsumption struct {
 // identify an occurrence. InvocationID and WaitGeneration must be copied from
 // RunSnapshot.Waiting, never inferred from node order or history.
 func (controller *Controller) ResolveExternalWait(ctx context.Context, request ResolveExternalWaitRequest) (contracts.Run, error) {
-	return controller.resolveExternalWait(ctx, request, "")
+	result, err := controller.ResolveExternalWaitResult(ctx, request)
+	return result.Run, err
+}
+
+// ResolveExternalWaitResult is the replay-aware form of ResolveExternalWait.
+func (controller *Controller) ResolveExternalWaitResult(
+	ctx context.Context, request ResolveExternalWaitRequest,
+) (ResolveExternalWaitResult, error) {
+	replay := false
+	run, err := controller.resolveExternalWait(ctx, request, "", &replay)
+	return ResolveExternalWaitResult{Run: run, Replay: replay}, err
 }
 
 // ResolveActiveExternalWait requires the exact canonical owner key and Run ID
@@ -92,18 +109,29 @@ func (controller *Controller) ResolveExternalWait(ctx context.Context, request R
 func (controller *Controller) ResolveActiveExternalWait(
 	ctx context.Context, key contracts.ActiveOwnerKey, request ResolveExternalWaitRequest,
 ) (contracts.Run, error) {
+	result, err := controller.ResolveActiveExternalWaitResult(ctx, key, request)
+	return result.Run, err
+}
+
+// ResolveActiveExternalWaitResult is the replay-aware, owner-fenced form of
+// ResolveActiveExternalWait.
+func (controller *Controller) ResolveActiveExternalWaitResult(
+	ctx context.Context, key contracts.ActiveOwnerKey, request ResolveExternalWaitRequest,
+) (ResolveExternalWaitResult, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) {
-		return contracts.Run{}, errors.New("controller, context, and target Run are required")
+		return ResolveExternalWaitResult{}, errors.New("controller, context, and target Run are required")
 	}
 	_, _, ownerRef, err := normalizeActiveOwnerKey(key)
 	if err != nil {
-		return contracts.Run{}, err
+		return ResolveExternalWaitResult{}, err
 	}
-	return controller.resolveExternalWait(ctx, request, ownerRef)
+	replay := false
+	run, err := controller.resolveExternalWait(ctx, request, ownerRef, &replay)
+	return ResolveExternalWaitResult{Run: run, Replay: replay}, err
 }
 
 func (controller *Controller) resolveExternalWait(
-	ctx context.Context, request ResolveExternalWaitRequest, activeOwnerRef string,
+	ctx context.Context, request ResolveExternalWaitRequest, activeOwnerRef string, replay *bool,
 ) (contracts.Run, error) {
 	if controller == nil || ctx == nil || !contracts.ValidIdentifier(request.RunID) ||
 		!contracts.ValidIdentifier(request.InvocationID) || request.WaitGeneration == 0 ||
@@ -112,20 +140,26 @@ func (controller *Controller) resolveExternalWait(
 		(request.PayloadArtifactRef != "" && !contracts.ValidIdentifier(request.PayloadArtifactRef)) {
 		return contracts.Run{}, errors.New("external wait resolution identity, status, evidence, or time is invalid")
 	}
+	if replay == nil {
+		return contracts.Run{}, errors.New("external wait replay output is required")
+	}
+	*replay = false
 	if err := controller.authorizeExternalWait(ctx, request.RunID, activeOwnerRef); err != nil {
-		// Preserve generic command-ledger identity conflicts when a replay changes
-		// only the Run ID to an unknown Run. Active ingress never gets this
-		// fallback: its exact key and target Run must authorize before receipt
-		// lookup or any mutation.
-		if activeOwnerRef != "" || !errors.Is(err, store.ErrNotFound) {
-			return contracts.Run{}, err
-		}
+		return contracts.Run{}, err
+	}
+	scopeRun, err := controller.GetRun(ctx, request.RunID)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	commandScope, err := runCommandScope("run.external-wait", scopeRun, runAggregateType, scopeRun.RunID)
+	if err != nil {
+		return contracts.Run{}, err
 	}
 	requestIdentityDigest, payloadDigest, err := externalWaitRequestIdentity(request)
 	if err != nil {
 		return contracts.Run{}, err
 	}
-	if receipt, found, err := controller.getExternalWaitReceipt(ctx, request.CommandID); err != nil {
+	if receipt, found, err := controller.getExternalWaitReceipt(ctx, commandScope, request.CommandID); err != nil {
 		return contracts.Run{}, err
 	} else if found {
 		if receipt.RequestIdentityDigest != requestIdentityDigest {
@@ -134,6 +168,7 @@ func (controller *Controller) resolveExternalWait(
 		if err := controller.verifyExternalWaitOccurrence(ctx, receipt); err != nil {
 			return contracts.Run{}, err
 		}
+		*replay = true
 		return controller.replayExternalWait(ctx, receipt)
 	}
 	occurrenceKey, err := externalWaitOccurrenceKey(request.RunID, request.InvocationID, request.WaitGeneration)
@@ -223,19 +258,23 @@ func (controller *Controller) resolveExternalWait(
 	}
 	resolution.PayloadDigest = payloadDigest
 	receipt := externalWaitResolutionReceipt{
-		SchemaVersion: externalWaitResolutionSchema, RunID: request.RunID,
+		SchemaVersion: externalWaitResolutionSchema, CommandScope: commandScope, RunID: request.RunID,
 		InvocationID: request.InvocationID, WaitGeneration: request.WaitGeneration, WaitKind: wait.Kind,
 		SubjectRef: request.SubjectRef, ConditionDigest: request.ConditionDigest, Status: request.Status,
 		Payload: request.Payload, PayloadDigest: payloadDigest, PayloadArtifactRef: request.PayloadArtifactRef,
 		Failure: cloneStructuredFailure(request.Failure), ObservedAt: request.ObservedAt,
 		CommandID: request.CommandID, RequestIdentityDigest: requestIdentityDigest,
 	}
-	receiptMutation, err := aggregateMutation(externalWaitResolutionKey(request.CommandID), 0, receipt)
+	receiptKey, err := externalWaitResolutionKey(commandScope, request.CommandID)
+	if err != nil {
+		return contracts.Run{}, err
+	}
+	receiptMutation, err := aggregateMutation(receiptKey, 0, receipt)
 	if err != nil {
 		return contracts.Run{}, err
 	}
 	consumption := externalWaitOccurrenceConsumption{
-		SchemaVersion: externalWaitOccurrenceSchema, RunID: request.RunID,
+		SchemaVersion: externalWaitOccurrenceSchema, CommandScope: commandScope, RunID: request.RunID,
 		InvocationID: request.InvocationID, WaitGeneration: request.WaitGeneration,
 		CommandID: request.CommandID, RequestIdentityDigest: requestIdentityDigest,
 	}
@@ -376,12 +415,12 @@ func (controller *Controller) resolveExternalWait(
 		return contracts.Run{}, err
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: commandID, IdentityDigest: requestIdentityDigest, Expected: expected,
+		CommandScope: commandScope, CommandID: commandID, IdentityDigest: requestIdentityDigest, Expected: expected,
 		Mutations: mutations, Events: events, Intents: intents, Outcome: outcome, At: now,
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrRevisionConflict) || errors.Is(err, store.ErrIdentityConflict) {
-			if durableReceipt, found, getErr := controller.getExternalWaitReceipt(ctx, request.CommandID); getErr != nil {
+			if durableReceipt, found, getErr := controller.getExternalWaitReceipt(ctx, commandScope, request.CommandID); getErr != nil {
 				return contracts.Run{}, getErr
 			} else if found {
 				if durableReceipt.RequestIdentityDigest != requestIdentityDigest {
@@ -390,6 +429,7 @@ func (controller *Controller) resolveExternalWait(
 				if err := controller.verifyExternalWaitOccurrence(ctx, durableReceipt); err != nil {
 					return contracts.Run{}, err
 				}
+				*replay = true
 				return controller.replayExternalWait(ctx, durableReceipt)
 			}
 			if durableConsumption, found, getErr := controller.getExternalWaitConsumption(ctx, occurrenceKey); getErr != nil {
@@ -407,11 +447,16 @@ func (controller *Controller) resolveExternalWait(
 	if err := canonicaljson.UnmarshalStrict(committed.Outcome, &durableRun); err != nil {
 		return contracts.Run{}, err
 	}
+	*replay = committed.Replay
 	return controller.driveAfterExternalWait(ctx, durableRun.RunID)
 }
 
-func externalWaitResolutionKey(commandID string) store.AggregateKey {
-	return store.AggregateKey{Type: externalWaitResolutionType, ID: commandID}
+func externalWaitResolutionKey(scope store.CommandScope, commandID string) (store.AggregateKey, error) {
+	id, err := store.CommandIdentityKey(scope, commandID)
+	if err != nil {
+		return store.AggregateKey{}, err
+	}
+	return store.AggregateKey{Type: externalWaitResolutionType, ID: id}, nil
 }
 
 func (controller *Controller) authorizeExternalWait(ctx context.Context, runID, activeOwnerRef string) error {
@@ -475,8 +520,14 @@ func externalWaitRequestIdentity(request ResolveExternalWaitRequest) (string, st
 	return digest, payloadDigest, err
 }
 
-func (controller *Controller) getExternalWaitReceipt(ctx context.Context, commandID string) (externalWaitResolutionReceipt, bool, error) {
-	record, err := controller.store.GetAggregate(ctx, externalWaitResolutionKey(commandID))
+func (controller *Controller) getExternalWaitReceipt(
+	ctx context.Context, scope store.CommandScope, commandID string,
+) (externalWaitResolutionReceipt, bool, error) {
+	key, err := externalWaitResolutionKey(scope, commandID)
+	if err != nil {
+		return externalWaitResolutionReceipt{}, false, err
+	}
+	record, err := controller.store.GetAggregate(ctx, key)
 	if errors.Is(err, store.ErrNotFound) {
 		return externalWaitResolutionReceipt{}, false, nil
 	}
@@ -490,7 +541,7 @@ func (controller *Controller) getExternalWaitReceipt(ctx context.Context, comman
 	if err := canonicaljson.UnmarshalStrict(record.Payload, &receipt); err != nil {
 		return externalWaitResolutionReceipt{}, false, errors.Join(store.ErrCorrupt, err)
 	}
-	if err := validateExternalWaitReceipt(receipt); err != nil {
+	if err := validateExternalWaitReceipt(receipt); err != nil || receipt.CommandScope != scope {
 		return externalWaitResolutionReceipt{}, false, errors.Join(store.ErrCorrupt, err)
 	}
 	return receipt, true, nil
@@ -513,7 +564,7 @@ func (controller *Controller) getExternalWaitConsumption(
 	if err := canonicaljson.UnmarshalStrict(record.Payload, &consumption); err != nil {
 		return externalWaitOccurrenceConsumption{}, false, errors.Join(store.ErrCorrupt, err)
 	}
-	if consumption.SchemaVersion != externalWaitOccurrenceSchema ||
+	if consumption.SchemaVersion != externalWaitOccurrenceSchema || consumption.CommandScope.Validate() != nil ||
 		!contracts.ValidIdentifier(consumption.RunID) || !contracts.ValidIdentifier(consumption.InvocationID) ||
 		consumption.WaitGeneration == 0 || !contracts.ValidIdentifier(consumption.CommandID) ||
 		!contracts.ValidDigest(consumption.RequestIdentityDigest) {
@@ -523,7 +574,8 @@ func (controller *Controller) getExternalWaitConsumption(
 }
 
 func validateExternalWaitReceipt(receipt externalWaitResolutionReceipt) error {
-	if receipt.SchemaVersion != externalWaitResolutionSchema || !contracts.ValidIdentifier(receipt.RunID) ||
+	if receipt.SchemaVersion != externalWaitResolutionSchema || receipt.CommandScope.Validate() != nil ||
+		!contracts.ValidIdentifier(receipt.RunID) ||
 		!contracts.ValidIdentifier(receipt.InvocationID) || receipt.WaitGeneration == 0 ||
 		!receipt.WaitKind.Valid() || receipt.WaitKind == contracts.NodeWaitEffect ||
 		!contracts.ValidIdentifier(receipt.SubjectRef) || !contracts.ValidDigest(receipt.ConditionDigest) ||
@@ -586,14 +638,14 @@ func (controller *Controller) verifyExternalWaitOccurrence(ctx context.Context, 
 	}
 	if !found || consumption.RunID != receipt.RunID || consumption.InvocationID != receipt.InvocationID ||
 		consumption.WaitGeneration != receipt.WaitGeneration || consumption.CommandID != receipt.CommandID ||
-		consumption.RequestIdentityDigest != receipt.RequestIdentityDigest {
+		consumption.CommandScope != receipt.CommandScope || consumption.RequestIdentityDigest != receipt.RequestIdentityDigest {
 		return store.ErrCorrupt
 	}
 	return nil
 }
 
 func (controller *Controller) verifyExternalWaitConsumption(ctx context.Context, consumption externalWaitOccurrenceConsumption) error {
-	receipt, found, err := controller.getExternalWaitReceipt(ctx, consumption.CommandID)
+	receipt, found, err := controller.getExternalWaitReceipt(ctx, consumption.CommandScope, consumption.CommandID)
 	if err != nil {
 		return err
 	}

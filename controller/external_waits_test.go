@@ -183,16 +183,16 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 		t.Fatal("mismatched signal resolution was accepted")
 	}
 	type outcome struct {
-		run contracts.Run
-		err error
+		result ResolveExternalWaitResult
+		err    error
 	}
 	gate := make(chan struct{})
 	outcomes := make(chan outcome, 2)
 	for range 2 {
 		go func() {
 			<-gate
-			run, resolveErr := orchestrator.ResolveExternalWait(t.Context(), resolution)
-			outcomes <- outcome{run: run, err: resolveErr}
+			result, resolveErr := orchestrator.ResolveExternalWaitResult(t.Context(), resolution)
+			outcomes <- outcome{result: result, err: resolveErr}
 		}()
 	}
 	close(gate)
@@ -211,11 +211,18 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	}
 	close(barrier.release)
 	released = true
+	apiReplays := 0
 	for range 2 {
 		result := <-outcomes
-		if result.err != nil || result.run.RunID != waiting.RunID {
-			t.Fatalf("concurrent external wait = %+v err=%v", result.run, result.err)
+		if result.err != nil || result.result.Run.RunID != waiting.RunID {
+			t.Fatalf("concurrent external wait = %+v err=%v", result.result, result.err)
 		}
+		if result.result.Replay {
+			apiReplays++
+		}
+	}
+	if apiReplays != 1 {
+		t.Fatalf("replay-aware concurrent results = %d, want exactly 1", apiReplays)
 	}
 	completed, err := orchestrator.GetRun(t.Context(), waiting.RunID)
 	if err != nil || completed.Status != contracts.RunSucceeded {
@@ -240,15 +247,14 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	}
 	assertOneSnapshotResolutionEvent(t, durable, waiting.RunID, resolution.CommandID)
 
-	terminalReplay, err := orchestrator.ResolveExternalWait(t.Context(), resolution)
-	if err != nil || terminalReplay.RunID != completed.RunID || terminalReplay.Status != contracts.RunSucceeded {
+	terminalReplay, err := orchestrator.ResolveExternalWaitResult(t.Context(), resolution)
+	if err != nil || !terminalReplay.Replay || terminalReplay.Run.RunID != completed.RunID || terminalReplay.Run.Status != contracts.RunSucceeded {
 		t.Fatalf("terminal resolution replay = %+v err=%v", terminalReplay, err)
 	}
 	identityConflicts := []struct {
 		name   string
 		mutate func(*ResolveExternalWaitRequest)
 	}{
-		{name: "run", mutate: func(value *ResolveExternalWaitRequest) { value.RunID = "other-signal-run" }},
 		{name: "invocation", mutate: func(value *ResolveExternalWaitRequest) { value.InvocationID = "inv-other-signal" }},
 		{name: "generation", mutate: func(value *ResolveExternalWaitRequest) { value.WaitGeneration++ }},
 		{name: "condition", mutate: func(value *ResolveExternalWaitRequest) { value.ConditionDigest = testPackageDigest }},
@@ -269,6 +275,11 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 				t.Fatalf("changed resolution error = %v, want identity conflict", err)
 			}
 		})
+	}
+	differentRun := resolution
+	differentRun.RunID = "other-signal-run"
+	if _, err := orchestrator.ResolveExternalWait(t.Context(), differentRun); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("different Run scope error = %v, want not found", err)
 	}
 	newCommand := resolution
 	newCommand.CommandID = "resolve-consumed-signal"
@@ -298,8 +309,8 @@ func TestCoordinatorLeavesExternalWaitUntilExactSignalResolution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restartedReplay, err := recoveredController.ResolveExternalWait(t.Context(), resolution)
-	if err != nil || restartedReplay.RunID != completed.RunID || restartedReplay.Status != contracts.RunSucceeded {
+	restartedReplay, err := recoveredController.ResolveExternalWaitResult(t.Context(), resolution)
+	if err != nil || !restartedReplay.Replay || restartedReplay.Run.RunID != completed.RunID || restartedReplay.Run.Status != contracts.RunSucceeded {
 		t.Fatalf("restarted exact replay = %+v err=%v", restartedReplay, err)
 	}
 	assertOneSnapshotResolutionEvent(t, recovered, waiting.RunID, resolution.CommandID)
@@ -420,16 +431,16 @@ func TestActiveOwnerExternalWaitRequiresExactKeyAndReplaysConcurrentCommand(t *t
 	}
 
 	type outcome struct {
-		run contracts.Run
-		err error
+		result ResolveExternalWaitResult
+		err    error
 	}
 	gate := make(chan struct{})
 	outcomes := make(chan outcome, 2)
 	for range 2 {
 		go func() {
 			<-gate
-			run, resolveErr := orchestrator.ResolveActiveExternalWait(t.Context(), key, resolution)
-			outcomes <- outcome{run: run, err: resolveErr}
+			result, resolveErr := orchestrator.ResolveActiveExternalWaitResult(t.Context(), key, resolution)
+			outcomes <- outcome{result: result, err: resolveErr}
 		}()
 	}
 	close(gate)
@@ -448,11 +459,18 @@ func TestActiveOwnerExternalWaitRequiresExactKeyAndReplaysConcurrentCommand(t *t
 	}
 	close(barrier.release)
 	released = true
+	apiReplays := 0
 	for range 2 {
 		result := <-outcomes
-		if result.err != nil || result.run.RunID != waiting.RunID || result.run.Status != contracts.RunSucceeded {
-			t.Fatalf("concurrent active external wait = %+v err=%v", result.run, result.err)
+		if result.err != nil || result.result.Run.RunID != waiting.RunID || result.result.Run.Status != contracts.RunSucceeded {
+			t.Fatalf("concurrent active external wait = %+v err=%v", result.result, result.err)
 		}
+		if result.result.Replay {
+			apiReplays++
+		}
+	}
+	if apiReplays != 1 {
+		t.Fatalf("active replay-aware concurrent results = %d, want exactly 1", apiReplays)
 	}
 	commitResults := barrier.resolutionResults()
 	if len(commitResults) != 2 {
@@ -471,8 +489,8 @@ func TestActiveOwnerExternalWaitRequiresExactKeyAndReplaysConcurrentCommand(t *t
 	if err != nil || owner.State != contracts.ActiveRunOwnerReleased || owner.RunID != waiting.RunID {
 		t.Fatalf("terminal active owner = %+v err=%v", owner, err)
 	}
-	exactReplay, err := orchestrator.ResolveActiveExternalWait(t.Context(), key, resolution)
-	if err != nil || exactReplay.RunID != waiting.RunID || exactReplay.Status != contracts.RunSucceeded {
+	exactReplay, err := orchestrator.ResolveActiveExternalWaitResult(t.Context(), key, resolution)
+	if err != nil || !exactReplay.Replay || exactReplay.Run.RunID != waiting.RunID || exactReplay.Run.Status != contracts.RunSucceeded {
 		t.Fatalf("terminal active resolution replay = %+v err=%v", exactReplay, err)
 	}
 	if _, err := orchestrator.ResolveExternalWait(t.Context(), resolution); !errors.Is(err, ErrReservedIngressDenied) {

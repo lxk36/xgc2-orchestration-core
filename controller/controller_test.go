@@ -23,6 +23,14 @@ import (
 
 const testPackageDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
+func fixtureStoreCommandScope(run contracts.Run, operation string) store.CommandScope {
+	return store.CommandScope{
+		SchemaVersion: store.CommandScopeSchemaVersion, Operation: operation,
+		NamespaceID: run.NamespaceID, ResourceType: runAggregateType, ResourceID: run.RunID,
+		AuthorityRef: run.AdmissionPolicyRef, AuthorityDigest: run.AdmissionPolicyDigest,
+	}
+}
+
 type fakeClock struct {
 	mu  sync.Mutex
 	now time.Time
@@ -168,7 +176,7 @@ func TestOwnershipGraphReadFailsClosedWhenTerminalRunAggregateDiffers(t *testing
 		t.Fatal(err)
 	}
 	if _, err := fixture.store.Commit(t.Context(), store.Transaction{
-		CommandID: "tamper-terminal-run", IdentityDigest: identity,
+		CommandScope: fixtureStoreCommandScope(terminal, "fixture.tamper"), CommandID: "tamper-terminal-run", IdentityDigest: identity,
 		Expected:  []store.ExpectedRevision{{Key: runMutation.Key, Revision: runRecord.Revision}},
 		Mutations: []store.AggregateRecord{runMutation}, Events: []contracts.DomainEvent{event},
 		Outcome: outcome, At: at,
@@ -213,7 +221,7 @@ func TestPreexistingOwnershipGraphPreventsTerminalTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := fixture.store.Commit(t.Context(), store.Transaction{
-		CommandID: "forge-ownership-graph", IdentityDigest: identity,
+		CommandScope: fixtureStoreCommandScope(run, "fixture.forge"), CommandID: "forge-ownership-graph", IdentityDigest: identity,
 		Expected: []store.ExpectedRevision{{Key: mutation.Key, Revision: 0}}, Mutations: []store.AggregateRecord{mutation},
 		Events: []contracts.DomainEvent{event}, Outcome: outcome, At: at,
 	}); err != nil {
@@ -226,7 +234,8 @@ func TestPreexistingOwnershipGraphPreventsTerminalTransition(t *testing.T) {
 			break
 		}
 	}
-	if driveErr == nil || !strings.Contains(driveErr.Error(), "immutable ownership closure proof") {
+	if driveErr == nil || (!strings.Contains(driveErr.Error(), "immutable ownership closure proof") &&
+		!strings.Contains(driveErr.Error(), "durable ownership graph is invalid")) {
 		t.Fatalf("forged graph drive error = %v", driveErr)
 	}
 	after, err := fixture.controller.GetRun(t.Context(), run.RunID)
@@ -394,7 +403,7 @@ func commitSnapshotTamper(
 		t.Fatal(err)
 	}
 	if _, err := durable.Commit(t.Context(), store.Transaction{
-		CommandID: commandID, IdentityDigest: identity,
+		CommandScope: fixtureStoreCommandScope(run, "fixture.snapshot-tamper"), CommandID: commandID, IdentityDigest: identity,
 		Expected:  []store.ExpectedRevision{{Key: mutation.Key, Revision: expected}},
 		Mutations: []store.AggregateRecord{mutation}, Events: []contracts.DomainEvent{event},
 		Outcome: outcome, At: at,

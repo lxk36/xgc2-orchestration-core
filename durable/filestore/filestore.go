@@ -1,6 +1,6 @@
 // Package filestore is the standard-library durable Store reference adapter
 // for a single local orchestration controller. State changes use committed,
-// checksummed v2 snapshot frames. A stable sidecar, rather than the replaceable
+// checksummed v3 snapshot frames. A stable sidecar, rather than the replaceable
 // data inode, carries the process lock for the complete Store lifetime.
 package filestore
 
@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	diskVersion          = 2
-	frameFormatVersion   = 2
+	diskVersion          = 3
+	frameFormatVersion   = 3
 	frameHeader          = 96
 	frameFooter          = 128
 	frameHeaderCore      = frameHeader - sha256.Size
@@ -53,15 +53,17 @@ const (
 )
 
 var (
-	frameMagic       = [8]byte{'X', 'G', 'C', '2', 'F', 'S', 'V', '2'}
-	frameCommitMagic = [8]byte{'X', 'G', 'C', '2', 'C', 'M', 'V', '2'}
+	frameMagic       = [8]byte{'X', 'G', 'C', '2', 'F', 'S', 'V', '3'}
+	frameCommitMagic = [8]byte{'X', 'G', 'C', '2', 'C', 'M', 'V', '3'}
 	errUnsafePath    = errors.New("filestore path authority changed or is unsafe")
 )
 
 type commandRecord struct {
-	IdentityDigest string          `json:"identityDigest"`
-	OutcomeDigest  string          `json:"outcomeDigest"`
-	Outcome        json.RawMessage `json:"outcome"`
+	Scope          store.CommandScope `json:"scope"`
+	CommandID      string             `json:"commandId"`
+	IdentityDigest string             `json:"identityDigest"`
+	OutcomeDigest  string             `json:"outcomeDigest"`
+	Outcome        json.RawMessage    `json:"outcome"`
 }
 
 type diskState struct {
@@ -172,7 +174,7 @@ func openWithHooks(path string, hooks *ioHooks) (_ *Store, returnedErr error) {
 	if err != nil {
 		return nil, err
 	}
-	if initialSize > 0 && frameCount == 0 && !partialV2Prefix(dataFile, initialSize) {
+	if initialSize > 0 && frameCount == 0 && !partialV3Prefix(dataFile, initialSize) {
 		return nil, store.ErrCorrupt
 	}
 	result.state, result.frameCount = state, frameCount
@@ -234,10 +236,14 @@ func (fileStore *Store) Commit(ctx context.Context, transaction store.Transactio
 	if err := fileStore.ensureOpen(); err != nil {
 		return store.CommitResult{}, err
 	}
-	if !contracts.ValidIdentifier(transaction.CommandID) || !contracts.ValidDigest(transaction.IdentityDigest) {
-		return store.CommitResult{}, errors.New("transaction command id or identity digest is invalid")
+	commandKey, err := store.CommandIdentityKey(transaction.CommandScope, transaction.CommandID)
+	if err != nil || !contracts.ValidDigest(transaction.IdentityDigest) {
+		return store.CommitResult{}, errors.New("transaction command scope, id, or identity digest is invalid")
 	}
-	if prior, exists := fileStore.state.Commands[transaction.CommandID]; exists {
+	if prior, exists := fileStore.state.Commands[commandKey]; exists {
+		if prior.Scope != transaction.CommandScope || prior.CommandID != transaction.CommandID {
+			return store.CommitResult{}, store.ErrCorrupt
+		}
 		if prior.IdentityDigest != transaction.IdentityDigest {
 			return store.CommitResult{}, store.ErrIdentityConflict
 		}
@@ -254,7 +260,8 @@ func (fileStore *Store) Commit(ctx context.Context, transaction store.Transactio
 	if err := applyTransaction(&next, transaction); err != nil {
 		return store.CommitResult{}, err
 	}
-	next.Commands[transaction.CommandID] = commandRecord{
+	next.Commands[commandKey] = commandRecord{
+		Scope: transaction.CommandScope, CommandID: transaction.CommandID,
 		IdentityDigest: transaction.IdentityDigest, OutcomeDigest: outcomeDigest, Outcome: outcome,
 	}
 	if err := fileStore.append(next); err != nil {
@@ -965,7 +972,7 @@ func committedFooterInRange(file *os.File, offset, remaining int64) (bool, error
 	return false, nil
 }
 
-func partialV2Prefix(file *os.File, size int64) bool {
+func partialV3Prefix(file *os.File, size int64) bool {
 	if size <= 0 {
 		return true
 	}
@@ -1251,8 +1258,9 @@ func validateState(state diskState) error {
 			return store.ErrCorrupt
 		}
 	}
-	for id, command := range state.Commands {
-		if !contracts.ValidIdentifier(id) || !contracts.ValidDigest(command.IdentityDigest) || !contracts.ValidDigest(command.OutcomeDigest) {
+	for key, command := range state.Commands {
+		expectedKey, err := store.CommandIdentityKey(command.Scope, command.CommandID)
+		if err != nil || key != expectedKey || !contracts.ValidDigest(command.IdentityDigest) || !contracts.ValidDigest(command.OutcomeDigest) {
 			return store.ErrCorrupt
 		}
 		_, digest, err := normalizeRaw(command.Outcome)

@@ -101,6 +101,43 @@ func (controller *Controller) deriveOwnershipClosure(ctx context.Context, run co
 	return base, nil
 }
 
+// convergedTerminalRun returns the already published terminal Run only when
+// its immutable ownership graph validates and carries that exact Run. This is
+// the convergence path for a transaction that lost the final closure CAS.
+func (controller *Controller) convergedTerminalRun(ctx context.Context, runID string) (contracts.Run, bool, error) {
+	record, err := controller.store.GetAggregate(ctx, ownershipGraphKey(runID))
+	if errors.Is(err, store.ErrNotFound) {
+		return contracts.Run{}, false, nil
+	}
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	graph, err := decodeOwnershipGraph(record)
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	runRecord, err := controller.store.GetAggregate(ctx, runKey(runID))
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	run, err := decodeRun(runRecord)
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	graphRun, err := canonicaljson.Marshal(graph.TerminalRun)
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	durableRun, err := canonicaljson.Marshal(run)
+	if err != nil {
+		return contracts.Run{}, false, err
+	}
+	if !run.Status.Terminal() || string(graphRun) != string(durableRun) {
+		return contracts.Run{}, false, errors.New("durable ownership graph terminal Run differs from the Run aggregate")
+	}
+	return run, true, nil
+}
+
 func listAllAggregates(ctx context.Context, durable store.Store, aggregateType string) ([]store.AggregateRecord, error) {
 	result := make([]store.AggregateRecord, 0)
 	after := ""

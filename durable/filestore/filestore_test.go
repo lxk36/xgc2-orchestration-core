@@ -64,7 +64,7 @@ func TestAtomicCommitReplayLeaseAndRestart(t *testing.T) {
 		t.Fatalf("commit result = %#v", committed)
 	}
 
-	replayRequest := store.Transaction{CommandID: transaction.CommandID, IdentityDigest: transaction.IdentityDigest}
+	replayRequest := store.Transaction{CommandScope: transaction.CommandScope, CommandID: transaction.CommandID, IdentityDigest: transaction.IdentityDigest}
 	replayed, err := durable.Commit(ctx, replayRequest)
 	if err != nil {
 		t.Fatal(err)
@@ -156,6 +156,113 @@ func TestAtomicCommitReplayLeaseAndRestart(t *testing.T) {
 	recoveredIntent, err := durable.GetIntent(ctx, completed.Intent.Identity)
 	if err != nil || recoveredIntent.Status != store.IntentCompleted {
 		t.Fatalf("recovered intent = %#v, err %v", recoveredIntent, err)
+	}
+}
+
+func TestCommandLedgerV3ScopesSameIDAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "scoped-commands.wal")
+	durable, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 8, 14, 1, 0, 0, 0, time.UTC)
+	reservedDigest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	scopes := []store.CommandScope{
+		{SchemaVersion: store.CommandScopeSchemaVersion, Operation: "action.install", NamespaceID: "alpha", ResourceType: "action-version", ResourceID: "action-one"},
+		{SchemaVersion: store.CommandScopeSchemaVersion, Operation: "action.install", NamespaceID: "beta", ResourceType: "action-version", ResourceID: "action-one"},
+		{SchemaVersion: store.CommandScopeSchemaVersion, Operation: "run.invoke", NamespaceID: "alpha", ResourceType: "run", ResourceID: "run-one"},
+		{SchemaVersion: store.CommandScopeSchemaVersion, Operation: "run.invoke", NamespaceID: "alpha", ResourceType: "run", ResourceID: "run-one", AuthorityRef: "experiment-builder-v1", AuthorityDigest: reservedDigest},
+	}
+	transactions := make([]store.Transaction, len(scopes))
+	for index, scope := range scopes {
+		identity, digestErr := canonicaljson.DigestValue(map[string]any{"scope": scope, "ordinal": index})
+		if digestErr != nil {
+			t.Fatal(digestErr)
+		}
+		outcome, marshalErr := canonicaljson.Marshal(map[string]any{"ordinal": index})
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		transactions[index] = store.Transaction{
+			CommandScope: scope, CommandID: "same-command", IdentityDigest: identity,
+			Outcome: outcome, At: at.Add(time.Duration(index) * time.Second),
+		}
+		result, commitErr := durable.Commit(t.Context(), transactions[index])
+		if commitErr != nil || result.Replay {
+			t.Fatalf("scope %d first commit = %#v err=%v", index, result, commitErr)
+		}
+	}
+	conflict := transactions[0]
+	conflict.IdentityDigest = fixtureDigest
+	if conflict.IdentityDigest == transactions[0].IdentityDigest {
+		conflict.IdentityDigest = reservedDigest
+	}
+	if _, err := durable.Commit(t.Context(), conflict); !errors.Is(err, store.ErrIdentityConflict) {
+		t.Fatalf("same-scope changed identity = %v, want conflict", err)
+	}
+	if _, err := durable.Commit(t.Context(), store.Transaction{CommandID: "missing-scope", IdentityDigest: fixtureDigest}); err == nil {
+		t.Fatal("transaction without a v3 command scope was accepted")
+	}
+	if err := durable.Close(); err != nil {
+		t.Fatal(err)
+	}
+	durable, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer durable.Close()
+	for index, transaction := range transactions {
+		result, replayErr := durable.Commit(t.Context(), transaction)
+		if replayErr != nil || !result.Replay {
+			t.Fatalf("scope %d restart replay = %#v err=%v", index, result, replayErr)
+		}
+	}
+}
+
+func TestCommandLedgerV3RecoveryRejectsScopeAndKeyTampering(t *testing.T) {
+	outcome := json.RawMessage(`{"stored":true}`)
+	outcomeDigest, err := canonicaljson.Digest(outcome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope := fixtureCommandScope("recovery-command")
+	commandID := "recovery-command"
+	key, err := store.CommandIdentityKey(scope, commandID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := commandRecord{
+		Scope: scope, CommandID: commandID, IdentityDigest: fixtureDigest,
+		OutcomeDigest: outcomeDigest, Outcome: outcome,
+	}
+	for _, test := range []struct {
+		name   string
+		key    string
+		mutate func(*commandRecord)
+	}{
+		{name: "wrong-key", key: "command-v3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{name: "changed-scope", key: key, mutate: func(record *commandRecord) { record.Scope.NamespaceID = "other" }},
+		{name: "changed-command-id", key: key, mutate: func(record *commandRecord) { record.CommandID = "other-command" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := emptyState()
+			record := base
+			if test.mutate != nil {
+				test.mutate(&record)
+			}
+			state.Commands[test.key] = record
+			frame, encodeErr := encodeFrame(state)
+			if encodeErr != nil {
+				t.Fatal(encodeErr)
+			}
+			path := filepath.Join(t.TempDir(), "tampered-command.wal")
+			if err := os.WriteFile(path, frame, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+				t.Fatalf("tampered command recovery error = %v", err)
+			}
+		})
 	}
 }
 
@@ -540,13 +647,13 @@ func TestOpenStoreDetectsNewHardlinkAliases(t *testing.T) {
 	}
 }
 
-func TestV2FrameLayoutAndNoLegacyFallback(t *testing.T) {
+func TestV3FrameLayoutAndNoLegacyFallback(t *testing.T) {
 	frame, err := encodeFrame(emptyState())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(frame[:8], frameMagic[:]) || !bytes.Equal(frame[len(frame)-frameFooter:len(frame)-frameFooter+8], frameCommitMagic[:]) {
-		t.Fatalf("v2 magic is absent")
+		t.Fatalf("v3 magic is absent")
 	}
 	if binary.BigEndian.Uint16(frame[8:10]) != frameFormatVersion {
 		t.Fatalf("frame version = %d", binary.BigEndian.Uint16(frame[8:10]))
@@ -578,20 +685,28 @@ func TestV2FrameLayoutAndNoLegacyFallback(t *testing.T) {
 	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
 		t.Fatalf("legacy v1 fallback error = %v", err)
 	}
-	v1PayloadInV2Frame, err := encodeFrame(legacyState)
-	if err != nil {
-		t.Fatal(err)
-	}
-	path = filepath.Join(t.TempDir(), "v1-state-v2-frame.db")
-	if err := os.WriteFile(path, v1PayloadInV2Frame, 0o600); err != nil {
+	v2Prefix := []byte{'X', 'G', 'C', '2', 'F', 'S', 'V', '2'}
+	path = filepath.Join(t.TempDir(), "legacy-v2.db")
+	if err := os.WriteFile(path, v2Prefix, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
-		t.Fatalf("v1 state inside v2 frame error = %v", err)
+		t.Fatalf("legacy v2 fallback error = %v", err)
+	}
+	v1PayloadInV3Frame, err := encodeFrame(legacyState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path = filepath.Join(t.TempDir(), "v1-state-v3-frame.db")
+	if err := os.WriteFile(path, v1PayloadInV3Frame, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(path); !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("v1 state inside v3 frame error = %v", err)
 	}
 }
 
-func TestV2FrameLengthAndCorruptionMatrix(t *testing.T) {
+func TestV3FrameLengthAndCorruptionMatrix(t *testing.T) {
 	frame, err := encodeFrame(emptyState())
 	if err != nil {
 		t.Fatal(err)
@@ -657,7 +772,7 @@ func TestV2FrameLengthAndCorruptionMatrix(t *testing.T) {
 	}
 }
 
-func TestV2OnlyAndLatestDeclaredLengthMatrix(t *testing.T) {
+func TestV3OnlyAndLatestDeclaredLengthMatrix(t *testing.T) {
 	frame, err := encodeFrame(emptyState())
 	if err != nil {
 		t.Fatal(err)
@@ -1023,7 +1138,7 @@ func appendFrames(count int) func(*testing.T, *Store) {
 	}
 }
 
-func TestV2PartialCrashTailBoundaries(t *testing.T) {
+func TestV3PartialCrashTailBoundaries(t *testing.T) {
 	frame, err := encodeFrame(emptyState())
 	if err != nil {
 		t.Fatal(err)
@@ -1205,7 +1320,7 @@ func TestDurableFrameExceedsSingleProtocolValueLimitAndRecovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	transaction := store.Transaction{
-		CommandID: "large-frame-commit", IdentityDigest: fixtureDigest,
+		CommandScope: fixtureCommandScope("large-frame"), CommandID: "large-frame-commit", IdentityDigest: fixtureDigest,
 		Outcome: json.RawMessage(`{"stored":true}`), At: t0,
 	}
 	for index := 0; index < 700; index++ {
@@ -1258,14 +1373,19 @@ func TestForkStateUsesCopyOnWriteIndexes(t *testing.T) {
 		PayloadDigest: fixtureDigest, Payload: json.RawMessage(`{"value":"frozen"}`),
 	}
 	original.Events["event-frozen"] = contracts.DomainEvent{EventID: "event-frozen"}
-	original.Commands["command-frozen"] = commandRecord{IdentityDigest: fixtureDigest}
+	frozenScope := fixtureCommandScope("frozen")
+	frozenKey, err := store.CommandIdentityKey(frozenScope, "command-frozen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original.Commands[frozenKey] = commandRecord{Scope: frozenScope, CommandID: "command-frozen", IdentityDigest: fixtureDigest}
 	original.Intents["intent-frozen"] = store.IntentRecord{Revision: 1}
 	original.Inbox["source\x00message"] = store.InboxRecord{SourceRef: "source", MessageID: "message"}
 
 	next := forkState(original)
 	delete(next.Aggregates, "fixture\x00frozen")
 	delete(next.Events, "event-frozen")
-	delete(next.Commands, "command-frozen")
+	delete(next.Commands, frozenKey)
 	delete(next.Intents, "intent-frozen")
 	delete(next.Inbox, "source\x00message")
 	next.Aggregates["fixture\x00mutable"] = store.AggregateRecord{
@@ -1306,7 +1426,7 @@ func TestCheckpointEncodingPreservesCanonicalRecordIdentityAcrossRestart(t *test
 		t.Fatal(err)
 	}
 	transaction := store.Transaction{
-		CommandID: "persist-record-identity", IdentityDigest: fixtureDigest,
+		CommandScope: fixtureCommandScope("record-identity"), CommandID: "persist-record-identity", IdentityDigest: fixtureDigest,
 		Expected: []store.ExpectedRevision{{Key: key}},
 		Mutations: []store.AggregateRecord{{
 			Key: key, Revision: 1, PayloadDigest: payloadDigest, Payload: payload,
@@ -1415,9 +1535,16 @@ func runTransaction(t *testing.T, decision execution.RunDecision, expected uint6
 	}
 	outcome, _ := json.Marshal(map[string]any{"runId": decision.Run.RunID, "revision": decision.Run.Revision})
 	return store.Transaction{
-		CommandID: commandID, IdentityDigest: identityDigest,
+		CommandScope: fixtureCommandScope(decision.Run.RunID), CommandID: commandID, IdentityDigest: identityDigest,
 		Expected:  []store.ExpectedRevision{{Key: store.AggregateKey{Type: "run", ID: decision.Run.RunID}, Revision: expected}},
 		Mutations: []store.AggregateRecord{{Key: store.AggregateKey{Type: "run", ID: decision.Run.RunID}, Revision: decision.Run.Revision, PayloadDigest: payloadDigest, Payload: payload}},
 		Events:    decision.Events, Intents: seeds, Outcome: outcome, At: at,
+	}
+}
+
+func fixtureCommandScope(resourceID string) store.CommandScope {
+	return store.CommandScope{
+		SchemaVersion: store.CommandScopeSchemaVersion, Operation: "fixture.commit",
+		NamespaceID: "test", ResourceType: "fixture", ResourceID: resourceID,
 	}
 }

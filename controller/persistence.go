@@ -28,8 +28,60 @@ func effectKey(effectID string) store.AggregateKey {
 	return store.AggregateKey{Type: effectAggregateType, ID: effectID}
 }
 
-func commandLedgerKey(commandID string) store.AggregateKey {
-	return store.AggregateKey{Type: commandLedgerType, ID: commandID}
+func commandLedgerKey(scope store.CommandScope, commandID string) (store.AggregateKey, error) {
+	id, err := store.CommandIdentityKey(scope, commandID)
+	if err != nil {
+		return store.AggregateKey{}, err
+	}
+	return store.AggregateKey{Type: commandLedgerType, ID: id}, nil
+}
+
+func newCommandScope(operation, namespaceID, resourceType, resourceID, authorityRef, authorityDigest string) (store.CommandScope, error) {
+	scope := store.CommandScope{
+		SchemaVersion: store.CommandScopeSchemaVersion, Operation: operation,
+		NamespaceID: namespaceID, ResourceType: resourceType, ResourceID: resourceID,
+		AuthorityRef: authorityRef, AuthorityDigest: authorityDigest,
+	}
+	if err := scope.Validate(); err != nil {
+		return store.CommandScope{}, err
+	}
+	return scope, nil
+}
+
+func runCommandScope(operation string, run contracts.Run, resourceType, resourceID string) (store.CommandScope, error) {
+	return newCommandScope(
+		operation, run.NamespaceID, resourceType, resourceID,
+		run.AdmissionPolicyRef, run.AdmissionPolicyDigest,
+	)
+}
+
+func (controller *Controller) effectCommandScope(
+	ctx context.Context, operation string, current contracts.EffectRecord,
+) (store.CommandScope, error) {
+	run, err := controller.GetRun(ctx, current.Intent.RunID)
+	if err != nil {
+		return store.CommandScope{}, err
+	}
+	return runCommandScope(operation, run, effectAggregateType, current.EffectID)
+}
+
+func (controller *Controller) internalCommandScope(ctx context.Context, outcome any) (store.CommandScope, error) {
+	var run contracts.Run
+	var err error
+	switch current := outcome.(type) {
+	case contracts.Run:
+		run = current
+	case contracts.Invocation:
+		run, err = controller.GetRun(ctx, current.RunID)
+	case contracts.EffectRecord:
+		run, err = controller.GetRun(ctx, current.Intent.RunID)
+	default:
+		return store.CommandScope{}, errors.New("internal transaction outcome cannot identify its owning Run")
+	}
+	if err != nil {
+		return store.CommandScope{}, err
+	}
+	return runCommandScope("kernel.run-phase", run, runAggregateType, run.RunID)
 }
 
 func aggregateMutation(key store.AggregateKey, currentRevision uint64, payload any) (store.AggregateRecord, error) {
@@ -208,6 +260,10 @@ func (controller *Controller) commit(
 	intents []contracts.DurableIntent,
 	outcome any,
 ) error {
+	commandScope, err := controller.internalCommandScope(ctx, outcome)
+	if err != nil {
+		return err
+	}
 	identityDigest, err := canonicaljson.DigestValue(map[string]any{"commandId": commandID, "mutations": mutations})
 	if err != nil {
 		return err
@@ -221,7 +277,7 @@ func (controller *Controller) commit(
 		seeds[index] = store.IntentSeed{Intent: intents[index], AvailableAt: at}
 	}
 	_, err = controller.store.Commit(ctx, store.Transaction{
-		CommandID: commandID, IdentityDigest: identityDigest, Expected: expected, Mutations: mutations,
+		CommandScope: commandScope, CommandID: commandID, IdentityDigest: identityDigest, Expected: expected, Mutations: mutations,
 		Events: events, Intents: seeds, Outcome: outcomeRaw, At: at,
 	})
 	return err

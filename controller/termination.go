@@ -83,6 +83,10 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 			return TerminateRunResult{}, fmt.Errorf("%w: owner-backed Run requires its exact active owner key", ErrReservedIngressDenied)
 		}
 	}
+	commandScope, err := runCommandScope("run.terminate", current, runAggregateType, current.RunID)
+	if err != nil {
+		return TerminateRunResult{}, err
+	}
 	if current.Termination != nil {
 		if terminationMatchesRequest(current.RunID, *current.Termination, request) {
 			return TerminateRunResult{Run: current, Replay: true}, nil
@@ -136,7 +140,7 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 		intents[index] = store.IntentSeed{Intent: decision.Intents[index], AvailableAt: at}
 	}
 	committed, err := controller.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identityDigest,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identityDigest,
 		Expected:  []store.ExpectedRevision{{Key: mutation.Key, Revision: record.Revision}},
 		Mutations: []store.AggregateRecord{mutation}, Events: decision.Events, Intents: intents,
 		Outcome: outcome, At: at,

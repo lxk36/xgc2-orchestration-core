@@ -305,6 +305,24 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 	if err != nil {
 		return InvokeResult{}, err
 	}
+	operation := "run.invoke"
+	authorityRef, authorityDigest := ingress.policyRef, ingress.policyDigest
+	if childProof != nil {
+		operation = "kernel.child-invoke"
+		authorityRef = "kernel.child-ingress"
+		authorityDigest, err = canonicaljson.DigestValue(map[string]any{
+			"schemaVersion": "xgc.kernel-child-ingress-authority/v1",
+		})
+		if err != nil {
+			return InvokeResult{}, err
+		}
+	}
+	commandScope, err := newCommandScope(
+		operation, request.NamespaceID, runAggregateType, request.RunID, authorityRef, authorityDigest,
+	)
+	if err != nil {
+		return InvokeResult{}, err
+	}
 	plan, err := workflowkernel.Compile(request.Definition)
 	if err != nil {
 		return InvokeResult{}, err
@@ -361,7 +379,7 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 		return InvokeResult{}, err
 	}
 	if ingress.ownerKey != nil {
-		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, request.CommandID); receiptErr != nil {
+		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, commandScope, request.CommandID); receiptErr != nil {
 			return InvokeResult{}, receiptErr
 		} else if found {
 			if receipt.RequestIdentityDigest != identityDigest {
@@ -430,11 +448,15 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 				return InvokeResult{}, ownerErr
 			}
 			receipt := runAdmissionReceipt{
-				SchemaVersion: runAdmissionReceiptSchema, CommandID: request.CommandID,
+				SchemaVersion: runAdmissionReceiptSchema, CommandScope: commandScope, CommandID: request.CommandID,
 				RequestIdentityDigest: identityDigest, AcceptedRun: decision.Run,
 				OwnerRef: owner.OwnerRef, OwnerGeneration: owner.Generation,
 			}
-			receiptMutation, receiptErr := aggregateMutation(runAdmissionReceiptKey(request.CommandID), 0, receipt)
+			receiptKey, receiptErr := runAdmissionReceiptKey(commandScope, request.CommandID)
+			if receiptErr != nil {
+				return InvokeResult{}, receiptErr
+			}
+			receiptMutation, receiptErr := aggregateMutation(receiptKey, 0, receipt)
 			if receiptErr != nil {
 				return InvokeResult{}, receiptErr
 			}
@@ -456,7 +478,7 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 			return InvokeResult{}, marshalErr
 		}
 		committed, commitErr := controller.store.Commit(ctx, store.Transaction{
-			CommandID: request.CommandID, IdentityDigest: identityDigest, Expected: expected,
+			CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identityDigest, Expected: expected,
 			Mutations: mutations, Events: events, Outcome: outcome, At: at,
 		})
 		if commitErr == nil {
@@ -469,7 +491,7 @@ func (controller *Controller) invoke(ctx context.Context, request InvokeRequest,
 		if ingress.ownerKey == nil || (!errors.Is(commitErr, store.ErrRevisionConflict) && !errors.Is(commitErr, store.ErrIdentityConflict)) {
 			return InvokeResult{}, commitErr
 		}
-		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, request.CommandID); receiptErr != nil {
+		if receipt, found, receiptErr := controller.getRunAdmissionReceipt(ctx, commandScope, request.CommandID); receiptErr != nil {
 			return InvokeResult{}, receiptErr
 		} else if found {
 			if receipt.RequestIdentityDigest != identityDigest {

@@ -2,7 +2,7 @@
 
 - Status: accepted for S3
 - Date: 2026-08-12
-- Updated: 2026-08-13 (destructive filestore v2)
+- Updated: 2026-08-14 (destructive filestore and command-ledger v3)
 - Decision owner: G4
 
 ## Decision
@@ -13,7 +13,26 @@ atomically persists:
 - exact aggregate revisions under compare-and-swap;
 - one immutable DomainEvent for every mutated aggregate revision;
 - zero or more durable outbox, reconcile, cleanup, or wait intents;
-- the command identity and canonical outcome used for idempotent replay.
+- the scoped command identity and canonical outcome used for idempotent replay.
+
+Every `Transaction` carries a mandatory `xgc.command-scope/v3` value with a
+bounded operation, namespace, resource type, resource ID, and an optional
+inseparable authority ref/digest pair. The ledger key is SHA-256 over that
+complete scope plus `commandId`; a bare caller command ID is never a durable
+key. The command record persists both inputs and recovery recomputes the key,
+so a mismatched scope/ID record is corruption. The guarantees are:
+
+- same scope + same command ID + same identity is an exact replay;
+- same scope + same command ID + changed identity is a conflict;
+- the same command ID in a different operation, namespace, resource, or
+  sealed authority is independent.
+
+Controllers derive scopes from authorized and frozen state. Public request
+bodies do not contain a scope field. Reserved Action install and Run ingress
+bind the registered policy ref/digest obtained through the in-memory permit;
+later Run/effect/wait/termination scopes bind the Run's frozen policy. Kernel
+phase transactions are isolated by owning Run. Thus an ordinary API caller
+cannot preoccupy a reserved scope by guessing a command ID.
 
 Inbox dedupe and intent lease transitions use the same durable authority. An
 expired lease can be adopted with a new token/revision; the old worker is then
@@ -40,14 +59,14 @@ sidecar replacement, data-path replacement, and link-count changes are thereby
 detected. Both files are mode `0600`; the sidecar is persistent rather than
 deleted and recreated.
 
-The only accepted disk framing is destructive v2. There is no v1/legacy
+The only accepted disk framing is destructive v3. There is no v1/v2/legacy
 fallback. One complete state checkpoint is encoded as:
 
-- a 96-byte header containing the v2 magic and version, fixed header size,
+- a 96-byte header containing the v3 magic and version, fixed header size,
   zero flags, payload length, total encoded length, payload SHA-256 digest, and
   a SHA-256 digest of the preceding header fields;
-- a deterministic JSON checkpoint, at most 64 MiB, whose state version is 2;
-- a 128-byte commit footer containing a distinct commit magic, v2 version,
+- a deterministic JSON checkpoint, at most 64 MiB, whose state version is 3;
+- a 128-byte commit footer containing a distinct commit magic, v3 version,
   fixed footer size, repeated payload and total lengths, repeated payload and
   header digests, and a SHA-256 digest of the preceding footer fields.
 
@@ -71,7 +90,7 @@ the byte budget, the adapter writes one checkpoint to a mode-`0600` stage file
 in the pinned parent, syncs it, renames it over the data name, and syncs the
 pinned parent.
 
-Every ordinary state change writes a whole v2 frame and syncs the data fd
+Every ordinary state change writes a whole v3 frame and syncs the data fd
 before publishing the in-memory state. A write, data-sync, stage-write,
 rename, directory-sync, or replaced-fd-close error poisons the handle because
 the durable outcome is uncertain; later operations fail until close and
@@ -100,7 +119,8 @@ database, consensus protocol, or production HA claim. Public products depend
 on the Store port, not this adapter. A PostgreSQL or other HA adapter must pass
 the same conformance suite before public-server deployment.
 
-The v2 switch intentionally does not read v1 files. Local data is rebuilt for
+The v3 switch intentionally does not read v1/v2 files or legacy global
+`commandId` ledgers. Local data is rebuilt for
 this destructive cutover; rollback is a whole-version redeploy with data built
 for that version, not a dual reader or compatibility layer.
 

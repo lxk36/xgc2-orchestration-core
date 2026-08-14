@@ -197,8 +197,16 @@ func (catalog *Catalog) Install(ctx context.Context, request InstallRequest) (In
 		PayloadSchemaDigest: eventSchemaDigest, PayloadDigest: eventPayloadDigest,
 		Payload: eventPayload, OccurredAt: request.At.UTC(),
 	}
+	commandScope := store.CommandScope{
+		SchemaVersion: store.CommandScopeSchemaVersion, Operation: "action.install",
+		NamespaceID: request.NamespaceID, ResourceType: key.Type, ResourceID: key.ID,
+		AuthorityRef: policyRef, AuthorityDigest: policyDigest,
+	}
+	if err := commandScope.Validate(); err != nil {
+		return InstallResult{}, err
+	}
 	committed, err := catalog.store.Commit(ctx, store.Transaction{
-		CommandID: request.CommandID, IdentityDigest: identityDigest,
+		CommandScope: commandScope, CommandID: request.CommandID, IdentityDigest: identityDigest,
 		Expected: []store.ExpectedRevision{{Key: key, Revision: 0}},
 		Mutations: []store.AggregateRecord{{
 			Key: key, Revision: 1, PayloadDigest: payloadDigest, Payload: payload,

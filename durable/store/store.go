@@ -4,8 +4,11 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/lxk36/xgc2-orchestration-core/sdk/go/contracts"
@@ -39,7 +42,59 @@ type AggregateRecord struct {
 	Payload       json.RawMessage `json:"payload"`
 }
 
+const CommandScopeSchemaVersion = "xgc.command-scope/v3"
+
+// CommandScope is the mandatory semantic partition for one durable command.
+// HTTP and node callers never provide it directly: composition/controller
+// code derives it from the authorized operation and frozen resource identity.
+// AuthorityRef and AuthorityDigest are an inseparable pair used for sealed
+// ingress domains (for example, a registered reserved-ingress policy).
+type CommandScope struct {
+	SchemaVersion   string `json:"schemaVersion"`
+	Operation       string `json:"operation"`
+	NamespaceID     string `json:"namespaceId"`
+	ResourceType    string `json:"resourceType"`
+	ResourceID      string `json:"resourceId"`
+	AuthorityRef    string `json:"authorityRef,omitempty"`
+	AuthorityDigest string `json:"authorityDigest,omitempty"`
+}
+
+func (scope CommandScope) Validate() error {
+	if scope.SchemaVersion != CommandScopeSchemaVersion ||
+		!contracts.ValidIdentifier(scope.Operation) || !contracts.ValidIdentifier(scope.NamespaceID) ||
+		!contracts.ValidIdentifier(scope.ResourceType) || !contracts.ValidIdentifier(scope.ResourceID) {
+		return errors.New("command scope identity is invalid")
+	}
+	if (scope.AuthorityRef == "") != (scope.AuthorityDigest == "") ||
+		(scope.AuthorityRef != "" && (!contracts.ValidIdentifier(scope.AuthorityRef) || !contracts.ValidDigest(scope.AuthorityDigest))) {
+		return errors.New("command scope authority is invalid")
+	}
+	return nil
+}
+
+// CommandIdentityKey is the bounded, collision-resistant persistent ledger
+// key for a semantic scope and caller command ID. Its v3 schema marker makes
+// this deliberately incompatible with the former global commandId ledger.
+func CommandIdentityKey(scope CommandScope, commandID string) (string, error) {
+	if err := scope.Validate(); err != nil {
+		return "", err
+	}
+	if !contracts.ValidIdentifier(commandID) {
+		return "", errors.New("command id is invalid")
+	}
+	payload, err := json.Marshal(struct {
+		Scope     CommandScope `json:"scope"`
+		CommandID string       `json:"commandId"`
+	}{Scope: scope, CommandID: commandID})
+	if err != nil {
+		return "", fmt.Errorf("marshal command identity: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return "command-v3-" + hex.EncodeToString(digest[:]), nil
+}
+
 type Transaction struct {
+	CommandScope   CommandScope            `json:"commandScope"`
 	CommandID      string                  `json:"commandId"`
 	IdentityDigest string                  `json:"identityDigest"`
 	Expected       []ExpectedRevision      `json:"expected"`

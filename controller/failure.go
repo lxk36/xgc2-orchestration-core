@@ -149,6 +149,11 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	}
 	closureBase, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
+		if terminal, converged, convergenceErr := controller.convergedTerminalRun(ctx, run.RunID); convergenceErr != nil {
+			return contracts.Run{}, convergenceErr
+		} else if converged {
+			return terminal, nil
+		}
 		return contracts.Run{}, err
 	}
 	const graphRevision = uint64(1)
@@ -217,6 +222,13 @@ func (controller *Controller) finalizeStoppingRun(ctx context.Context, runRecord
 	if err := controller.commit(ctx, commandID, at,
 		expected, mutations, events, decision.Intents, decision.Run,
 	); err != nil {
+		if errors.Is(err, store.ErrRevisionConflict) || errors.Is(err, store.ErrIdentityConflict) {
+			if terminal, converged, convergenceErr := controller.convergedTerminalRun(ctx, run.RunID); convergenceErr != nil {
+				return contracts.Run{}, convergenceErr
+			} else if converged {
+				return terminal, nil
+			}
+		}
 		return contracts.Run{}, err
 	}
 	return decision.Run, nil
@@ -265,6 +277,11 @@ func (controller *Controller) succeedRun(
 	}
 	closureBase, err := controller.deriveOwnershipClosure(ctx, run)
 	if err != nil {
+		if terminal, converged, convergenceErr := controller.convergedTerminalRun(ctx, run.RunID); convergenceErr != nil {
+			return contracts.Run{}, convergenceErr
+		} else if converged {
+			return terminal, nil
+		}
 		return contracts.Run{}, err
 	}
 	const graphRevision = uint64(1)
@@ -329,6 +346,13 @@ func (controller *Controller) succeedRun(
 	if err := controller.commit(ctx, commandID, at,
 		expected, mutations, events, decision.Intents, decision.Run,
 	); err != nil {
+		if errors.Is(err, store.ErrRevisionConflict) || errors.Is(err, store.ErrIdentityConflict) {
+			if terminal, converged, convergenceErr := controller.convergedTerminalRun(ctx, run.RunID); convergenceErr != nil {
+				return contracts.Run{}, convergenceErr
+			} else if converged {
+				return terminal, nil
+			}
+		}
 		return contracts.Run{}, err
 	}
 	return decision.Run, nil
