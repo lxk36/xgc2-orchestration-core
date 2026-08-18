@@ -94,6 +94,12 @@ func (controller *Controller) requestRunTermination(ctx context.Context, request
 		if current.Termination.CommandID == request.CommandID {
 			return TerminateRunResult{}, store.ErrIdentityConflict
 		}
+		// A failed Effect already froze termination. Operator Stop must drain
+		// that exact closure instead of fighting the first command with a
+		// second identity (which previously left the active-owner slot stuck).
+		if current.Status == contracts.RunStopping || current.Status.Terminal() {
+			return TerminateRunResult{Run: current, Replay: true}, nil
+		}
 		return TerminateRunResult{}, execution.ErrRevisionConflict
 	}
 	if current.Status.Terminal() {
