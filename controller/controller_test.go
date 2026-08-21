@@ -52,6 +52,7 @@ type countExecutor struct {
 	descriptor contracts.NodeDescriptor
 	mu         sync.Mutex
 	calls      int
+	failures   int
 	function   func(map[string]any) map[string]any
 }
 
@@ -60,6 +61,13 @@ func (executor *countExecutor) Descriptor() contracts.NodeDescriptor { return ex
 func (executor *countExecutor) Execute(_ context.Context, request contracts.NodeInvocationRequest) (contracts.NodeResult, error) {
 	executor.mu.Lock()
 	executor.calls++
+	if executor.failures > 0 {
+		executor.failures--
+		executor.mu.Unlock()
+		failure := contracts.StructuredFailure{Class: contracts.FailureTransient, Code: "test.transient", Message: "retry after a transient test failure"}
+		evidence, _ := canonicaljson.DigestValue(failure)
+		return contracts.NodeResult{SchemaVersion: node.ResultSchemaVersion, Status: contracts.NodeResultFailed, Failure: &failure, EvidenceDigest: evidence}, nil
+	}
 	executor.mu.Unlock()
 	output := executor.function(request.Input)
 	digest, err := canonicaljson.DigestValue(output)
@@ -67,6 +75,35 @@ func (executor *countExecutor) Execute(_ context.Context, request contracts.Node
 		return contracts.NodeResult{}, err
 	}
 	return contracts.NodeResult{SchemaVersion: node.ResultSchemaVersion, Status: contracts.NodeResultSucceeded, Output: output, OutputDigest: digest, EvidenceDigest: digest}, nil
+}
+
+func TestCoordinatorPreservesRetryWaitUntilItsDurableDeadline(t *testing.T) {
+	fixture := newControllerFixture(t)
+	fixture.prepare.failures = 1
+	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request("run-retry-wait", "invoke-retry-wait"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator, err := NewCoordinator(CoordinatorConfig{
+		Controller: fixture.controller, Store: fixture.store,
+		OwnerRef: "retry-wait-coordinator", Clock: fixture.clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if !errors.Is(err, ErrRunWaiting) || waiting.Status != contracts.RunWaiting {
+		t.Fatalf("retry wait run = %#v, err=%v", waiting, err)
+	}
+	snapshot, _, err := fixture.controller.GetSnapshot(t.Context(), invoked.Run.RunID)
+	if err != nil || snapshot.RetryWait == nil || snapshot.Waiting != nil {
+		t.Fatalf("retry wait snapshot = %#v, err=%v", snapshot.RetryWait, err)
+	}
+	fixture.clock.Advance(time.Second)
+	succeeded, err := coordinator.AdvanceRun(t.Context(), invoked.Run.RunID)
+	if err != nil || succeeded.Status != contracts.RunSucceeded || fixture.prepare.Calls() != 2 {
+		t.Fatalf("retried run = %#v, err=%v, calls=%d", succeeded, err, fixture.prepare.Calls())
+	}
 }
 
 func (executor *countExecutor) Calls() int {

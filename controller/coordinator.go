@@ -197,6 +197,13 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 			}
 			continue
 		}
+		if snapshot.RetryWait != nil {
+			// The retry deadline is durable and Controller.Drive is the only
+			// authority allowed to resume it. Returning the ordinary waiting
+			// sentinel lets schedulers retry later without misclassifying this
+			// projection as a missing Effect wait.
+			return run, ErrRunWaiting
+		}
 		if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
 			return run, errors.New("waiting run has no durable wait in its snapshot")
 		}
@@ -258,7 +265,10 @@ func (coordinator *Coordinator) waitedEffect(ctx context.Context, runID string) 
 	}
 	if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil ||
 		snapshot.Waiting.Result.Wait.Kind != contracts.NodeWaitEffect {
-		return contracts.EffectRecord{}, errors.New("waiting run has no effect wait in its snapshot")
+		// Another exact coordinator may have resolved this Effect and advanced
+		// the Run between our projection read and this lookup. The caller must
+		// re-read rather than treating concurrent durable progress as corruption.
+		return contracts.EffectRecord{}, ErrRunWaiting
 	}
 	waitRef := snapshot.Waiting.Result.Wait.SubjectRef
 	after := ""
