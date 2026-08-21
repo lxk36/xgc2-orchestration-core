@@ -36,7 +36,13 @@ const (
 	frameFooter          = 128
 	frameHeaderCore      = frameHeader - sha256.Size
 	frameFooterCore      = frameFooter - sha256.Size
-	maxFrameBytes        = 64 << 20
+	// One native fleet Run records the complete occurrence, Effect, command,
+	// and audit closure. The former 64 MiB ceiling was exhausted by only a few
+	// dozen normal multi-robot Runs and could strand a terminal cleanup intent
+	// after every owned process had already stopped. Keep a finite recovery
+	// bound, but size it for the retained fleet workflow history rather than a
+	// single-process development workload.
+	maxFrameBytes        = 256 << 20
 	retainedFrameBudget  = 4
 	maxEncodedFrameBytes = frameHeader + maxFrameBytes + frameFooter
 	maxJournalBytes      = maxEncodedFrameBytes

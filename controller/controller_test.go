@@ -753,6 +753,35 @@ func (adapter *compensatingEffectAdapter) Compensate(
 	return contracts.CommandLedger{Envelope: envelope, Receipts: []contracts.CommandReceipt{accepted, succeeded}}, nil
 }
 
+func (adapter *compensatingEffectAdapter) RecoverCompensation(
+	_ context.Context,
+	applied contracts.EffectRecord,
+	ledger contracts.CommandLedger,
+	authorizationDigest string,
+) (contracts.CommandLedger, error) {
+	if applied.State != contracts.EffectApplied || applied.ExternalIdentity == "" ||
+		len(ledger.Receipts) != 1 || ledger.Receipts[0].Status != contracts.ReceiptAccepted {
+		return contracts.CommandLedger{}, errors.New("compensation recovery lacks exact accepted evidence")
+	}
+	adapter.mu.Lock()
+	adapter.order = append(adapter.order, applied.Intent.InvocationID)
+	adapter.mu.Unlock()
+	descriptor := adapter.Descriptor()
+	succeeded, err := syntheticReceipt(
+		ledger.Envelope, descriptor, authorizationDigest, 2,
+		contracts.ReceiptSucceeded, nil, adapter.clock.Now(),
+	)
+	if err != nil {
+		return contracts.CommandLedger{}, err
+	}
+	succeeded.ResultDigest, _ = canonicaljson.DigestValue(map[string]any{"stopped": applied.ExternalIdentity})
+	succeeded.ExternalIdentity = applied.ExternalIdentity
+	return contracts.CommandLedger{
+		Envelope: ledger.Envelope,
+		Receipts: append(append([]contracts.CommandReceipt(nil), ledger.Receipts...), succeeded),
+	}, nil
+}
+
 func (adapter *compensatingEffectAdapter) Order() []string {
 	adapter.mu.Lock()
 	defer adapter.mu.Unlock()
@@ -997,7 +1026,7 @@ func TestConcurrentDuplicateTerminationHasOneDurableDecision(t *testing.T) {
 	}
 }
 
-func TestTerminationResumesAppliedEffectCompensationAfterControllerRestart(t *testing.T) {
+func TestTerminationRecoversAcceptedEffectCompensationAfterControllerRestart(t *testing.T) {
 	fixture := newEffectControllerFixture(t, "run-stop-restart")
 	fixture.executor.owned = true
 	invoked, err := fixture.controller.Invoke(t.Context(), fixture.request)
@@ -1056,6 +1085,28 @@ func TestTerminationResumesAppliedEffectCompensationAfterControllerRestart(t *te
 	if err != nil || pending.CompensationState != contracts.EffectCompensationPending {
 		t.Fatalf("persisted compensation = %#v, err=%v", pending, err)
 	}
+	compensationRequest, err := planner.PlanEffectCompensation(t.Context(), pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	begun, err := fixture.controller.BeginEffectCompensation(t.Context(), compensationRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := syntheticReceipt(
+		begun.Ledger.Envelope, adapter.Descriptor(), testPackageDigest, 1,
+		contracts.ReceiptAccepted, nil, fixture.clock.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedResult, err := fixture.controller.ObserveEffectCompensation(t.Context(), ObserveEffectCompensationRequest{
+		EffectID: effectID, Receipt: accepted, CommandID: "persist-accepted-before-controller-crash",
+	})
+	if err != nil || acceptedResult.Effect.CompensationState != contracts.EffectCompensationRunning {
+		t.Fatalf("accepted compensation = %#v, err=%v", acceptedResult, err)
+	}
+	fixture.clock.Advance(10 * time.Second)
 	if err := fixture.store.Close(); err != nil {
 		t.Fatal(err)
 	}

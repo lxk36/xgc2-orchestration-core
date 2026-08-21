@@ -38,3 +38,11 @@ type Compensator interface {
 	Adapter
 	Compensate(context.Context, contracts.EffectRecord, contracts.CommandEnvelope, string) (contracts.CommandLedger, error)
 }
+
+// CompensationRecoverer is the optional observation port for a compensation
+// whose Accepted receipt was persisted before the host stopped. Accepted is
+// proof that the provider already executed the fenced command; recovery must
+// observe that same command and append evidence, never dispatch a new mutation.
+type CompensationRecoverer interface {
+	RecoverCompensation(context.Context, contracts.EffectRecord, contracts.CommandLedger, string) (contracts.CommandLedger, error)
+}

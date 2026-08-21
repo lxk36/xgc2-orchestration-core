@@ -338,13 +338,24 @@ func (handler *EffectCleanupHandler) Handle(ctx context.Context, claimed store.C
 	envelope.IdempotencyKey = credentials.IdempotencyKey
 	envelope.CapabilityToken = credentials.CapabilityToken
 	now := handler.controller.clock.Now().UTC()
-	if err := effect.ValidatePrivateEnvelopeTokens(envelope); err != nil || !envelope.Deadline.After(now) {
-		if err == nil {
-			err = errors.New("compensation command deadline has elapsed")
+	var providerLedger contracts.CommandLedger
+	var dispatchErr error
+	if len(ledger.Receipts) > 0 {
+		recoverer, ok := compensator.(effectport.CompensationRecoverer)
+		if !ok {
+			return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest,
+				"compensation.recovery-unavailable", "provider cannot recover an accepted compensation command")
 		}
-		return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.command-invalid", err.Error())
+		providerLedger, dispatchErr = recoverer.RecoverCompensation(ctx, current, ledger, credentials.AuthorizationDigest)
+	} else {
+		if err := effect.ValidatePrivateEnvelopeTokens(envelope); err != nil || !envelope.Deadline.After(now) {
+			if err == nil {
+				err = errors.New("compensation command deadline has elapsed")
+			}
+			return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.command-invalid", err.Error())
+		}
+		providerLedger, dispatchErr = compensator.Compensate(ctx, current, envelope, credentials.AuthorizationDigest)
 	}
-	providerLedger, dispatchErr := compensator.Compensate(ctx, current, envelope, credentials.AuthorizationDigest)
 	if dispatchErr != nil {
 		return handler.fail(ctx, current, ledger, compensator.Descriptor(), credentials.AuthorizationDigest, "compensation.dispatch-uncertain", dispatchErr.Error())
 	}
@@ -385,6 +396,11 @@ func (handler *EffectCleanupHandler) fail(
 	if code == "compensator.not-installed" || code == "compensation.command-invalid" || code == "compensation.credential" {
 		status = contracts.ReceiptRejected
 		class = contracts.FailurePermanent
+	}
+	if len(ledger.Receipts) > 0 && status == contracts.ReceiptRejected {
+		// Rejected is valid only before provider acceptance. Once Accepted is
+		// durable, a permanent provider error is a Failed terminal observation.
+		status = contracts.ReceiptFailed
 	}
 	receipt, err := syntheticReceipt(ledger.Envelope, descriptor, authorizationDigest, sequence, status,
 		&contracts.StructuredFailure{Class: class, Code: code, Message: message}, at)
