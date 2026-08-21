@@ -205,6 +205,16 @@ func (coordinator *Coordinator) AdvanceRun(ctx context.Context, runID string) (c
 			return run, ErrRunWaiting
 		}
 		if snapshot.Waiting == nil || snapshot.Waiting.Result.Wait == nil {
+			current, currentErr := coordinator.controller.GetRun(ctx, runID)
+			if currentErr != nil {
+				return run, currentErr
+			}
+			if current.Revision != run.Revision || current.Status != contracts.RunWaiting {
+				// Another coordinator atomically consumed the observed wait after
+				// Drive returned but before this snapshot read. Yield the newer
+				// Run instead of diagnosing corruption from a stale read view.
+				return current, ErrRunWaiting
+			}
 			return run, errors.New("waiting run has no durable wait in its snapshot")
 		}
 		if snapshot.Waiting.Result.Wait.Kind != contracts.NodeWaitEffect {
